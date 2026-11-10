@@ -30,6 +30,7 @@ from gustav.core.recovery import Recovery, RecoveryReport
 from gustav.core.scheduler import Observation, Scheduler, SleepDecision
 from gustav.core.state import State, StateMachine
 from gustav.core.supervisor import Supervisor
+from gustav.hw.service import HardwareService, PlanOutcome
 from gustav.paths import Paths
 from gustav.sleep.pipeline import PipelineRunner, RunOutcome, default_pipeline
 from gustav.store.db import Database, open_db
@@ -51,6 +52,7 @@ class Daemon:
         clock: Clock | None = None,
         responder: Responder | None = None,
         db: Database | None = None,
+        detector=None,
     ):
         self.config = config
         self.paths = paths.ensure()
@@ -65,6 +67,9 @@ class Daemon:
         self.lease = GpuLease("gpu0", logger=get_logger("gpu"))
         self.supervisor = Supervisor(logger=get_logger("supervisor"))
         self.scheduler = Scheduler(config.schedule, self.clock)
+        self.hw = HardwareService(
+            config, self.paths, self.db, self.events, detector=detector
+        )
         self.responder: Responder = responder or EchoResponder()
         self.state = StateMachine(
             State.STARTING, clock=self.clock, on_transition=self._record_transition
@@ -82,6 +87,7 @@ class Daemon:
         self.started_at = self.clock.now()
         self.last_activity_at = self.clock.now()
         self.recovery_report: RecoveryReport | None = None
+        self.plan_outcome: PlanOutcome | None = None
         self.last_decision: SleepDecision | None = None
         self.last_run_outcome: RunOutcome | None = None
 
@@ -120,6 +126,8 @@ class Daemon:
             health_checks=[self.responder.health],
             logger=get_logger("recovery"),
         ).run()
+
+        self._plan_hardware(reason="startup")
 
         if self.recovery_report.safe_mode:
             self.state.transition(State.SAFE_MODE, "startup health check failed")
@@ -436,6 +444,32 @@ class Daemon:
     # ------------------------------------------------------------------
     # loops
     # ------------------------------------------------------------------
+    def _plan_hardware(self, *, reason: str, force: bool = False) -> PlanOutcome:
+        """Detect the hardware and make sure a usable plan exists.
+
+        Runs at startup and on the maintenance timer. A base-model change never
+        happens here: it becomes a pending approval.
+        """
+        try:
+            outcome = self.hw.ensure_plan(force=force)
+        except Exception as exc:  # noqa: BLE001 - never block startup on the planner
+            self.log.exception("hardware planning failed")
+            self.events.emit(
+                "hardware.planner_failed", f"{type(exc).__name__}: {exc}", level="error"
+            )
+            return PlanOutcome(plan=None, source="planner", error=str(exc))
+
+        self.plan_outcome = outcome
+        if outcome.error:
+            self.events.emit("hardware.plan_problem", outcome.error, level="error")
+        for message in outcome.messages:
+            self.events.emit("hardware.notice", message, level="warning")
+        if outcome.changed and outcome.plan is not None:
+            self.log.info("hardware plan (%s): %s", reason, outcome.plan.summary())
+            for line in outcome.plan.explanation:
+                self.log.info("  %s", line)
+        return outcome
+
     async def _scheduler_loop(self) -> None:
         tick = max(self.config.schedule.tick_seconds, 0.05)
         while True:
@@ -461,11 +495,16 @@ class Daemon:
 
     async def _maintenance_loop(self) -> None:
         interval = max(self.config.maintenance.health_check_minutes * 60, 5)
+        recheck_every = max(self.config.maintenance.hardware_recheck_minutes * 60, interval)
+        last_hardware_check = self.clock.monotonic()
         while True:
             try:
                 await asyncio.sleep(interval)
                 ok, message = self.responder.health()
                 self.telemetry.record("daemon.alive", 1.0, state=str(self.state.state))
+                if self.clock.monotonic() - last_hardware_check >= recheck_every:
+                    last_hardware_check = self.clock.monotonic()
+                    self._plan_hardware(reason="periodic re-check", force=True)
                 if not ok and self.state.state is State.WAKE:
                     self.events.emit("daemon.unhealthy", message, level="error")
                     self.state.transition(State.SAFE_MODE, message)
@@ -485,8 +524,16 @@ class Daemon:
             learning_paused=self.learning_paused,
             last_sleep_finished_at=_parse_dt(last_sleep),
             manual_trigger=manual,
+            gpu_temp_c=self._gpu_temperature(),
             resumable_run=resumable,
         )
+
+    def _gpu_temperature(self) -> float | None:
+        """Hottest GPU, for the scheduler's thermal guard. Never raises."""
+        try:
+            return self.hw.hottest_gpu_c()
+        except Exception:  # noqa: BLE001
+            return None
 
     # ------------------------------------------------------------------
     # control surface
@@ -556,10 +603,41 @@ class Daemon:
                 if self.recovery_report
                 else None
             ),
-            # Filled in by later stages; declared now so `ai status` has a stable shape.
-            "hardware_plan": self.db.get_meta("hardware_plan"),
+            "hardware": self._hardware_status(),
+            # Filled in by a later stage; declared now so `ai status` has a stable shape.
             "last_backup": self.db.get_meta("last_backup"),
         }
+
+    def _hardware_status(self) -> dict[str, Any]:
+        plan = self.hw.stored_plan()
+        outcome = self.plan_outcome
+        return {
+            "fingerprint": self.hw.hardware.fingerprint(),
+            "gpus": [g.describe() for g in self.hw.hardware.gpus],
+            "plan": plan.summary() if plan else None,
+            "plan_source": outcome.source if outcome else None,
+            "base_model": self.hw.active_base_model,
+            "vram_inference_mb": plan.vram_inference_mb if plan else None,
+            "vram_training_mb": plan.vram_training_mb if plan else None,
+            "expansion_budget": (
+                {
+                    "max_adapters": plan.expansion.max_adapters,
+                    "max_lora_rank": plan.expansion.max_lora_rank,
+                    "max_adapter_vram_mb": plan.expansion.max_adapter_vram_mb,
+                }
+                if plan
+                else None
+            ),
+            "temperatures_c": self._gpu_temperatures_quiet(),
+            "warnings": plan.warnings if plan else [],
+            "problem": outcome.error if outcome else None,
+        }
+
+    def _gpu_temperatures_quiet(self) -> dict[int, float]:
+        try:
+            return self.hw.gpu_temperatures()
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _record_transition(self, transition) -> None:
         self.db.insert(

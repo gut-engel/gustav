@@ -1,0 +1,35 @@
+# Several large cards (e.g. 4x 24 GB). One card serves while the others train, so the
+# model keeps answering during sleep. Larger LoRA ranks and more adapters fit.
+# Full fine-tuning stays off by default: adapters are cheaper, safer and revertible.
+# Select with `hardware.profile: server-multigpu`.
+
+balance: 0.8
+min_tokens_per_second: 20
+vram_reserve_fraction: 0.10
+ram_reserve_mb: 16384
+require_training: true
+inference_gpus: [0]
+training_gpus: [1, 2, 3]
+
+plan:
+  base_model: qwen3-30b-a3b
+  repo: Qwen/Qwen3-30B-A3B
+  quantization: 4bit-nf4
+  max_seq_len: 8192
+  kv_cache_dtype: fp16
+  compute_dtype: bfloat16
+  attention: flash_attention_2
+  lora_rank: 32
+  train_seq_len: 2048
+  batch_size: 1
+  grad_accum: 8
+  gradient_checkpointing: true
+  optimizer: paged_adamw_8bit
+  speculative_decoding: false
+  draft_model: qwen3-1.7b
+  inference_gpus: [0]
+  training_gpus: [1, 2, 3]
+  training_allowed: true
+  # Sharded training (Accelerate + DeepSpeed ZeRO or FSDP) arrives with stage 5's
+  # multi-GPU training backend; until then this profile trains on one card.
+  training_strategy: sharded

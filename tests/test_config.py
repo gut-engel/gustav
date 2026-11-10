@@ -38,15 +38,24 @@ def test_data_dir_override(tmp_path):
 def test_profile_is_merged(tmp_path):
     (tmp_path / "profiles").mkdir()
     (tmp_path / "profiles" / "small-12gb.yaml").write_text(
-        "base_model: Qwen3-4B\nlora_rank: 16\n", encoding="utf-8"
+        "balance: 0.5\nplan:\n  base_model: qwen3-4b\n  lora_rank: 16\n", encoding="utf-8"
     )
     (tmp_path / "config.yaml").write_text(
-        "hardware:\n  profile: small-12gb\n  lora_rank: 32\n", encoding="utf-8"
+        "hardware:\n  profile: small-12gb\n  balance: 0.9\n", encoding="utf-8"
     )
     config, _ = load_config(tmp_path / "config.yaml")
-    assert config.hardware["base_model"] == "Qwen3-4B"
+    assert config.hardware.plan["base_model"] == "qwen3-4b"
     # config.yaml is the base, the profile overlays it: the profile wins on conflict.
-    assert config.hardware["lora_rank"] == 16
+    assert config.hardware.balance == 0.5
+
+
+def test_real_preset_profiles_load(repo_root):
+    for name in ("small-12gb", "tiny-4gb", "server-multigpu"):
+        config, _ = load_config(
+            repo_root / "config.yaml", overrides={"hardware": {"profile": name}}
+        )
+        assert config.hardware.plan["base_model"]
+        assert config.hardware.profile == name
 
 
 def test_missing_profile_explains_itself(tmp_path):

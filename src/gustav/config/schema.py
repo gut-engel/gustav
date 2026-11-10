@@ -157,6 +157,42 @@ class TunableConfig(Strict):
     warm_cache_mb: int = 8192
 
 
+class HardwareConfig(Strict):
+    """How the planner should size the system for this machine."""
+
+    #: "auto" runs the planner; any other name loads profiles/<name>.yaml.
+    profile: str = "auto"
+    #: 0.0 = as fast as possible, 1.0 = as capable as possible.
+    balance: float = Field(default=0.5, ge=0.0, le=1.0)
+    #: The chat speed we refuse to go below.
+    min_tokens_per_second: float = 15.0
+    #: Left free on every GPU for other software.
+    vram_reserve_fraction: float = Field(default=0.15, ge=0.0, le=0.9)
+    ram_reserve_mb: int = 8192
+    disk_reserve_mb: int = 10240
+    allow_training: bool = True
+    #: When true, a model is only chosen if QLoRA training also fits.
+    require_training: bool = True
+    #: Empty means "decide from the detected GPUs": with two or more cards, one serves
+    #: and the rest train, so chat stays up during sleep.
+    inference_gpus: list[int] = []
+    training_gpus: list[int] = []
+    max_seq_len: int | None = None
+    train_seq_len: int | None = None
+    kv_cache_dtype: Literal["auto", "fp16", "bf16", "int8", "fp8"] = "auto"
+    speculative_decoding: Literal["auto", "on", "off"] = "auto"
+    #: Pin the base model, or restrict/exclude ladder entries.
+    prefer_model: str | None = None
+    allow_models: list[str] = []
+    deny_models: list[str] = []
+    #: Alternative ladder file.
+    ladder: str | None = None
+    #: Re-plan when the hardware fingerprint changes (never silently: you are told).
+    replan_on_hardware_change: bool = True
+    #: A plan written here (or in a profile) wins over anything the planner computes.
+    plan: dict[str, Any] = {}
+
+
 class Config(Strict):
     instance: InstanceConfig = InstanceConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -166,9 +202,9 @@ class Config(Strict):
     sleep: SleepConfig = SleepConfig()
     wake: WakeConfig = WakeConfig()
     tunable: TunableConfig = TunableConfig()
-    #: Sections owned by later stages. Declared loosely now so a stage-2+ config
-    #: file still loads under a stage-1 build.
-    hardware: dict[str, Any] = {}
+    hardware: HardwareConfig = HardwareConfig()
+    #: Sections owned by later stages. Declared loosely now so a stage-3+ config
+    #: file still loads under this build.
     inference: dict[str, Any] = {}
     backup: dict[str, Any] = {}
     expansion: dict[str, Any] = {}

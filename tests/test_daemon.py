@@ -75,9 +75,11 @@ async def test_status_has_everything_ai_status_prints(client):
     for key in (
         "state", "pid", "learning_paused", "model", "gpu", "sleep",
         "pending_items", "failed_steps", "pending_approvals", "recovery",
-        "hardware_plan", "last_backup",
+        "hardware", "last_backup",
     ):
         assert key in status, key
+    for key in ("fingerprint", "gpus", "plan", "base_model", "expansion_budget"):
+        assert key in status["hardware"], key
     assert status["sleep"]["windows"] == ["00:00-06:00"]
     assert status["sleep"]["next"] in ("sleep disabled", "window open now") or status["sleep"][
         "next"

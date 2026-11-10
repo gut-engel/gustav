@@ -1,0 +1,36 @@
+# 4 GB VRAM, Turing (e.g. GTX 1650): fp16 only (no bfloat16, no FlashAttention-2),
+# 4-bit inference, and training only if the pre-flight check passes — which it
+# usually will not. The normal arrangement is: serve here, train elsewhere, and copy
+# the adapters over (see the README's remote section).
+# Select with `hardware.profile: tiny-4gb`.
+
+balance: 0.25
+min_tokens_per_second: 10
+# Leave more of a small card for the desktop.
+vram_reserve_fraction: 0.20
+ram_reserve_mb: 4096
+allow_training: false
+require_training: false
+max_seq_len: 1024
+kv_cache_dtype: int8
+
+plan:
+  base_model: qwen3-1.7b
+  repo: Qwen/Qwen3-1.7B
+  quantization: 4bit-nf4
+  max_seq_len: 1024
+  kv_cache_dtype: int8
+  compute_dtype: float16          # Turing has no bfloat16
+  attention: sdpa                 # FlashAttention-2 needs sm_80+
+  lora_rank: 8
+  train_seq_len: 512
+  batch_size: 1
+  grad_accum: 16
+  gradient_checkpointing: true
+  optimizer: paged_adamw_8bit
+  speculative_decoding: false
+  draft_model: null
+  inference_gpus: [0]
+  training_gpus: []
+  training_allowed: false
+  training_strategy: none

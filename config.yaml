@@ -35,6 +35,36 @@ schedule:
   max_gpu_temp_c: 83
   tick_seconds: 5.0
 
+hardware:
+  # "auto" runs the planner at startup and writes profiles/auto-generated.yaml.
+  # Any other name loads profiles/<name>.yaml and pins whatever it sets.
+  profile: auto
+  # The one knob: 0.0 = as fast as possible, 1.0 = as capable as possible.
+  # It works by raising the speed floor, which moves the choice along the model ladder.
+  balance: 0.5
+  # Chat speed we refuse to go below.
+  min_tokens_per_second: 15
+  # Left free on every GPU for other software (the measured usage of other processes
+  # counts against the same allowance rather than on top of it).
+  vram_reserve_fraction: 0.15
+  ram_reserve_mb: 8192
+  disk_reserve_mb: 10240
+  # Only choose a model that can also train here. Set false to serve a bigger model and
+  # train on another machine.
+  allow_training: true
+  require_training: true
+  # Empty = decide from the detected GPUs: with two or more cards one serves and the
+  # rest train, so chat stays up during sleep.
+  inference_gpus: []
+  training_gpus: []
+  # max_seq_len: 2048        # let the planner choose, or pin it
+  # train_seq_len: 1024
+  kv_cache_dtype: auto       # auto | fp16 | bf16 | int8 | fp8
+  speculative_decoding: auto # auto | on | off
+  # prefer_model: qwen3-4b   # pin a base model from the ladder
+  # deny_models: [qwen3-30b-a3b]
+  replan_on_hardware_change: true
+
 supervisor:
   # A child that stops heart-beating for this long is killed and retried.
   heartbeat_timeout_seconds: 60

@@ -59,7 +59,7 @@ def load_config(
     """Load config.yaml (+ the active profile) and derive the path layout.
 
     Precedence, lowest first: schema defaults, ``config.yaml``, the profile named by
-    ``hardware.profile`` (stage 2+), explicit ``overrides``, then ``GUSTAV_DATA_DIR``.
+    ``hardware.profile``, explicit ``overrides``, then ``GUSTAV_DATA_DIR``.
     """
     if config_path is None:
         config_path = os.environ.get(ENV_CONFIG)
@@ -74,7 +74,11 @@ def load_config(
 
     data = _read_yaml(cfg_file)
 
-    profile_name = (data.get("hardware") or {}).get("profile")
+    # Overrides are merged first so that they can *select* the profile, and again at
+    # the end so that they still win over whatever the profile sets.
+    selection = deep_merge(data, overrides) if overrides else data
+    profile_name = (selection.get("hardware") or {}).get("profile")
+    # A profile file is a hardware section: knobs plus an optional pinned `plan`.
     if profile_name and profile_name != "auto":
         profile_file = project_root / "profiles" / f"{profile_name}.yaml"
         if not profile_file.exists():

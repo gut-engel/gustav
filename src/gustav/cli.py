@@ -23,11 +23,9 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0)
 #: Commands whose implementation lands in a later stage. Listed so `ai --help` shows the
 #: full surface and the message is an explanation rather than "unknown command".
 NOT_YET: dict[str, str] = {
-    "plan-hardware": "stage 2 (hardware detection + planner)",
     "backup": "stage 4 (backups)",
     "report": "stage 5 (sleep phase)",
     "facts": "stage 5 (sleep phase)",
-    "approve-base-change": "stage 2 (planner approvals)",
     "approve-expansion": "stage 6 (self-expansion)",
     "expansion": "stage 6 (self-expansion)",
     "optimize": "stage 6 (self-optimisation)",
@@ -103,8 +101,29 @@ def _print_status(status: dict[str, Any]) -> None:
         lines.append(f"current run      {sleep['current_run']} (asleep now)")
     if sleep.get("resumable_runs"):
         lines.append(f"resumable runs   {sleep['resumable_runs']}")
-    if status.get("hardware_plan"):
-        lines.append(f"hardware plan    {status['hardware_plan']}")
+    hardware = status.get("hardware") or {}
+    if hardware.get("plan"):
+        lines.append(f"hardware plan    {hardware['plan']}")
+        budget = hardware.get("expansion_budget") or {}
+        if budget:
+            lines.append(
+                f"vram             "
+                f"{(hardware.get('vram_inference_mb') or 0) / 1024:.1f} GiB inference / "
+                f"{(hardware.get('vram_training_mb') or 0) / 1024:.1f} GiB training, "
+                f"{budget['max_adapters']} adapters <= r{budget['max_lora_rank']}"
+            )
+    for gpu in hardware.get("gpus") or []:
+        lines.append(f"gpu detected     {gpu}")
+    temps = hardware.get("temperatures_c") or {}
+    if temps:
+        lines.append(
+            "temperature      "
+            + ", ".join(f"GPU{i} {t:.0f}C" for i, t in sorted(temps.items()))
+        )
+    for warning in hardware.get("warnings") or []:
+        lines.append(f"  ! {warning}")
+    if hardware.get("problem"):
+        lines.append(f"  ! {hardware['problem']}")
     lines.append(f"last backup      {status.get('last_backup') or 'none yet'}")
     if status["failed_steps"]:
         lines.append("failed steps")
@@ -257,6 +276,154 @@ def cmd_stop(args: argparse.Namespace, client: Client) -> int:
     return 0
 
 
+def cmd_plan_hardware_offline(args: argparse.Namespace) -> int:
+    """Plan without a running daemon: 'can this machine run it at all?'"""
+    from gustav.hw.detect import default_detector, simulated
+    from gustav.hw.planner import Planner, PlannerError
+
+    config, paths = load_config(args.config, overrides=_overrides(args))
+    detector = simulated(args.simulate) if args.simulate else default_detector(paths.data_dir)
+    hardware = detector.detect()
+    overrides: dict[str, Any] = {}
+    if args.no_training:
+        overrides.update(allow_training=False, require_training=False)
+    if args.model:
+        overrides["prefer_model"] = args.model
+    if args.max_seq_len:
+        overrides["max_seq_len"] = args.max_seq_len
+    hw_config = config.hardware.model_copy(
+        update={**({"balance": args.balance} if args.balance is not None else {}), **overrides}
+    )
+
+    for line in hardware.describe():
+        print(line)
+    print()
+    try:
+        plan = Planner(hardware, hw_config).plan()
+    except PlannerError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, default=str))
+        return 0
+    print(f"plan: {_plan_line(plan.to_dict())}")
+    print()
+    for line in plan.explanation:
+        print(f"  {line}")
+    for warning in plan.warnings:
+        print(f"  ! {warning}")
+    if args.verbose and plan.rejected:
+        print("\nnot chosen:")
+        for line in plan.rejected:
+            print(f"  {line}")
+    print("\n(computed locally; start the daemon and re-run with --apply to use it)")
+    return 0
+
+
+def cmd_plan_hardware(args: argparse.Namespace, client: Client) -> int:
+    payload: dict[str, Any] = {"apply": args.apply}
+    if args.balance is not None:
+        payload["balance"] = args.balance
+    overrides: dict[str, Any] = {}
+    if args.no_training:
+        overrides["require_training"] = False
+        overrides["allow_training"] = False
+    if args.model:
+        overrides["prefer_model"] = args.model
+    if args.max_seq_len:
+        overrides["max_seq_len"] = args.max_seq_len
+    if overrides:
+        payload["overrides"] = overrides
+
+    result = client.post("/hardware/plan", json=payload)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+
+    plan = result["plan"]
+    print(f"plan: {_plan_line(plan)}")
+    print()
+    for line in result["explanation"]:
+        print(f"  {line}")
+    for warning in plan.get("warnings") or []:
+        print(f"  ! {warning}")
+    if args.verbose and result.get("rejected"):
+        print("\nnot chosen:")
+        for line in result["rejected"]:
+            print(f"  {line}")
+    if result.get("messages"):
+        print()
+        for message in result["messages"]:
+            print(f"  ! {message}")
+    if result.get("applied"):
+        print("\nstored as the active plan")
+    elif not args.apply:
+        print("\n(nothing changed; pass --apply to store this plan)")
+    return 0
+
+
+def _plan_line(plan: dict[str, Any]) -> str:
+    speed = plan.get("estimated_tokens_per_second") or 0
+    kind = "measured" if plan.get("speed_measured") else "estimated"
+    gpus = plan.get("training_gpus") or []
+    if plan.get("training_allowed") and gpus:
+        label = "GPU" if len(gpus) == 1 else "GPUs"
+        training = f"training on {label} {', '.join(str(g) for g in gpus)}"
+    else:
+        training = "inference only"
+    return (
+        f"{plan['base_model']} @ {plan['quantization']}, seq {plan['max_seq_len']}, "
+        f"LoRA r{plan['lora_rank']}, ~{speed:.0f} tok/s ({kind}), {training}"
+    )
+
+
+def cmd_hardware(args: argparse.Namespace, client: Client) -> int:
+    info = client.get("/hardware")
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return 0
+    print(f"fingerprint      {info['fingerprint']}  (source: {info['source']})")
+    for gpu in info["gpus"]:
+        print(f"                 {gpu}")
+    for budget in info["budgets"]:
+        print(f"                 {budget}")
+    host = info["host"]
+    print(
+        f"host             {host['cpu_count']} cores, "
+        f"{host['ram_total_mb'] / 1024:.0f} GiB RAM, "
+        f"{host['disk_free_mb'] / 1024:.0f} GiB disk free"
+    )
+    print(f"active base      {info['active_base_model'] or 'none yet'}")
+    if info.get("plan"):
+        print(f"plan             {_plan_line(info['plan'])}")
+    if info.get("pending_plan"):
+        print(f"proposed         {_plan_line(info['pending_plan'])}  (needs approval)")
+    return 0
+
+
+def cmd_approvals(args: argparse.Namespace, client: Client) -> int:
+    rows = client.get("/approvals", params={"status": args.status})["approvals"]
+    if not rows:
+        print(f"no {args.status} approvals")
+        return 0
+    for row in rows:
+        print(f"[{row['id']}] {row['kind']}: {row['subject']}   ({row['status']})")
+        for line in (row.get("rationale") or "").splitlines():
+            print(f"      {line}")
+    return 0
+
+
+def cmd_approve_base_change(args: argparse.Namespace, client: Client) -> int:
+    result = client.post(f"/approvals/{args.id}", json={"approve": True})
+    if result.get("approved"):
+        plan = result["plan"]
+        print(f"approved: the base model is now {plan['base_model']}")
+        print("adapters trained on the previous base no longer apply")
+        return 0
+    print(result.get("reason", "not approved"), file=sys.stderr)
+    return 1
+
+
 def cmd_events(args: argparse.Namespace, client: Client) -> int:
     payload = client.get("/events", params={"limit": args.limit, **({"kind": args.kind} if args.kind else {})})
     for event in reversed(payload["events"]):
@@ -322,6 +489,33 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("resume-learning", help="allow sleeping again")
     sub.add_parser("stop", help="shut the daemon down gracefully")
 
+    p = sub.add_parser("plan-hardware", help="size the system for this machine")
+    p.add_argument("--balance", type=float, help="0.0 = fastest ... 1.0 = most capable")
+    p.add_argument("--apply", action="store_true", help="store the plan as active")
+    p.add_argument("--no-training", action="store_true", help="plan for inference only")
+    p.add_argument("--model", help="pin a base model from the ladder")
+    p.add_argument("--max-seq-len", type=int)
+    p.add_argument("-v", "--verbose", action="store_true", help="also list what was rejected")
+    p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--offline", action="store_true",
+        help="plan without a running daemon (answers 'will this run here?')",
+    )
+    p.add_argument(
+        "--simulate", metavar="PRESET",
+        help="plan for a simulated machine instead: tiny-4gb, small-12gb, "
+             "server-multigpu, cpu-only (implies --offline)",
+    )
+
+    p = sub.add_parser("hardware", help="what was detected, and the active plan")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("approvals", help="things waiting for your decision")
+    p.add_argument("--status", default="pending", choices=["pending", "approved", "rejected", "all"])
+
+    p = sub.add_parser("approve-base-change", help="accept a proposed base-model change")
+    p.add_argument("id", type=int)
+
     p = sub.add_parser("events", help="recent daemon events")
     p.add_argument("--limit", type=int, default=40)
     p.add_argument("--kind")
@@ -365,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_not_yet(args.not_yet)
     if getattr(args, "local", False):
         return cmd_start(args)
+    if args.command == "plan-hardware" and (args.offline or args.simulate):
+        return cmd_plan_hardware_offline(args)
 
     client = Client(_resolve_socket(args), base_url=args.url, token=args.token)
     try:
@@ -386,6 +582,14 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_events(args, client)
         if args.command == "runs":
             return cmd_runs(args, client)
+        if args.command == "plan-hardware":
+            return cmd_plan_hardware(args, client)
+        if args.command == "hardware":
+            return cmd_hardware(args, client)
+        if args.command == "approvals":
+            return cmd_approvals(args, client)
+        if args.command == "approve-base-change":
+            return cmd_approve_base_change(args, client)
         parser.error(f"unhandled command {args.command}")
         return 2
     except DaemonUnreachable as exc:

@@ -1,0 +1,164 @@
+# The model ladder: what the planner is allowed to choose from, in order of capability.
+#
+# Architecture numbers are used to compute parameter counts, KV-cache size and LoRA
+# footprints, so they must match the model's config.json. When weights are present on
+# disk the loader reads config.json and overrides these (see ladder.ModelSpec.from_hf_config),
+# which is why `verified: false` below is not a problem in practice — it only means the
+# numbers came from this file rather than from a downloaded model.
+#
+# Adding a model is a matter of adding an entry. Nothing here is hardcoded elsewhere.
+
+quantizations:
+  - id: 4bit-nf4
+    label: 4-bit NF4 (bitsandbytes, double quant)
+    # Tried first when two quantisations of the same model both fit: QLoRA on NF4 is
+    # the best-supported training path and it leaves the most room for adapters.
+    preference: 3
+    bytes_per_param: 0.55        # 4 bits + quantisation constants
+    linear_only: true            # embeddings, lm_head and norms stay in 16-bit
+    trainable: true              # QLoRA
+    compute_dtype: auto
+    # Decode is memory-bandwidth bound; this is the fraction of theoretical bandwidth
+    # a transformers + bitsandbytes generate() loop actually achieves. Replaced by a
+    # real measurement as soon as the harness can benchmark (stage 3).
+    bandwidth_efficiency: 0.22
+  - id: 8bit
+    label: 8-bit int8 (bitsandbytes)
+    preference: 2
+    bytes_per_param: 1.07
+    linear_only: true
+    trainable: true
+    compute_dtype: auto
+    bandwidth_efficiency: 0.30
+  - id: bf16
+    label: bfloat16 (no quantisation)
+    preference: 1
+    bytes_per_param: 2.0
+    linear_only: false
+    trainable: true
+    compute_dtype: bfloat16
+    requires_bf16: true
+    bandwidth_efficiency: 0.55
+  - id: fp16
+    label: float16 (no quantisation)
+    preference: 1
+    bytes_per_param: 2.0
+    linear_only: false
+    trainable: true
+    compute_dtype: float16
+    bandwidth_efficiency: 0.55
+
+defaults:
+  lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  seq_len_options: [512, 1024, 2048, 4096, 8192]
+
+models:
+  - id: qwen3-0.6b
+    repo: Qwen/Qwen3-0.6B
+    label: Qwen3 0.6B
+    rung: 1
+    family: qwen3
+    layers: 28
+    hidden: 1024
+    attn_heads: 16
+    kv_heads: 8
+    head_dim: 128
+    intermediate: 3072
+    vocab: 151936
+    tied_embeddings: true
+    max_position: 32768
+    quantizations: [4bit-nf4, bf16, fp16]
+    draft: true                 # small enough to be a speculative-decoding draft
+    verified: false
+
+  - id: qwen3-1.7b
+    repo: Qwen/Qwen3-1.7B
+    label: Qwen3 1.7B
+    rung: 2
+    family: qwen3
+    layers: 28
+    hidden: 2048
+    attn_heads: 16
+    kv_heads: 8
+    head_dim: 128
+    intermediate: 6144
+    vocab: 151936
+    tied_embeddings: true
+    max_position: 32768
+    quantizations: [4bit-nf4, 8bit, bf16, fp16]
+    draft: true
+    verified: false
+
+  - id: qwen3-4b
+    repo: Qwen/Qwen3-4B
+    label: Qwen3 4B
+    rung: 3
+    family: qwen3
+    layers: 36
+    hidden: 2560
+    attn_heads: 32
+    kv_heads: 8
+    head_dim: 128
+    intermediate: 9728
+    vocab: 151936
+    tied_embeddings: true
+    max_position: 32768
+    quantizations: [4bit-nf4, 8bit, bf16, fp16]
+    verified: false
+
+  - id: qwen3-8b
+    repo: Qwen/Qwen3-8B
+    label: Qwen3 8B
+    rung: 4
+    family: qwen3
+    layers: 36
+    hidden: 4096
+    attn_heads: 32
+    kv_heads: 8
+    head_dim: 128
+    intermediate: 12288
+    vocab: 151936
+    tied_embeddings: false
+    max_position: 32768
+    quantizations: [4bit-nf4, 8bit, bf16]
+    verified: false
+
+  - id: qwen3-14b
+    repo: Qwen/Qwen3-14B
+    label: Qwen3 14B
+    rung: 5
+    family: qwen3
+    layers: 40
+    hidden: 5120
+    attn_heads: 40
+    kv_heads: 8
+    head_dim: 128
+    intermediate: 17408
+    vocab: 151936
+    tied_embeddings: false
+    max_position: 32768
+    quantizations: [4bit-nf4, 8bit, bf16]
+    verified: false
+
+  - id: qwen3-30b-a3b
+    repo: Qwen/Qwen3-30B-A3B
+    label: Qwen3 30B-A3B (Mixture of Experts)
+    rung: 6
+    family: qwen3_moe
+    layers: 48
+    hidden: 2048
+    attn_heads: 32
+    kv_heads: 4
+    head_dim: 128
+    intermediate: 6144           # dense fallback, unused when experts are set
+    moe_experts: 128
+    moe_active_experts: 8
+    moe_intermediate: 768
+    vocab: 151936
+    tied_embeddings: false
+    max_position: 32768
+    quantizations: [4bit-nf4]
+    # LoRA on 128 experts per layer is not worth it; attention only.
+    lora_targets: [q_proj, k_proj, v_proj, o_proj]
+    expert_offload: true
+    verified: false

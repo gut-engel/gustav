@@ -1,0 +1,32 @@
+# 12 GB VRAM, 64 GB RAM (e.g. RTX 4070 SUPER / 3060 12GB / 4070 Ti).
+# Comfortable: a 4B base in 4-bit trains and serves on the same card.
+# Select with `hardware.profile: small-12gb` in config.yaml.
+
+balance: 0.5
+min_tokens_per_second: 15
+vram_reserve_fraction: 0.15
+ram_reserve_mb: 8192
+require_training: true
+
+plan:
+  base_model: qwen3-4b
+  repo: Qwen/Qwen3-4B
+  quantization: 4bit-nf4
+  max_seq_len: 2048
+  kv_cache_dtype: fp16
+  compute_dtype: bfloat16
+  attention: flash_attention_2
+  lora_rank: 16
+  train_seq_len: 1024
+  batch_size: 1
+  grad_accum: 16
+  gradient_checkpointing: true
+  optimizer: paged_adamw_8bit
+  speculative_decoding: false
+  draft_model: null
+  inference_gpus: [0]
+  training_gpus: [0]
+  training_allowed: true
+  training_strategy: single-gpu
+  # Optional: Qwen3-8B in 4-bit also fits for inference, but it is tight and leaves
+  # little room for several resident adapters. Set hardware.balance: 1.0 to get it.

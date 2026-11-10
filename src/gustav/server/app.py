@@ -30,6 +30,20 @@ class LearningRequest(BaseModel):
     paused: bool
 
 
+class PlanRequest(BaseModel):
+    #: Recompute with a different speed/capability balance without changing config.
+    balance: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: Store the result as the active plan (a base-model change still needs approval).
+    apply: bool = False
+    #: Any HardwareConfig key, e.g. {"require_training": false}.
+    overrides: dict[str, Any] = {}
+
+
+class ApprovalDecision(BaseModel):
+    approve: bool
+    note: str = ""
+
+
 def create_app(daemon: "Daemon") -> FastAPI:
     app = FastAPI(
         title="gustav",
@@ -133,6 +147,70 @@ def create_app(daemon: "Daemon") -> FastAPI:
                 for s in record.steps
             ],
         }
+
+    @app.get("/hardware", dependencies=guard)
+    async def hardware() -> dict[str, Any]:
+        return daemon.hw.describe()
+
+    @app.post("/hardware/plan", dependencies=guard)
+    async def plan_hardware(req: PlanRequest) -> dict[str, Any]:
+        from gustav.hw.planner import PlannerError
+
+        try:
+            if req.apply and req.balance is None and not req.overrides:
+                outcome = daemon._plan_hardware(reason="requested", force=True)
+                if outcome.plan is None:
+                    raise HTTPException(status_code=409, detail=outcome.error or "no usable plan")
+                return {
+                    "applied": True,
+                    "source": outcome.source,
+                    "approval_id": outcome.approval_id,
+                    "messages": outcome.messages,
+                    "plan": outcome.plan.to_dict(),
+                    "explanation": outcome.plan.explanation,
+                    "rejected": outcome.plan.rejected,
+                }
+            plan = daemon.hw.compute_plan(balance=req.balance, overrides=req.overrides or None)
+        except PlannerError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        applied = False
+        approval_id = None
+        if req.apply:
+            daemon.db.set_meta("hardware_plan", plan.to_dict())
+            applied = True
+        return {
+            "applied": applied,
+            "source": "planner",
+            "approval_id": approval_id,
+            "messages": [],
+            "plan": plan.to_dict(),
+            "explanation": plan.explanation,
+            "rejected": plan.rejected,
+        }
+
+    @app.get("/approvals", dependencies=guard)
+    async def approvals(status: str = "pending", limit: int = 50) -> dict[str, Any]:
+        rows = daemon.db.query(
+            "SELECT id, kind, subject, rationale, status, created_at, decided_at, note"
+            " FROM approvals WHERE (? = 'all' OR status = ?) ORDER BY id DESC LIMIT ?",
+            (status, status, limit),
+        )
+        return {"approvals": [dict(r) for r in rows]}
+
+    @app.post("/approvals/{approval_id}", dependencies=guard)
+    async def decide(approval_id: int, req: ApprovalDecision) -> dict[str, Any]:
+        try:
+            if not req.approve:
+                return daemon.hw.reject_approval(approval_id, req.note)
+            result = daemon.hw.approve_base_change(approval_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
 
     @app.get("/report", dependencies=guard)
     async def report() -> dict[str, Any]:

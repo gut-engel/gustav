@@ -18,7 +18,10 @@ pytestmark = pytest.mark.slow
 
 @pytest.fixture
 def running(repo_root, project, python_exe):
-    daemon = DaemonProcess(repo_root, project, python_exe)
+    # Simulated hardware so the CLI's output does not depend on this machine's GPU.
+    daemon = DaemonProcess(
+        repo_root, project, python_exe, GUSTAV_SIMULATE_HARDWARE="small-12gb"
+    )
     daemon.start()
     try:
         yield daemon
@@ -98,9 +101,50 @@ def test_a_missing_daemon_says_how_to_start_one(project, repo_root):
 
 
 def test_later_stage_commands_explain_themselves(project, repo_root):
-    result = ai(project, "plan-hardware", repo_root=repo_root)
+    result = ai(project, "backup", "list", repo_root=repo_root)
     assert result.returncode == 2
-    assert "stage 2" in result.stderr
+    assert "stage 4" in result.stderr
+
+
+def test_plan_hardware_explains_its_choice(running, project, repo_root):
+    result = ai(project, "plan-hardware", "-v", repo_root=repo_root)
+    assert result.returncode == 0, result.stderr
+    assert "qwen3-4b @ 4bit-nf4" in result.stdout
+    assert "largest model on the ladder" in result.stdout
+    assert "not chosen:" in result.stdout
+    assert "pass --apply to store this plan" in result.stdout
+
+
+def test_plan_hardware_balance_changes_the_answer(running, project, repo_root):
+    fast = ai(project, "plan-hardware", "--balance", "0.0", repo_root=repo_root).stdout
+    smart = ai(project, "plan-hardware", "--balance", "1.0", repo_root=repo_root).stdout
+    assert "qwen3-1.7b" in fast
+    assert "qwen3-8b" in smart
+
+
+def test_plan_hardware_json(running, project, repo_root):
+    import json
+
+    payload = json.loads(ai(project, "plan-hardware", "--json", repo_root=repo_root).stdout)
+    assert payload["plan"]["base_model"] == "qwen3-4b"
+    assert payload["applied"] is False
+
+
+def test_hardware_command_shows_what_was_detected(running, project, repo_root):
+    result = ai(project, "hardware", repo_root=repo_root)
+    assert "fingerprint" in result.stdout
+    assert "usable of" in result.stdout
+    assert "active base      qwen3-4b" in result.stdout
+
+
+def test_status_includes_the_plan(running, project, repo_root):
+    result = ai(project, "status", repo_root=repo_root)
+    assert "hardware plan    qwen3-4b" in result.stdout
+    assert "adapters <= r" in result.stdout
+
+
+def test_approvals_is_empty_on_a_fresh_install(running, project, repo_root):
+    assert "no pending approvals" in ai(project, "approvals", repo_root=repo_root).stdout
 
 
 def test_parser_covers_the_documented_command_surface():
@@ -113,3 +157,26 @@ def test_parser_covers_the_documented_command_surface():
         "plan-hardware", "optimize", "expansion", "facts", "start", "stop",
     ):
         assert expected in names, expected
+
+
+# --- offline planning (no daemon) ----------------------------------------
+def test_plan_hardware_offline_needs_no_daemon(project, repo_root):
+    result = ai(project, "plan-hardware", "--simulate", "small-12gb", repo_root=repo_root)
+    assert result.returncode == 0, result.stderr
+    assert "qwen3-4b" in result.stdout
+    assert "computed locally" in result.stdout
+
+
+def test_plan_hardware_offline_for_a_machine_that_cannot_run_it(project, repo_root):
+    result = ai(project, "plan-hardware", "--simulate", "cpu-only", repo_root=repo_root)
+    assert result.returncode == 1
+    assert "no GPU was detected" in result.stderr
+
+
+def test_plan_hardware_offline_respects_no_training(project, repo_root):
+    result = ai(
+        project, "plan-hardware", "--simulate", "tiny-4gb", "--no-training",
+        repo_root=repo_root,
+    )
+    assert "inference only" in result.stdout
+    assert "serves only" in result.stdout
