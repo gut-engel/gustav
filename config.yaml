@@ -33,6 +33,10 @@ schedule:
   cooldown_minutes: 60
   max_duration_minutes: 300
   max_gpu_temp_c: 83
+  # Stay awake while something else is using the GPU — a game, another model, a render.
+  # Sleeping would mean fighting it for the card.
+  max_foreign_vram_mb: 2048
+  max_foreign_gpu_percent: 35
   tick_seconds: 5.0
 
 hardware:
@@ -91,6 +95,10 @@ sleep:
   replay_fraction: 0.30
 
 wake:
+  # Release the GPU after this long without a message, so the VRAM is free for whatever
+  # else you are doing. The next message reloads the model (a second or two).
+  # Set to 0 to keep the model resident.
+  idle_unload_minutes: 15
   max_history_turns: 40
 
 maintenance:

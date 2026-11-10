@@ -91,6 +91,11 @@ class ScheduleConfig(Strict):
     max_duration_minutes: int = 300
     #: Pause training above this GPU temperature.
     max_gpu_temp_c: int = 83
+    #: Stay awake while another process holds this much VRAM. A game, another model or
+    #: a render job should not have to fight the daemon for the card.
+    max_foreign_vram_mb: int = 2048
+    #: Stay awake while the GPU is this busy with other software.
+    max_foreign_gpu_percent: int = 35
     #: How often the scheduler re-evaluates its triggers.
     tick_seconds: float = 5.0
 
@@ -142,6 +147,10 @@ class SleepConfig(Strict):
 
 
 class WakeConfig(Strict):
+    #: Release the GPU after this long without a request, so the VRAM is free for
+    #: whatever else you are doing. The next message reloads the model.
+    #: 0 disables it and keeps the model resident.
+    idle_unload_minutes: int = 15
     session_idle_minutes: int = 120
     max_history_turns: int = 40
     #: Store a redacted copy when a secret is detected. The live request still sees the

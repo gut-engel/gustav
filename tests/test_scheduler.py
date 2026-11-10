@@ -166,3 +166,42 @@ def test_no_window_configured_falls_back_to_other_triggers():
     assert s.next_window_start(DAY) is None
     assert not s.decide(obs(DAY, pending=10, idle_minutes=90))
     assert s.decide(obs(DAY, pending=99, idle_minutes=90)).trigger == "pending"
+
+
+# --- staying out of the way of other software -----------------------------
+def test_a_game_on_the_gpu_keeps_us_awake():
+    """Section 3: if the GPU is busy with other software, stay in wake-only mode."""
+    decision = sched(max_foreign_vram_mb=2048).decide(obs(NIGHT, foreign_vram_mb=7000))
+    assert not decision.should_sleep
+    assert "6.8 GiB of VRAM" in decision.reason and "staying awake" in decision.reason
+
+
+def test_the_desktops_own_vram_is_not_enough_to_stop_us():
+    decision = sched(max_foreign_vram_mb=2048).decide(obs(NIGHT, foreign_vram_mb=700))
+    assert decision.should_sleep
+
+
+def test_a_busy_gpu_keeps_us_awake_even_with_free_vram():
+    decision = sched(max_foreign_gpu_percent=35).decide(
+        obs(NIGHT, foreign_vram_mb=100, gpu_utilization_pct=92.0)
+    )
+    assert not decision.should_sleep and "92% busy" in decision.reason
+
+
+def test_an_idle_gpu_does_not_stop_us():
+    assert sched().decide(obs(NIGHT, gpu_utilization_pct=3.0)).should_sleep
+
+
+def test_the_guards_can_be_switched_off():
+    decision = sched(max_foreign_vram_mb=0, max_foreign_gpu_percent=0).decide(
+        obs(NIGHT, foreign_vram_mb=11000, gpu_utilization_pct=99.0)
+    )
+    assert decision.should_sleep
+
+
+def test_a_manual_sleep_still_wins_over_a_busy_gpu():
+    """If you ask for it explicitly, you get it."""
+    decision = sched().decide(
+        obs(NIGHT, manual_trigger="manual", foreign_vram_mb=9000, gpu_utilization_pct=99.0)
+    )
+    assert decision.should_sleep and decision.trigger == "manual"

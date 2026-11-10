@@ -41,6 +41,9 @@ class Observation:
     last_sleep_finished_at: datetime | None = None
     manual_trigger: str | None = None
     gpu_temp_c: float | None = None
+    #: VRAM held by processes that are not us, and how busy the card is.
+    foreign_vram_mb: int = 0
+    gpu_utilization_pct: float | None = None
     #: A run that was interrupted and still has steps to finish.
     resumable_run: bool = False
 
@@ -97,6 +100,27 @@ class Scheduler:
         if obs.gpu_temp_c is not None and obs.gpu_temp_c > cfg.max_gpu_temp_c:
             return SleepDecision(
                 False, None, f"GPU is {obs.gpu_temp_c:.0f}C, above the {cfg.max_gpu_temp_c}C limit"
+            )
+
+        # Section 3: if the GPU is busy with other software, stay in wake-only mode and
+        # retry later. Sleeping would mean fighting a game for the card.
+        if cfg.max_foreign_vram_mb and obs.foreign_vram_mb > cfg.max_foreign_vram_mb:
+            return SleepDecision(
+                False,
+                None,
+                f"another process is using {obs.foreign_vram_mb / 1024:.1f} GiB of VRAM "
+                f"(limit {cfg.max_foreign_vram_mb / 1024:.1f} GiB); staying awake",
+            )
+        if (
+            cfg.max_foreign_gpu_percent
+            and obs.gpu_utilization_pct is not None
+            and obs.gpu_utilization_pct > cfg.max_foreign_gpu_percent
+        ):
+            return SleepDecision(
+                False,
+                None,
+                f"the GPU is {obs.gpu_utilization_pct:.0f}% busy with other software "
+                f"(limit {cfg.max_foreign_gpu_percent}%); staying awake",
             )
 
         if obs.last_sleep_finished_at is not None:

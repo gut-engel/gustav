@@ -405,6 +405,18 @@ def cmd_learning(args: argparse.Namespace, client: Client, paused: bool) -> int:
     return 0
 
 
+def cmd_release_gpu(args: argparse.Namespace, client: Client) -> int:
+    result = client.post("/control/release-gpu", params={"reason": args.reason})
+    if result["released"]:
+        print("GPU released — the VRAM is free")
+    else:
+        print("nothing was loaded; the GPU was already free")
+    if result.get("sleep_paused"):
+        print("a running sleep was paused and checkpointed")
+    print(result["note"])
+    return 0
+
+
 def cmd_stop(args: argparse.Namespace, client: Client) -> int:
     client.post("/control/shutdown")
     print("daemon is shutting down")
@@ -640,6 +652,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("wake", help="pause sleep and come back online")
     sub.add_parser("pause-learning", help="no sleeping or training until resumed")
     sub.add_parser("resume-learning", help="allow sleeping again")
+    p = sub.add_parser(
+        "release-gpu", help="unload the model now and free the VRAM (reloads on demand)"
+    )
+    p.add_argument("--reason", default="requested")
+
     sub.add_parser("stop", help="shut the daemon down gracefully")
 
     p = sub.add_parser("plan-hardware", help="size the system for this machine")
@@ -729,6 +746,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_learning(args, client, True)
         if args.command == "resume-learning":
             return cmd_learning(args, client, False)
+        if args.command == "release-gpu":
+            return cmd_release_gpu(args, client)
         if args.command == "stop":
             return cmd_stop(args, client)
         if args.command == "events":

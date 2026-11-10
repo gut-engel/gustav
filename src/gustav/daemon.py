@@ -878,28 +878,84 @@ class Daemon:
                 await asyncio.sleep(tick)
 
     async def _maintenance_loop(self) -> None:
-        interval = max(self.config.maintenance.health_check_minutes * 60, 5)
-        recheck_every = max(self.config.maintenance.hardware_recheck_minutes * 60, interval)
-        last_hardware_check = self.clock.monotonic()
+        """One timer, several jobs, each on its own interval.
+
+        The tick itself is deliberately cheap: a 30-second sleep and a couple of
+        comparisons. Anything that costs real work has its own, much longer interval.
+        """
+        tick = 30.0
+        health_every = max(self.config.maintenance.health_check_minutes * 60, tick)
+        recheck_every = max(self.config.maintenance.hardware_recheck_minutes * 60, health_every)
+        last_health = last_hardware = self.clock.monotonic()
         while True:
             try:
-                await asyncio.sleep(interval)
-                ok, message = self.responder.health()
-                self.telemetry.record("daemon.alive", 1.0, state=str(self.state.state))
-                if self.clock.monotonic() - last_hardware_check >= recheck_every:
-                    last_hardware_check = self.clock.monotonic()
+                await asyncio.sleep(tick)
+                now = self.clock.monotonic()
+
+                await self._unload_if_idle()
+
+                if now - last_health >= health_every:
+                    last_health = now
+                    ok, message = self.responder.health()
+                    self.telemetry.record("daemon.alive", 1.0, state=str(self.state.state))
+                    if not ok and self.state.state is State.WAKE:
+                        self.events.emit("daemon.unhealthy", message, level="error")
+                        self.state.transition(State.SAFE_MODE, message)
+
+                if now - last_hardware >= recheck_every:
+                    last_hardware = now
                     self._plan_hardware(reason="periodic re-check", force=True)
-                if not ok and self.state.state is State.WAKE:
-                    self.events.emit("daemon.unhealthy", message, level="error")
-                    self.state.transition(State.SAFE_MODE, message)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 self.log.exception("maintenance tick failed")
 
+    async def _unload_if_idle(self) -> None:
+        """Give the VRAM back when nobody is talking to us.
+
+        The model is several gigabytes; holding it while you are doing something else
+        with the GPU is rude. The next message reloads it, which costs a second or two.
+        """
+        minutes = self.config.wake.idle_unload_minutes
+        if not minutes or not self.responder.loaded:
+            return
+        if self.state.state is not State.WAKE:
+            return
+        idle_seconds = (self.clock.now() - self.last_activity_at).total_seconds()
+        if idle_seconds < minutes * 60:
+            return
+        async with self._chat_lock:
+            if not self.responder.loaded:
+                return
+            await self.responder.unload()
+        self.events.emit(
+            "inference.idle_unload",
+            f"released the GPU after {idle_seconds / 60:.0f} min idle; "
+            f"the next message reloads the model",
+            idle_minutes=round(idle_seconds / 60, 1),
+        )
+
+    async def release_gpu(self, reason: str = "requested") -> dict[str, Any]:
+        """Unload the model now. Chat still works; it reloads on the next message."""
+        was_loaded = self.responder.loaded
+        paused = False
+        if self.state.state is State.SLEEP:
+            paused = await self._pause_sleep(f"GPU release: {reason}", wait=True)
+        async with self._chat_lock:
+            if self.responder.loaded:
+                await self.responder.unload()
+        if was_loaded or paused:
+            self.events.emit("inference.released", f"released the GPU ({reason})")
+        return {
+            "released": was_loaded,
+            "sleep_paused": paused,
+            "note": "the next message reloads the model",
+        }
+
     def _observe(self, *, manual: str | None = None) -> Observation:
         last_sleep = self.db.get_meta(META_LAST_SLEEP)
         resumable = any(r.next_step is not None for r in self.journal.open_runs())
+        foreign_mb, utilisation = self._gpu_pressure_quiet()
         return Observation(
             state=self.state.state,
             now=self.clock.now(),
@@ -909,8 +965,21 @@ class Daemon:
             last_sleep_finished_at=_parse_dt(last_sleep),
             manual_trigger=manual,
             gpu_temp_c=self._gpu_temperature(),
+            foreign_vram_mb=foreign_mb,
+            gpu_utilization_pct=utilisation,
             resumable_run=resumable,
         )
+
+    def _gpu_pressure_quiet(self) -> tuple[int, float | None]:
+        """What else is using the GPU. Never raises; the scheduler only needs a hint.
+
+        Our own inference process is excluded, but a *loaded* model of ours still
+        occupies VRAM, so the reading is taken as "someone else's" usage only.
+        """
+        try:
+            return self.hw.gpu_pressure()
+        except Exception:  # noqa: BLE001
+            return 0, None
 
     def _gpu_temperature(self) -> float | None:
         """Hottest GPU, for the scheduler's thermal guard. Never raises."""

@@ -232,6 +232,10 @@ def create_app(daemon: "Daemon") -> FastAPI:
     async def learning(req: LearningRequest) -> dict[str, Any]:
         return daemon.set_learning_paused(req.paused)
 
+    @app.post("/control/release-gpu", dependencies=guard)
+    async def release_gpu(reason: str = "requested") -> dict[str, Any]:
+        return await daemon.release_gpu(reason)
+
     @app.post("/control/shutdown", dependencies=guard)
     async def shutdown() -> dict[str, Any]:
         daemon.request_shutdown("shutdown requested over the control plane")

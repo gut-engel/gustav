@@ -98,6 +98,29 @@ class HardwareService:
         temps = self.gpu_temperatures()
         return max(temps.values()) if temps else None
 
+    def gpu_pressure(self) -> tuple[int, float | None]:
+        """(VRAM held by other processes, how busy the card is) — a cheap NVML poll.
+
+        Used by the scheduler to stay out of the way of whatever else is on the GPU.
+        """
+        if isinstance(self.detector, NvmlDetector):
+            try:
+                fresh = self.detector.detect()
+            except Exception:  # noqa: BLE001 - never let a poll break the tick
+                return 0, None
+        else:
+            fresh = self.hardware
+        plan = self.stored_plan()
+        indices = (plan.inference_gpus if plan and plan.inference_gpus else None)
+        gpus = [
+            g for g in fresh.gpus if indices is None or g.index in indices
+        ] or list(fresh.gpus)
+        if not gpus:
+            return 0, None
+        foreign = max(g.foreign_mb for g in gpus)
+        utilisations = [g.utilization_pct for g in gpus if g.utilization_pct is not None]
+        return foreign, (max(utilisations) if utilisations else None)
+
     # --- the ladder, refined by what is actually on disk ----------------
     def _ladder_with_local_configs(self) -> Ladder:
         """Prefer a downloaded model's own ``config.json`` over the ladder's numbers."""
