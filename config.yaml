@@ -1,0 +1,68 @@
+# Gustav configuration. Every key has a default, so this file may be empty.
+# Only the `tunable` section may ever be changed by the daemon itself.
+
+instance:
+  name: gustav
+  data_dir: var
+  # The CLI talks to the daemon over this Unix socket (default: <data_dir>/gustav.sock).
+  # socket: var/gustav.sock
+  http_enabled: false
+  http_host: 127.0.0.1
+  http_port: 8713
+  # http_token: set this before exposing the TCP port to anything but localhost
+
+logging:
+  level: INFO
+  console: true
+  json_lines: false
+
+schedule:
+  enabled: true
+  # Local-time windows in which the daemon is allowed to sleep.
+  windows: ["00:00-06:00"]
+  # Sleep after this much user silence (inside a window, or when pending work is high).
+  idle_trigger_enabled: true
+  idle_minutes: 45
+  # Sleep once this much unprocessed experience has piled up.
+  pending_trigger_enabled: true
+  pending_threshold: 50
+  # Don't sleep at all with less than this much to do (0 = sleep anyway).
+  min_pending_items: 1
+  # Never interrupt a conversation: require this much silence first.
+  min_idle_seconds: 120
+  cooldown_minutes: 60
+  max_duration_minutes: 300
+  max_gpu_temp_c: 83
+  tick_seconds: 5.0
+
+supervisor:
+  # A child that stops heart-beating for this long is killed and retried.
+  heartbeat_timeout_seconds: 60
+  step_timeout_seconds: 1800
+  memory_limit_mb: 16384
+  max_attempts: 3
+  retry_backoff_seconds: 10
+  retry_backoff_factor: 2.0
+
+sleep:
+  # disabled_steps: [dreaming]
+  simulated_step_seconds: 0.5   # stage-1 placeholder steps
+  replay_fraction: 0.30
+
+wake:
+  max_history_turns: 40
+
+maintenance:
+  health_check_minutes: 5
+  hardware_recheck_minutes: 60
+  backup_retention_minutes: 360
+  doc_cache_refresh_hours: 24
+
+# Self-optimisation may change these values and nothing else.
+tunable:
+  kv_cache_dtype: auto
+  batch_size: 1
+  speculative_decoding: false
+  router_threshold: 0.45
+  prefix_cache_mb: 512
+  warm_cache_mb: 8192

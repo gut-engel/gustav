@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+var/
+backups/
+adapters/
+models/
+profiles/auto-generated.yaml
+.coverage

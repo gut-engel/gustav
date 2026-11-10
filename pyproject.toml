@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gustav"
+version = "0.1.0"
+description = "Self-learning local AI with a wake/sleep cycle, run by a single always-on daemon"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "psutil>=6.0",
+    "nvidia-ml-py>=12.560",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.15",
+    "transformers>=5.22",
+    "peft>=0.21",
+    "trl>=1.17",
+    "accelerate>=1.15",
+    "bitsandbytes>=0.50",
+    "datasets>=5.2",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+]
+
+[project.scripts]
+ai = "gustav.cli:main"
+gustav = "gustav.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gustav"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+timeout = 120
+markers = [
+    "gpu: requires a real GPU and model weights",
+    "slow: end-to-end tests that start a real daemon process",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
