@@ -23,7 +23,6 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0)
 #: Commands whose implementation lands in a later stage. Listed so `ai --help` shows the
 #: full surface and the message is an explanation rather than "unknown command".
 NOT_YET: dict[str, str] = {
-    "backup": "stage 4 (backups)",
     "report": "stage 5 (sleep phase)",
     "facts": "stage 5 (sleep phase)",
     "approve-expansion": "stage 6 (self-expansion)",
@@ -147,7 +146,15 @@ def _print_status(status: dict[str, Any]) -> None:
         lines.append(f"  ! {warning}")
     if hardware.get("problem"):
         lines.append(f"  ! {hardware['problem']}")
-    lines.append(f"last backup      {status.get('last_backup') or 'none yet'}")
+    backup = status.get("last_backup")
+    if isinstance(backup, dict):
+        lines.append(
+            f"last backup      {backup['id']} ({backup['operation']}, "
+            f"{backup['size_mb']:.0f} MiB"
+            + (", verified)" if backup.get("verified") else ")")
+        )
+    else:
+        lines.append(f"last backup      {backup or 'none yet'}")
     if status.get("load_error"):
         lines.append(f"  ! the model is not loaded: {status['load_error'].splitlines()[0]}")
     if status["failed_steps"]:
@@ -327,6 +334,76 @@ def cmd_model(args: argparse.Namespace, client: Client) -> int:
         return 1
     print(f"done: {result['path']} ({result['size_mb'] / 1024:.2f} GiB)")
     return 0
+
+
+def cmd_backup(args: argparse.Namespace, client: Client) -> int:
+    if args.action == "list":
+        payload = client.get("/backups")
+        print(f"snapshots in {payload['location']}  "
+              f"({payload['free_mb'] / 1024:.1f} GiB free)")
+        print(f"retention: {payload['policy']}")
+        if not payload["snapshots"]:
+            print("  (none yet)")
+        for snapshot in payload["snapshots"]:
+            marks = []
+            if snapshot["protected"]:
+                marks.append("protected")
+            if not snapshot["complete"]:
+                marks.append("INCOMPLETE")
+            print(
+                f"  {snapshot['id']:<34} {snapshot['operation']:<20} "
+                f"{snapshot['size_mb']:>9.1f} MiB  {snapshot['file_count']:>4} files"
+                + ("  " + ", ".join(marks) if marks else "")
+            )
+        changes = payload.get("changes") or []
+        if changes:
+            print("\nrecent weight changes:")
+            for change in changes:
+                print(f"  {change['started_at']}  {change['status']:<12} "
+                      f"{change['operation']}  snapshot={change['snapshot_id'] or '-'}")
+        return 0
+
+    if args.action == "create":
+        result = client.post(
+            "/backups",
+            json={"operation": args.operation, "dry_run": args.dry_run,
+                  "include_base": args.include_base},
+        )
+        if result.get("dry_run"):
+            for line in result["lines"]:
+                print(line)
+            return 0
+        print(f"snapshot {result['id']}: {result['file_count']} files, "
+              f"{result['size_mb']:.1f} MiB"
+              + (", verified" if result["verified"] else ""))
+        return 0
+
+    if args.action == "verify":
+        result = client.post(f"/backups/{args.snapshot_id}/verify")
+        for line in result["lines"]:
+            print(line)
+        return 0 if result["ok"] else 1
+
+    if args.action == "restore":
+        result = client.post(
+            f"/backups/{args.snapshot_id}/restore",
+            json={"only": args.only or [], "module": args.module, "dry_run": args.dry_run},
+        )
+        for line in result["lines"]:
+            print(line)
+        return 0
+
+    if args.action == "retention":
+        result = client.post("/backups/retention", params={"dry_run": args.dry_run})
+        verb = "would delete" if result["dry_run"] else "deleted"
+        print(f"policy: {result['policy']}")
+        print(f"keeping {len(result['kept'])}, {verb} {len(result['deleted'])}")
+        for snapshot_id in result["deleted"]:
+            print(f"  {verb} {snapshot_id}: {result['reasons'].get(snapshot_id, '')}")
+        return 0
+
+    print(f"unknown backup action {args.action}", file=sys.stderr)
+    return 2
 
 
 def cmd_bench(args: argparse.Namespace, client: Client) -> int:
@@ -630,6 +707,25 @@ def build_parser() -> argparse.ArgumentParser:
     pull = model_sub.add_parser("pull", help="fetch a checkpoint (uses the network)")
     pull.add_argument("model_id")
 
+    p = sub.add_parser("backup", help="snapshots: list, create, verify, restore, retention")
+    backup_sub = p.add_subparsers(dest="action", required=True)
+    backup_sub.add_parser("list", help="every snapshot and recent weight changes")
+    create = backup_sub.add_parser("create", help="take a snapshot now")
+    create.add_argument("--operation", default="manual")
+    create.add_argument("--dry-run", action="store_true",
+                        help="show what would be copied and how much space it needs")
+    create.add_argument("--include-base", action="store_true",
+                        help="also copy the base checkpoint (several GiB)")
+    verify = backup_sub.add_parser("verify", help="re-hash a snapshot and compare")
+    verify.add_argument("snapshot_id")
+    restore = backup_sub.add_parser("restore", help="restore a snapshot (undoable)")
+    restore.add_argument("snapshot_id")
+    restore.add_argument("--only", nargs="*", help="just these sources, e.g. adapters database")
+    restore.add_argument("--module", help="just one adapter module")
+    restore.add_argument("--dry-run", action="store_true")
+    ret = backup_sub.add_parser("retention", help="apply the retention policy")
+    ret.add_argument("--dry-run", action="store_true")
+
     p = sub.add_parser("bench", help="measure tokens/s, latency and peak VRAM")
     p.add_argument("--max-tokens", type=int, default=96)
     p.add_argument("--repeats", type=int, default=1)
@@ -756,6 +852,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_runs(args, client)
         if args.command == "model":
             return cmd_model(args, client)
+        if args.command == "backup":
+            return cmd_backup(args, client)
         if args.command == "bench":
             return cmd_bench(args, client)
         if args.command == "adapters":

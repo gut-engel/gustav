@@ -211,6 +211,28 @@ class HardwareConfig(Strict):
     plan: dict[str, Any] = {}
 
 
+class BackupConfig(Strict):
+    """Section 9. Nothing that changes weights runs without a verified snapshot."""
+
+    #: Turning this off removes the safety net. It exists for a machine that backs the
+    #: whole tree up by other means, and the daemon says so every time it is used.
+    enabled: bool = True
+    #: Where snapshots go. Ideally another disk, or a remote path. Default: <root>/backups.
+    location: str | None = None
+    #: Retention: the last N, plus one a day for M days and one a week for K weeks.
+    keep_last: int = 5
+    daily_days: int = 7
+    weekly_weeks: int = 4
+    #: Refuse to take a snapshot that would leave less than this free.
+    min_free_mb: int = 5120
+    #: Warn (rather than delete) when the location gets this low.
+    warn_free_mb: int = 20480
+    #: Include the base checkpoint. Only needed for a merge or a base change, which ask
+    #: for it explicitly; it is several gigabytes.
+    include_base_model: bool = False
+    verify_after_write: bool = True
+
+
 class Config(Strict):
     instance: InstanceConfig = InstanceConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -223,8 +245,8 @@ class Config(Strict):
     hardware: HardwareConfig = HardwareConfig()
     #: Sections owned by later stages. Declared loosely now so a stage-3+ config
     #: file still loads under this build.
+    backup: BackupConfig = BackupConfig()
     inference: dict[str, Any] = {}
-    backup: dict[str, Any] = {}
     expansion: dict[str, Any] = {}
     fetcher: dict[str, Any] = {}
     sandbox: dict[str, Any] = {}

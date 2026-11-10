@@ -161,6 +161,30 @@ MIGRATION_0001 = [
     "CREATE INDEX idx_telemetry_metric ON telemetry (metric, ts DESC)",
 ]
 
+MIGRATION_0002 = [
+    # Section 9: every operation that touches weights records the snapshot it took
+    # first. An entry still 'in_progress' at startup is an interrupted change, which
+    # is exactly what crash recovery needs to find and undo.
+    """
+    CREATE TABLE weight_changes (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at TEXT,
+        operation   TEXT NOT NULL,
+        snapshot_id TEXT,
+        status      TEXT NOT NULL DEFAULT 'in_progress',
+                    -- in_progress | done | rolled_back | failed | refused
+        run_id      INTEGER,
+        step        TEXT,
+        sources     TEXT,
+        detail      TEXT
+    )
+    """,
+    "CREATE INDEX idx_weight_changes_status ON weight_changes (status, id DESC)",
+    "CREATE INDEX idx_weight_changes_step ON weight_changes (run_id, step)",
+]
+
 MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (1, "initial_daemon_schema", MIGRATION_0001),
+    (2, "weight_change_log", MIGRATION_0002),
 ]

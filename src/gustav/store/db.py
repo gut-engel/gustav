@@ -144,6 +144,24 @@ class Database:
     def delete_meta(self, key: str) -> None:
         self.execute("DELETE FROM meta WHERE key = ?", (key,))
 
+    def backup_to(self, destination: Path | str) -> Path:
+        """A consistent copy, taken through SQLite's own backup API.
+
+        Copying the file would be wrong: in WAL mode the newest commits live in
+        ``-wal`` and a plain copy can catch a torn state. ``Connection.backup``
+        serialises against writers and produces a single, self-contained file.
+        """
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            other = sqlite3.connect(str(target))
+            try:
+                self._conn.backup(other)
+                other.execute("PRAGMA journal_mode=DELETE")  # one tidy file, no sidecars
+            finally:
+                other.close()
+        return target
+
     def close(self) -> None:
         with self._lock:
             try:

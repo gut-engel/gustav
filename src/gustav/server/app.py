@@ -54,6 +54,18 @@ class ModelRequest(BaseModel):
     model_id: str
 
 
+class BackupRequest(BaseModel):
+    operation: str = "manual"
+    dry_run: bool = False
+    include_base: bool = False
+
+
+class RestoreRequest(BaseModel):
+    only: list[str] = []
+    module: str | None = None
+    dry_run: bool = False
+
+
 class SleepRequest(BaseModel):
     dry_run: bool = False
     force: bool = False
@@ -286,6 +298,45 @@ def create_app(daemon: "Daemon") -> FastAPI:
             ],
         }
 
+    @app.get("/backups", dependencies=guard)
+    async def backups() -> dict[str, Any]:
+        return daemon.list_backups()
+
+    @app.post("/backups", dependencies=guard)
+    async def create_backup(req: BackupRequest) -> dict[str, Any]:
+        from gustav.backup.snapshot import BackupError
+
+        try:
+            return daemon.create_backup(
+                req.operation, dry_run=req.dry_run, include_base=req.include_base
+            )
+        except BackupError as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+
+    @app.post("/backups/{snapshot_id}/verify", dependencies=guard)
+    async def verify_backup(snapshot_id: str) -> dict[str, Any]:
+        from gustav.backup.snapshot import BackupError
+
+        try:
+            return daemon.verify_backup(snapshot_id)
+        except BackupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/backups/{snapshot_id}/restore", dependencies=guard)
+    async def restore_backup(snapshot_id: str, req: RestoreRequest) -> dict[str, Any]:
+        from gustav.backup.snapshot import BackupError
+
+        try:
+            return await daemon.restore_backup(
+                snapshot_id, only=tuple(req.only), module=req.module, dry_run=req.dry_run
+            )
+        except BackupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/backups/retention", dependencies=guard)
+    async def retention(dry_run: bool = False) -> dict[str, Any]:
+        return daemon.apply_retention(dry_run=dry_run)
+
     @app.post("/bench", dependencies=guard)
     async def bench(max_tokens: int = 96, repeats: int = 1) -> dict[str, Any]:
         try:
@@ -361,7 +412,8 @@ def create_app(daemon: "Daemon") -> FastAPI:
         try:
             if not req.approve:
                 return daemon.hw.reject_approval(approval_id, req.note)
-            result = daemon.hw.approve_base_change(approval_id)
+            # Guarded: a base change is a weight change (section 9).
+            result = daemon.approve_base_change(approval_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

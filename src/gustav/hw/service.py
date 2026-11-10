@@ -415,16 +415,16 @@ class HardwareService:
             return {"approved": False, "reason": f"approval #{approval_id} is {row['status']}"}
 
         plan = Plan.from_dict(json.loads(row["payload"]))
-        # Stage 4 takes a verified snapshot here before anything changes. Until then
-        # there are no trained adapters to lose, and we say so rather than implying
-        # a backup happened.
+        # A base change invalidates every adapter trained on the old base, so section 9
+        # requires a verified backup first. The daemon wraps this call in the guard; the
+        # snapshot id is recorded on the approval so it can be found later.
         self.events.emit(
             "hardware.base_change_approved",
             f"base model is now {plan.base_model} (approval #{approval_id}); "
             f"adapters trained on the previous base no longer apply",
             level="warning",
             approval=approval_id,
-            backup="not taken: backups arrive in stage 4",
+            previous_base=self.active_base_model,
         )
         self.db.set_meta(META_ACTIVE_BASE, plan.base_model)
         self.db.set_meta(META_PLAN, plan.to_dict())

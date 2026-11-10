@@ -20,8 +20,9 @@ ai sleep now
 
 ## Status
 
-Built in reviewable stages. **Stages 1-3 are complete** — it loads real weights and
-answers — and later stages are scaffolded behind the interfaces they define.
+Built in reviewable stages. **Stages 1-4 are complete** — it loads real weights, answers,
+and cannot change its own weights without a verified backup — and later stages are
+scaffolded behind the interfaces they define.
 `ai <command>` tells you when a command arrives.
 
 | Stage | What it is | State |
@@ -29,8 +30,8 @@ answers — and later stages are scaffolded behind the interfaces they define.
 | 1 | Daemon: state machine, scheduler, child supervision, journal, crash recovery, control plane | **done** |
 | 2 | Hardware detection, memory pre-flight, auto planner, base-model approvals | **done** |
 | 3 | Inference harness (transformers + PEFT), streaming chat, adapters, the wake phase | **done** |
-| 4 | Backups, verification and atomic promotion | next |
-| 5 | Sleep phase: consolidation, study, practice, training, gate | planned |
+| 4 | Backups, verification, atomic promotion, the weight-change guard | **done** |
+| 5 | Sleep phase: consolidation, study, practice, training, gate | next |
 | 6 | Self-expansion, self-optimisation, packaging | planned |
 
 Measured on the development machine (RTX 4070 SUPER, 12 GB) with Qwen3-4B in 4-bit NF4:
@@ -93,6 +94,13 @@ Guards that stop it being annoying: `min_idle_seconds` (never interrupt a live
 conversation — and the same guard governs how soon a paused night resumes),
 `cooldown_minutes` between nights, `max_duration_minutes` per night, and
 `max_gpu_temp_c` to pause when the card is too hot.
+
+**It stays out of the way when the GPU is needed elsewhere.** If another process holds
+more than `schedule.max_foreign_vram_mb` (2 GiB) or the card is busier than
+`max_foreign_gpu_percent` (35%), it will not start a sleep run and says why — playing a
+game should not mean fighting the daemon for the card. `wake.idle_unload_minutes` (15)
+also releases the model after that long without a message, so several gigabytes of VRAM
+are not held for nothing; the next message reloads it. `ai release-gpu` does it now.
 
 **A message during sleep wins.** The daemon asks the running step to stop, the child
 checkpoints at a step boundary and exits, the GPU lease comes back to inference, you get
@@ -203,6 +211,73 @@ of the measured triggers for self-expansion in stage 6.
 Modules are held in a tiered cache (VRAM → pinned RAM → disk, LRU) inside the adapter
 budget the hardware plan computed, so the VRAM ceiling is never exceeded by accident.
 
+## Backups
+
+Section 9 of the specification is a rule, not a feature: *no operation that adds,
+changes, merges or removes weights may start without a verified backup; if the backup
+fails, the operation is refused.* That rule is a single context manager, and every weight
+change goes through it:
+
+```python
+with guard.change("promote coding v004", sources=("adapters",)) as change:
+    ...                                  # write the new weights
+    change.activate(link, "v004")        # atomic symlink swap
+```
+
+On entry it takes a snapshot and **verifies it by re-hashing**; if that fails for any
+reason — disk full, permissions, a bad hash — it raises and the body never runs. If the
+body raises, the touched sources are restored from that snapshot before the error
+propagates. A test asserts the body does not execute when the backup fails, and
+[a structural test](tests/test_backup_invariants.py) reads the source to prove the guard
+is the only path: it parses `daemon.py` and fails if an `activate_adapter` or
+`rollback_adapter` call is not lexically inside a `with ... guard.change(...)` block.
+
+**Snapshots** go to `backups/<timestamp>-<operation>/` with a manifest of SHA-256 hashes
+covering the adapters and their metadata, the module registry, the SQLite store, the
+config, the profiles and hardware plan, the router and draft model, and the held-out
+benchmarks. The base checkpoint is included only for operations that could change it,
+since it is several gigabytes.
+
+Three details that matter more than they look:
+
+- **The database is copied through SQLite's own backup API**, not as a file. In WAL mode
+  the newest commits live in the `-wal` sidecar and a plain copy can catch a torn state.
+- **Symlinks are recorded as symlinks, not followed.** `adapters/<module>/active` *is*
+  the promotion mechanism; resolving it would quietly turn a pointer into a copy.
+- **The manifest is written last and atomically.** A snapshot directory without one is by
+  definition incomplete, which is how an interrupted backup is told apart from a finished
+  one — and incomplete ones are never restored from.
+
+**A restore is itself a change**, so it snapshots the current state first and tells you
+the id, which makes "I restored the wrong one" recoverable. Restores are staged beside the
+target and swapped in, so a crash mid-restore leaves the old tree or the new one, never a
+mixture — and a failed swap puts the original back.
+
+**An interrupted promotion is undone at startup.** Every change is logged in
+`weight_changes` with its snapshot id; an entry still `in_progress` when the daemon starts
+is by definition an interrupted operation, and recovery restores from its snapshot before
+anything else runs.
+
+```
+$ ai backup list
+snapshots in /home/simon/devel/gustav/backups  (1649.2 GiB free)
+retention: keep the last 5, one daily for 7 days, one weekly for 4 weeks
+  20261110T164051-manual             manual               0.1 MiB   3 files
+  20261110T164102-promote-coding     promote coding v004  4.2 MiB  18 files  protected
+
+recent weight changes:
+  2026-11-10 16:41:02  done  promote coding v004  snapshot=20261110T164102-promote-coding
+```
+
+`ai backup create [--dry-run]` (the dry run shows what would be copied and how much space
+it needs), `ai backup verify <id>`, `ai backup restore <id> [--module M] [--only adapters]`,
+`ai backup retention [--dry-run]`.
+
+**Retention** keeps the last N, one a day for M days and one a week for K weeks — and
+never the newest complete snapshot or one a pending approval refers to. When the location
+runs low it *warns*; it does not delete beyond the policy, because losing backups to free
+space is precisely the failure backups exist to prevent.
+
 ## Hardware and the auto planner
 
 `ai plan-hardware` sizes the system for the machine it is on. It reads the GPUs through
@@ -296,12 +371,14 @@ and the estimates become exact.
 | `ai model list` / `ai model pull <id>` | what weights are on disk; fetch one (uses the network) |
 | `ai bench` | measure tokens/s, latency and peak VRAM, and record it for the planner |
 | `ai adapters` / `ai rollback <module>` | adapter versions and what is loaded; go back one version |
+| `ai backup list\|create\|verify\|restore\|retention` | snapshots; every weight change takes one first |
+| `ai release-gpu` | unload now and free the VRAM (reloads on the next message) |
 | `ai runs [id]` | sleep runs and their steps, with checkpoints and errors |
 | `ai events [--kind K]` | the daemon's event log |
 | `ai stop` | graceful shutdown |
 
-Later stages add `ai backup list|verify|restore`, `ai approve-expansion`,
-`ai expansion --revert`, `ai optimize --revert`, `ai facts`, and `ai report`.
+Later stages add `ai approve-expansion`, `ai expansion --revert`, `ai optimize --revert`,
+`ai facts`, and `ai report`.
 
 Everything goes through the running daemon over a Unix socket at `var/gustav.sock`.
 Set `instance.http_enabled` (and `http_token`) to also listen on TCP for remote clients.
@@ -343,6 +420,7 @@ src/gustav/
   core/                state machine, scheduler, supervisor, journal, GPU lease, recovery
   hw/                  detection, the model ladder, memory model, pre-flight, planner
   inference/           backend, generation loop, sampling, adapters, router, caches
+  backup/              snapshots, manifests, atomic swaps, restore, retention, the guard
   sleep/               the pipeline and its steps
   wake/                the chat side
   server/ cli.py       control plane and its client

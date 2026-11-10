@@ -15,6 +15,7 @@ from gustav.core.journal import RunStatus, StepStatus
 from gustav.core.lockfile import LockHeld
 from gustav.core.state import State
 from gustav.daemon import Daemon
+from gustav.hw.detect import simulated
 from gustav.wake.responder import EchoResponder
 
 pytestmark = pytest.mark.asyncio
@@ -277,13 +278,15 @@ async def test_the_scheduler_triggers_sleep_by_itself(project, monkeypatch):
         "schedule:\n  enabled: true\n  windows: []\n  tick_seconds: 0.05\n"
         "  pending_threshold: 2\n  min_idle_seconds: 0\n  cooldown_minutes: 0\n"
         "  min_pending_items: 0\n"
+        "  max_foreign_vram_mb: 0\n  max_foreign_gpu_percent: 0\n"
         "supervisor:\n  memory_limit_mb: 0\n  max_attempts: 1\n"
         "sleep:\n  simulated_step_seconds: 0.01\n"
         "inference:\n  responder: echo\n",
         encoding="utf-8",
     )
     config, paths = load_config(project / "config.yaml")
-    instance = Daemon(config, paths)
+    # A simulated machine: the real one's GPU load must not decide whether this passes.
+    instance = Daemon(config, paths, detector=simulated("small-12gb"))
     await instance.start()
     try:
         transport = httpx.AsyncHTTPTransport(uds=str(instance.socket_path))

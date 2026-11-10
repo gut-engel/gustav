@@ -18,6 +18,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from gustav.backup.guard import WeightChangeGuard
+from gustav.backup.restore import Restorer
+from gustav.backup.retention import RetentionPolicy, plan_retention
+from gustav.backup.snapshot import BackupError, SnapshotStore
 from gustav.config.load import load_config
 from gustav.config.schema import Config
 from gustav.core.clock import Clock, RealClock
@@ -67,6 +71,23 @@ class Daemon:
         self.telemetry = Telemetry(self.db)
         self.journal = Journal(self.db)
         self.lock = PidLock(paths.lock_file)
+        self.backups = SnapshotStore(
+            self.paths,
+            location=config.backup.location,
+            db=self.db,
+            events=self.events,
+            min_free_mb=config.backup.min_free_mb,
+            warn_free_mb=config.backup.warn_free_mb,
+            logger=get_logger("backup"),
+        )
+        self.guard = WeightChangeGuard(
+            self.backups,
+            restorer=Restorer(self.backups, events=self.events),
+            db=self.db,
+            events=self.events,
+            enabled=config.backup.enabled,
+            logger=get_logger("guard"),
+        )
         self.lease = GpuLease("gpu0", logger=get_logger("gpu"))
         self.supervisor = Supervisor(logger=get_logger("supervisor"))
         self.scheduler = Scheduler(config.schedule, self.clock)
@@ -168,10 +189,29 @@ class Daemon:
             data_dir=str(self.paths.data_dir),
         )
 
+        # An interrupted weight change is undone before anything else runs.
+        undone = self.guard.rollback_interrupted()
+        for item in undone:
+            self.events.emit(
+                "weights.recovered" if item.get("restored") else "weights.recovery_failed",
+                f"interrupted {item['operation']}: "
+                + (
+                    f"restored from {item['snapshot']}"
+                    if item.get("restored")
+                    else f"could NOT be rolled back ({item.get('detail')})"
+                ),
+                level="warning" if item.get("restored") else "error",
+                **{k: v for k, v in item.items() if k != "detail"},
+            )
+
         self.recovery_report = Recovery(
             journal=self.journal,
             events=self.events,
             paths=self.paths,
+            rollbacks={
+                name: self._rollback_step
+                for name in ("expansion", "training", "gate", "snapshot")
+            },
             health_checks=[self.responder.health],
             logger=get_logger("recovery"),
         ).run()
@@ -195,6 +235,19 @@ class Daemon:
         self._tasks.append(asyncio.create_task(self._scheduler_loop(), name="scheduler"))
         self._tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
         self.log.info("gustav is awake; control socket at %s", self.socket_path)
+
+    def _rollback_step(self, run_id: int, step: str) -> None:
+        """Undo a weight-changing step that was interrupted (crash policy `rollback`)."""
+        result = self.guard.rollback_step(run_id, step)
+        if result is None:
+            self.log.info(
+                "step %s of run %s had not changed any weights; nothing to roll back",
+                step, run_id,
+            )
+            return
+        self.log.warning(
+            "rolled %s of run %s back from snapshot %s", step, run_id, result.snapshot_id
+        )
 
     async def _try_load_model(self, reason: str) -> bool:
         """Load the model, or record why not. Never raises."""
@@ -585,6 +638,172 @@ class Daemon:
         return self.db.insert("turns", values)
 
     # ------------------------------------------------------------------
+    # backups
+    # ------------------------------------------------------------------
+    def protected_snapshots(self) -> set[str]:
+        """Snapshots retention must never delete: those a pending approval refers to."""
+        rows = self.db.query(
+            "SELECT snapshot_id FROM approvals WHERE status = 'pending'"
+            " AND snapshot_id IS NOT NULL"
+        )
+        protected = {row["snapshot_id"] for row in rows}
+        rows = self.db.query(
+            "SELECT snapshot_id FROM weight_changes WHERE status = 'in_progress'"
+            " AND snapshot_id IS NOT NULL"
+        )
+        return protected | {row["snapshot_id"] for row in rows}
+
+    def retention_policy(self) -> RetentionPolicy:
+        return RetentionPolicy(
+            keep_last=self.config.backup.keep_last,
+            daily_days=self.config.backup.daily_days,
+            weekly_weeks=self.config.backup.weekly_weeks,
+        )
+
+    def apply_retention(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """Delete what the policy no longer needs. Never the newest, never a pending one."""
+        decision = plan_retention(
+            self.backups.list(),
+            self.retention_policy(),
+            protected=self.protected_snapshots(),
+            now=self.clock.now(),
+        )
+        free_mb = self.backups.free_mb()
+        if free_mb < self.config.backup.warn_free_mb:
+            # Warn rather than deleting beyond the policy: losing backups to free space
+            # is the very failure backups exist to prevent.
+            self.events.emit(
+                "backup.low_space",
+                f"the backup location has {free_mb / 1024:.1f} GiB free "
+                f"(warning below {self.config.backup.warn_free_mb / 1024:.1f} GiB)",
+                level="warning",
+                free_mb=free_mb,
+            )
+        deleted: list[str] = []
+        if not dry_run:
+            for snapshot in decision.delete:
+                try:
+                    self.backups.delete(snapshot.id)
+                    deleted.append(snapshot.id)
+                except BackupError as exc:
+                    self.log.warning("could not delete snapshot %s: %s", snapshot.id, exc)
+        return {
+            "kept": [s.id for s in decision.keep],
+            "deleted": deleted if not dry_run else [s.id for s in decision.delete],
+            "reasons": decision.reasons,
+            "policy": self.retention_policy().describe(),
+            "free_mb": free_mb,
+            "dry_run": dry_run,
+        }
+
+    def list_backups(self) -> dict[str, Any]:
+        protected = self.protected_snapshots()
+        return {
+            "location": str(self.backups.location),
+            "free_mb": self.backups.free_mb(),
+            "policy": self.retention_policy().describe(),
+            "snapshots": [
+                {
+                    "id": s.id, "operation": s.operation, "created_at": s.created_at,
+                    "size_mb": s.size_mb, "file_count": s.file_count,
+                    "complete": s.complete, "protected": s.id in protected,
+                }
+                for s in self.backups.list()
+            ],
+            "changes": self.guard.history(limit=10),
+        }
+
+    def create_backup(self, operation: str = "manual", *, dry_run: bool = False,
+                      include_base: bool = False) -> dict[str, Any]:
+        if dry_run:
+            plan = self.backups.plan(operation, include_base=include_base)
+            return {
+                "dry_run": True,
+                "operation": operation,
+                "estimated_mb": plan.estimated_mb,
+                "free_mb": plan.free_mb,
+                "sources": [{"name": n, "path": str(p), "size_mb": s} for n, p, s in plan.sources],
+                "warnings": plan.warnings,
+                "lines": plan.describe(),
+            }
+        snapshot = self.backups.create(operation, include_base=include_base)
+        self.db.set_meta(
+            "last_backup",
+            {
+                "id": snapshot.id, "operation": operation, "created_at": snapshot.created_at,
+                "size_mb": snapshot.size_mb, "verified": snapshot.verified,
+            },
+        )
+        return {
+            "dry_run": False, "id": snapshot.id, "size_mb": snapshot.size_mb,
+            "file_count": snapshot.file_count, "verified": snapshot.verified,
+            "path": str(snapshot.path),
+        }
+
+    def verify_backup(self, snapshot_id: str) -> dict[str, Any]:
+        result = self.backups.verify(snapshot_id, check_extra=True)
+        return {
+            "id": result.snapshot.id,
+            "ok": result.ok,
+            "file_count": result.snapshot.file_count,
+            "size_mb": result.snapshot.size_mb,
+            "problems": [{"path": p.path, "kind": p.kind, "detail": p.detail}
+                         for p in result.problems],
+            "lines": result.describe(),
+        }
+
+    async def restore_backup(
+        self,
+        snapshot_id: str,
+        *,
+        only: tuple[str, ...] = (),
+        module: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Restore, having first snapshotted the current state so this is undoable."""
+        restorer = Restorer(self.backups, events=self.events)
+        if not dry_run:
+            # The model holds adapters open; put it down before swapping files underneath.
+            await self.release_gpu(f"restoring snapshot {snapshot_id}")
+        result = restorer.restore(
+            snapshot_id, only=only, module=module, dry_run=dry_run
+        )
+        payload = {
+            "snapshot": result.snapshot_id,
+            "restored": result.restored,
+            "skipped": result.skipped,
+            "undo_snapshot": result.undo_snapshot_id,
+            "dry_run": result.dry_run,
+            "lines": result.describe(),
+        }
+        if not dry_run:
+            # The store on disk changed under us; re-read it.
+            self.db.set_meta("last_restore", payload)
+        return payload
+
+    def approve_base_change(self, approval_id: int) -> dict[str, Any]:
+        """Accept a base-model change — guarded, because it invalidates every adapter.
+
+        The base checkpoint itself is included in the snapshot: this is one of the two
+        operations section 9 names for that, since it is the one that could lose it.
+        """
+        with self.guard.change(
+            f"base-model change (approval {approval_id})",
+            sources=("adapters", "registry", "database", "profiles"),
+            include_base=self.config.backup.include_base_model,
+            meta={"approval": approval_id},
+        ) as change:
+            result = self.hw.approve_base_change(approval_id)
+            if result.get("approved"):
+                self.db.execute(
+                    "UPDATE approvals SET snapshot_id = ? WHERE id = ?",
+                    (change.snapshot_id, approval_id),
+                )
+                change.promoted.append(f"base model -> {result['plan']['base_model']}")
+        result["snapshot"] = change.snapshot_id
+        return result
+
+    # ------------------------------------------------------------------
     # benchmark
     # ------------------------------------------------------------------
     async def benchmark(self, *, max_tokens: int = 96, repeats: int = 1) -> dict[str, Any]:
@@ -686,18 +905,34 @@ class Daemon:
         return {"modules": {}, "active_in_model": {}, "note": "this responder has no adapters"}
 
     async def rollback_adapter(self, module: str) -> dict[str, Any]:
+        """Go back a version. Guarded: a verified snapshot exists before anything moves."""
         rollback = getattr(self.responder, "rollback_adapter", None)
         if not callable(rollback):
             raise RuntimeError("this responder has no adapters to roll back")
-        version = await rollback(module)
-        return {"module": module, "version": version.version}
+        with self.guard.change(
+            f"rollback {module}", sources=("adapters",), meta={"module": module}
+        ) as change:
+            version = await rollback(module)
+            change.promoted.append(f"{module} -> {version.version}")
+        return {
+            "module": module, "version": version.version, "snapshot": change.snapshot_id,
+        }
 
     async def activate_adapter(self, module: str, version: str) -> dict[str, Any]:
+        """Hot-swap a version in. Guarded, like every other change to weights."""
         activate = getattr(self.responder, "activate_adapter", None)
         if not callable(activate):
             raise RuntimeError("this responder has no adapters to activate")
-        target = await activate(module, version)
-        return {"module": module, "version": target.version}
+        with self.guard.change(
+            f"activate {module}@{version}",
+            sources=("adapters",),
+            meta={"module": module, "version": version},
+        ) as change:
+            target = await activate(module, version)
+            change.promoted.append(f"{module} -> {target.version}")
+        return {
+            "module": module, "version": target.version, "snapshot": change.snapshot_id,
+        }
 
     # ------------------------------------------------------------------
     # sleep
@@ -886,7 +1121,8 @@ class Daemon:
         tick = 30.0
         health_every = max(self.config.maintenance.health_check_minutes * 60, tick)
         recheck_every = max(self.config.maintenance.hardware_recheck_minutes * 60, health_every)
-        last_health = last_hardware = self.clock.monotonic()
+        retention_every = max(self.config.maintenance.backup_retention_minutes * 60, health_every)
+        last_health = last_hardware = last_retention = self.clock.monotonic()
         while True:
             try:
                 await asyncio.sleep(tick)
@@ -905,6 +1141,10 @@ class Daemon:
                 if now - last_hardware >= recheck_every:
                     last_hardware = now
                     self._plan_hardware(reason="periodic re-check", force=True)
+
+                if now - last_retention >= retention_every:
+                    last_retention = now
+                    self.apply_retention()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001

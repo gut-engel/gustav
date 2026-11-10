@@ -28,6 +28,9 @@ def project(tmp_path: Path) -> Path:
         "logging:\n  console: false\n  level: DEBUG\n"
         "schedule:\n  enabled: false\n  tick_seconds: 0.1\n  min_idle_seconds: 0\n"
         "  cooldown_minutes: 0\n  min_pending_items: 0\n"
+        # The busy-GPU guards are tested explicitly in test_scheduler.py; here they
+        # would make every test depend on what this machine's GPU is doing.
+        "  max_foreign_vram_mb: 0\n  max_foreign_gpu_percent: 0\n"
         "supervisor:\n  heartbeat_timeout_seconds: 5\n  step_timeout_seconds: 30\n"
         "  max_attempts: 2\n  retry_backoff_seconds: 0.05\n  memory_limit_mb: 0\n"
         "sleep:\n  simulated_step_seconds: 0.02\n"

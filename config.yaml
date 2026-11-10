@@ -69,6 +69,21 @@ hardware:
   # deny_models: [qwen3-30b-a3b]
   replan_on_hardware_change: true
 
+backup:
+  # Nothing that changes weights runs without a verified snapshot first (section 9).
+  enabled: true
+  # Ideally another disk, or a remote path. Default: <project>/backups
+  # location: /mnt/backup/gustav
+  # Keep the last N, plus one a day for M days and one a week for K weeks. The newest
+  # snapshot and any referenced by a pending approval are never deleted.
+  keep_last: 5
+  daily_days: 7
+  weekly_weeks: 4
+  # Refuse a snapshot that would leave less than this free; warn below warn_free_mb
+  # rather than deleting backups to make room.
+  min_free_mb: 5120
+  warn_free_mb: 20480
+
 inference:
   # auto = the real harness when the ML extras are installed; echo = a placeholder
   # responder that needs no GPU or weights (useful for development and tests).

@@ -101,9 +101,9 @@ def test_a_missing_daemon_says_how_to_start_one(project, repo_root):
 
 
 def test_later_stage_commands_explain_themselves(project, repo_root):
-    result = ai(project, "backup", "list", repo_root=repo_root)
+    result = ai(project, "report", repo_root=repo_root)
     assert result.returncode == 2
-    assert "stage 4" in result.stderr
+    assert "stage 5" in result.stderr
 
 
 def test_plan_hardware_explains_its_choice(running, project, repo_root):
@@ -180,3 +180,67 @@ def test_plan_hardware_offline_respects_no_training(project, repo_root):
     )
     assert "inference only" in result.stdout
     assert "serves only" in result.stdout
+
+
+# --- backups --------------------------------------------------------------
+def test_backup_list_is_empty_on_a_fresh_install(running, project, repo_root):
+    result = ai(project, "backup", "list", repo_root=repo_root)
+    assert result.returncode == 0, result.stderr
+    assert "(none yet)" in result.stdout
+    assert "retention: keep the last" in result.stdout
+
+
+def test_backup_create_verify_and_restore(running, project, repo_root):
+    created = ai(project, "backup", "create", "--operation", "manual", repo_root=repo_root)
+    assert created.returncode == 0, created.stderr
+    assert "verified" in created.stdout
+    snapshot_id = created.stdout.split()[1].rstrip(":")
+
+    listed = ai(project, "backup", "list", repo_root=repo_root)
+    assert snapshot_id in listed.stdout
+
+    verified = ai(project, "backup", "verify", snapshot_id, repo_root=repo_root)
+    assert verified.returncode == 0
+    assert "all hashes match" in verified.stdout
+
+    restored = ai(project, "backup", "restore", snapshot_id, "--dry-run", repo_root=repo_root)
+    assert "would restore" in restored.stdout
+
+
+def test_backup_create_dry_run_reports_sizes(running, project, repo_root):
+    result = ai(project, "backup", "create", "--dry-run", repo_root=repo_root)
+    assert "would go to" in result.stdout
+    assert "free at the destination" in result.stdout
+    assert "(none yet)" in ai(project, "backup", "list", repo_root=repo_root).stdout
+
+
+def test_backup_verify_detects_tampering(running, project, repo_root):
+    created = ai(project, "backup", "create", repo_root=repo_root)
+    snapshot_id = created.stdout.split()[1].rstrip(":")
+    target = next((project / "backups" / snapshot_id).rglob("gustav.db"))
+    target.write_bytes(b"corrupted")
+
+    result = ai(project, "backup", "verify", snapshot_id, repo_root=repo_root)
+    assert result.returncode == 1
+    assert "problem" in result.stdout
+
+
+def test_backup_retention_dry_run(running, project, repo_root):
+    for index in range(3):
+        ai(project, "backup", "create", "--operation", f"run{index}", repo_root=repo_root)
+    result = ai(project, "backup", "retention", "--dry-run", repo_root=repo_root)
+    assert "policy: keep the last" in result.stdout
+    assert "keeping 3" in result.stdout
+
+
+def test_status_shows_the_last_backup(running, project, repo_root):
+    ai(project, "backup", "create", "--operation", "manual", repo_root=repo_root)
+    result = ai(project, "status", repo_root=repo_root)
+    assert "last backup      " in result.stdout
+    assert "verified" in result.stdout
+
+
+def test_release_gpu_is_honest_when_nothing_is_loaded(running, project, repo_root):
+    result = ai(project, "release-gpu", repo_root=repo_root)
+    assert result.returncode == 0
+    assert "already free" in result.stdout or "released" in result.stdout
