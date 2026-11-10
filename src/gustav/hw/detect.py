@@ -28,6 +28,18 @@ BANDWIDTH_OVERRIDES_GB_S: dict[str, float] = {
 }
 
 
+def flash_attention_available() -> bool:
+    """Whether the ``flash_attn`` package is importable.
+
+    The GPU supporting FlashAttention-2 is not the same as having it installed, and
+    promising it in the plan when it is missing makes the plan a lie. It is an optional
+    extra: without it the backend uses PyTorch SDPA, which is close for small models.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("flash_attn") is not None
+
+
 @runtime_checkable
 class Detector(Protocol):
     def detect(self) -> Hardware: ...

@@ -20,37 +20,56 @@ ai sleep now
 
 ## Status
 
-Built in reviewable stages. **Stages 1-2 are complete**; later stages are scaffolded
-behind the interfaces they define, and `ai <command>` tells you when a command arrives.
+Built in reviewable stages. **Stages 1-3 are complete** — it loads real weights and
+answers — and later stages are scaffolded behind the interfaces they define.
+`ai <command>` tells you when a command arrives.
 
 | Stage | What it is | State |
 |---|---|---|
 | 1 | Daemon: state machine, scheduler, child supervision, journal, crash recovery, control plane | **done** |
 | 2 | Hardware detection, memory pre-flight, auto planner, base-model approvals | **done** |
-| 3 | Inference harness (transformers + PEFT) and the real wake phase | next |
-| 4 | Backups, verification and atomic promotion | planned |
+| 3 | Inference harness (transformers + PEFT), streaming chat, adapters, the wake phase | **done** |
+| 4 | Backups, verification and atomic promotion | next |
 | 5 | Sleep phase: consolidation, study, practice, training, gate | planned |
 | 6 | Self-expansion, self-optimisation, packaging | planned |
 
-Today the responder is an echo and the sleep steps do simulated, checkpointed work. That
-is deliberate: the hard parts of an always-on daemon — resuming an interrupted night,
-killing a hung child, handing the GPU back mid-training, never leaving weights
-half-written — are testable now, and the real work hangs off the same interfaces later.
-The planner is real, and so are its numbers; only the *speeds* are estimates until
-stage 3 can benchmark (every surface says which is which).
+Measured on the development machine (RTX 4070 SUPER, 12 GB) with Qwen3-4B in 4-bit NF4:
+**54 tok/s**, 25 ms to first token, 4.3 GiB peak VRAM. The sleep pipeline still does
+simulated, checkpointed work — but it already hands the GPU over for real: VRAM drops
+from 6.8 GiB to 1.8 GiB when a sleep step takes the card, and a chat request takes it
+back and answers within two seconds, reload included.
+
+The sleep steps still do simulated, checkpointed work. That is deliberate: the hard
+parts of an always-on daemon — resuming an interrupted night, killing a hung child,
+handing the GPU back mid-training, never leaving weights half-written — are tested now,
+and the real work hangs off the same interfaces in stage 5.
 
 ## Install
 
-Needs Python 3.12+ (3.14 is fine; torch 2.15 ships `cp314` wheels).
+Needs Python 3.12+ (3.14 is fine; torch 2.15 ships `cp314` wheels) and an NVIDIA GPU.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"      # add ".[ml]" from stage 3 onward
-.venv/bin/python daemon.py
+.venv/bin/pip install -e ".[ml,dev]"   # ~4 GB of CUDA wheels
+.venv/bin/python daemon.py             # plans, then loads the model it chose
+```
+
+In another terminal:
+
+```bash
+ai model pull qwen3-4b     # ~7.5 GiB, the only part that uses the network
+ai chat "what can you do?"
+ai bench                   # measures this machine; the planner then stops guessing
 ```
 
 `pip install -e .` puts `ai` on your PATH inside the venv. Without installing, `python
-daemon.py` works straight from a checkout.
+daemon.py` works straight from a checkout. Without the `ml` extra the daemon still runs
+end to end with a placeholder responder (`inference.responder: echo`), which is how most
+of the test suite stays fast.
+
+**FlashAttention-2 is optional.** It is not in the extras because it builds from source;
+install `flash-attn` yourself and the planner picks it up. Without it, PyTorch SDPA is
+used, and the plan says so rather than claiming otherwise.
 
 ## How the daemon schedules itself
 
@@ -101,6 +120,88 @@ training GPUs this never has to happen at all (`inference_gpus` / `training_gpus
 - **Safe mode.** If the active adapter will not load or fails its health prompt at
   startup, the daemon serves the last known-good weights (or the plain base model) and
   says so in `ai status` instead of flapping.
+
+## Chatting
+
+```
+$ ai chat
+Chatting with gustav. /help for commands, Ctrl-D to leave.
+you> name three rust crates for async IO, just the names
+ai > tokio, async-std, tokio-stream
+[50.0 tok/s, 91 ms to first token, modules: personal-memory, rust, general]
+```
+
+Tokens stream as they are produced. The harness is ours end to end — transformers and
+PEFT for the weights, but the generation loop, the sampling (temperature, top-p, top-k,
+min-p, repetition penalty), the stop sequences and the KV handling are this project's:
+
+- **The model's own chat template**, never a format we invented. Hybrid reasoning models
+  such as Qwen3 have their `<think>` block switched off for chat and available for the
+  practice tasks in stage 5, detected from the template rather than hardcoded.
+- **Stop sequences match across token boundaries.** A model emitting `</tool` then `>`
+  has produced `</tool>`, and a partial match at the tail is held back rather than
+  streamed, so a client never sees half a stop sequence.
+- **Prefix caching.** A multi-turn chat re-sends the whole conversation every turn, so
+  the shared prefix — nearly the whole prompt — is reused instead of recomputed. In the
+  example above, turn 3 reused 64 of 117 prompt tokens. It is a genuine trade-off:
+  a reused cache computes the prefill differently, so a *greedy* answer can differ by a
+  token from the same question asked cold. Set `tunable.prefix_cache: false` if you need
+  bit-exactness.
+- **The context budget keeps room for the answer.** Old turns are dropped (or, from
+  stage 5, summarised) to fit the window; the system prompt and the newest message always
+  survive, and a single over-long message is trimmed in the middle rather than cut off.
+
+Commands are handled before the model sees anything, and they are your control over what
+the system learns:
+
+| | |
+|---|---|
+| `/good`, `/bad` | becomes a preference pair |
+| `/correct <answer>` | highest-priority training data (weighted 10x against a thumb) |
+| `/forget [all]` | the last exchange, or the session, is never trained on — and the queued work for it is withdrawn |
+| `/clear`, `/help` | fresh conversation, the command list |
+
+**Secrets never reach the training data, or the disk.** Every message is scanned for API
+keys, tokens, private keys, credentials in URLs and `password: …` assignments. A hit
+marks the turn never-train *and* stores a redacted copy, because the store is backed up,
+copied between machines and summarised into reports:
+
+```
+$ ai chat "my key is sk-proj-abc... please remember it"
+(a openai-key was detected: stored redacted, never trained on)
+I cannot store or remember your key. ...
+
+$ sqlite3 var/gustav.db "select content, trainable from turns limit 1"
+my key is [REDACTED:openai-key] please remember it|0
+```
+
+The live request still sees the original text, so the answer is unaffected — only what is
+persisted changes. `wake.redact_secrets: false` keeps the raw text on disk; it is still
+never trained on. Detection is deliberately eager: a false positive costs one turn of
+training data, a false negative puts a credential in a file that gets copied around.
+
+**Implicit feedback is a candidate, not a verdict.** If you rephrase a question or say
+"no, that's wrong", that is recorded with a confidence and a reason and waits for review.
+It is never trained on by itself.
+
+## Adapters and routing
+
+Adapters live in `adapters/<module>/vNNN` with an `active` symlink. Promotion is a symlink
+swap via `os.replace`, so a crash at any instant leaves the previous version live and
+loadable, and `ai rollback <module>` goes back a version without restarting the model.
+An adapter trained on a different base model is detected and skipped rather than loaded
+into weights it does not belong to.
+
+A router picks which modules a request needs *before* generation, so the right adapters
+are resident when the first token is produced. It scores the request against each
+module's description with IDF-weighted keyword overlap — cheap and explainable, and
+replaceable by an embedding model behind the same interface. Every decision is logged
+with its scores, which is what lets stage 5 train it on outcomes instead of thresholds.
+When nothing scores above the threshold, that is recorded as an *uncovered topic* — one
+of the measured triggers for self-expansion in stage 6.
+
+Modules are held in a tiered cache (VRAM → pinned RAM → disk, LRU) inside the adapter
+budget the hardware plan computed, so the VRAM ceiling is never exceeded by accident.
 
 ## Hardware and the auto planner
 
@@ -192,6 +293,9 @@ and the estimates become exact.
 | `ai plan-hardware [--balance X] [--apply] [-v]` | size the system for this machine, and say why |
 | `ai hardware` | what was detected, the VRAM budget, the active plan |
 | `ai approvals` / `ai approve-base-change <id>` | decisions waiting for you |
+| `ai model list` / `ai model pull <id>` | what weights are on disk; fetch one (uses the network) |
+| `ai bench` | measure tokens/s, latency and peak VRAM, and record it for the planner |
+| `ai adapters` / `ai rollback <module>` | adapter versions and what is loaded; go back one version |
 | `ai runs [id]` | sleep runs and their steps, with checkpoints and errors |
 | `ai events [--kind K]` | the daemon's event log |
 | `ai stop` | graceful shutdown |
@@ -201,6 +305,10 @@ Later stages add `ai backup list|verify|restore`, `ai approve-expansion`,
 
 Everything goes through the running daemon over a Unix socket at `var/gustav.sock`.
 Set `instance.http_enabled` (and `http_token`) to also listen on TCP for remote clients.
+
+The HTTP API has `/chat` (JSON or SSE), `/v1/chat/completions` (OpenAI-compatible, so
+existing clients work against the local daemon), `/health`, `/status`, `/adapter/status`,
+`/adapter/rollback`, `/hardware`, `/models`, `/bench` and `/runs`.
 
 ## Configuration
 
@@ -234,6 +342,7 @@ profiles/              hardware profiles, including the generated one
 src/gustav/
   core/                state machine, scheduler, supervisor, journal, GPU lease, recovery
   hw/                  detection, the model ladder, memory model, pre-flight, planner
+  inference/           backend, generation loop, sampling, adapters, router, caches
   sleep/               the pipeline and its steps
   wake/                the chat side
   server/ cli.py       control plane and its client
@@ -271,9 +380,13 @@ against one of them too.
   on narrow verifiable skills, not open-ended self-improvement.
 - **Documentation licences are your call.** The fetcher records the licence per source and
   warns when it does not obviously permit training.
-- **Speeds are estimated until stage 3.** The planner derives tokens/s from memory
-  bandwidth and a per-quantisation efficiency factor. It is labelled "estimated"
-  everywhere it appears, and a real benchmark replaces it per model and quantisation as
-  soon as the harness can measure one.
+- **Speeds are estimates until you run `ai bench`.** The planner derives tokens/s from
+  memory bandwidth and a per-quantisation efficiency factor, labelled "estimated"
+  everywhere it appears. One benchmark replaces it with a measurement per model and
+  quantisation. (On the development machine the estimate was 36 tok/s and the measurement
+  54 — conservative, which is the safe direction.)
+- **Requests are served one at a time.** The GPU is single-tenant, so generation is
+  serialised behind a lock. The queue interface is in place for continuous batching
+  later; it is not implemented yet, and concurrent callers wait their turn.
 - **Architecture numbers come from `ladder.yaml`** until the weights are downloaded;
   the planner says so in its warnings, and reads the real `config.json` when it exists.

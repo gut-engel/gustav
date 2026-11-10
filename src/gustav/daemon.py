@@ -29,12 +29,15 @@ from gustav.core.logs import get_logger, setup_logging
 from gustav.core.recovery import Recovery, RecoveryReport
 from gustav.core.scheduler import Observation, Scheduler, SleepDecision
 from gustav.core.state import State, StateMachine
-from gustav.core.supervisor import Supervisor
+from gustav.core.supervisor import ChildSpec, Supervisor
 from gustav.hw.service import HardwareService, PlanOutcome
 from gustav.paths import Paths
 from gustav.sleep.pipeline import PipelineRunner, RunOutcome, default_pipeline
 from gustav.store.db import Database, open_db
+from gustav.wake.commands import CommandHandler, CommandResult
+from gustav.wake.implicit import detect as detect_implicit
 from gustav.wake.responder import EchoResponder, Reply, Responder
+from gustav.wake import secrets as secret_scanner
 
 META_LAST_SLEEP = "last_sleep_finished_at"
 META_LEARNING_PAUSED = "learning_paused"
@@ -70,7 +73,8 @@ class Daemon:
         self.hw = HardwareService(
             config, self.paths, self.db, self.events, detector=detector
         )
-        self.responder: Responder = responder or EchoResponder()
+        self.responder: Responder = responder or self._default_responder()
+        self.commands = CommandHandler(self.db, self.journal, self.events)
         self.state = StateMachine(
             State.STARTING, clock=self.clock, on_transition=self._record_transition
         )
@@ -88,6 +92,8 @@ class Daemon:
         self.last_activity_at = self.clock.now()
         self.recovery_report: RecoveryReport | None = None
         self.plan_outcome: PlanOutcome | None = None
+        #: Why the model is not loaded, if it is not. Shown by `ai status`.
+        self.load_error: str | None = None
         self.last_decision: SleepDecision | None = None
         self.last_run_outcome: RunOutcome | None = None
 
@@ -100,6 +106,49 @@ class Daemon:
         self._manual_dry_run = False
         self._chat_lock = asyncio.Lock()
         self._current_run_id: int | None = None
+
+    def _default_responder(self) -> Responder:
+        """The real harness when the ML stack is installed, the echo otherwise.
+
+        ``inference.responder`` (or ``GUSTAV_RESPONDER``) forces the choice: ``echo``
+        runs the whole daemon — scheduler, journal, recovery, the control plane —
+        without a GPU or any weights, which is how most of the test suite stays fast.
+        """
+        import importlib.util
+
+        choice = (
+            os.environ.get("GUSTAV_RESPONDER")
+            or (self.config.inference or {}).get("responder")
+            or "auto"
+        ).lower()
+        if choice == "echo":
+            return EchoResponder()
+        if choice not in ("auto", "harness"):
+            raise ValueError(
+                f"inference.responder must be auto, harness or echo, not {choice!r}"
+            )
+        if importlib.util.find_spec("torch") is None:
+            if choice == "harness":
+                raise RuntimeError(
+                    "inference.responder is 'harness' but torch is not installed; "
+                    'install the ML extras with: pip install -e ".[ml]"'
+                )
+            self.log.warning(
+                "torch is not installed, so chat is an echo; "
+                'install the ML extras with: pip install -e ".[ml]"'
+            )
+            return EchoResponder()
+        from gustav.inference.harness import Harness
+
+        return Harness(
+            config=self.config,
+            paths=self.paths,
+            hardware=self.hw,
+            events=self.events,
+            telemetry=self.telemetry,
+            db=self.db,
+            logger=get_logger("harness"),
+        )
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -132,16 +181,37 @@ class Daemon:
         if self.recovery_report.safe_mode:
             self.state.transition(State.SAFE_MODE, "startup health check failed")
         else:
-            await self.responder.load()
             await self.lease.acquire(
                 "inference", evictor=self._evict_inference, reason="serving", timeout=None
             )
-            self.state.transition(State.WAKE, "startup complete")
+            if await self._try_load_model("startup"):
+                self.state.transition(State.WAKE, "startup complete")
+            else:
+                # The control plane still has to come up: `ai status` is how you find
+                # out what went wrong, so dying here would be the worst thing to do.
+                self.state.transition(State.SAFE_MODE, self.load_error or "the model would not load")
 
         await self._start_servers()
         self._tasks.append(asyncio.create_task(self._scheduler_loop(), name="scheduler"))
         self._tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
         self.log.info("gustav is awake; control socket at %s", self.socket_path)
+
+    async def _try_load_model(self, reason: str) -> bool:
+        """Load the model, or record why not. Never raises."""
+        try:
+            await self.responder.load()
+        except Exception as exc:  # noqa: BLE001 - a bad model must not stop the daemon
+            self.load_error = f"{type(exc).__name__}: {exc}"
+            self.log.error("the model did not load (%s): %s", reason, exc)
+            self.events.emit(
+                "inference.load_failed",
+                f"the model did not load: {exc}".split("\n")[0],
+                level="error",
+                detail=self.load_error,
+            )
+            return False
+        self.load_error = None
+        return True
 
     async def serve_forever(self) -> None:
         await self._shutdown.wait()
@@ -242,31 +312,218 @@ class Daemon:
     # chat (wake phase)
     # ------------------------------------------------------------------
     async def chat(self, message: str, *, session: str | None = None) -> dict[str, Any]:
-        if self.state.state in (State.STOPPING, State.STOPPED):
-            raise RuntimeError("daemon is shutting down")
+        """One turn. Commands are handled here; everything else reaches the model."""
+        session_id, command = self._before_model(session, message)
+        if command is not None:
+            return self._command_response(session_id, command)
 
-        self.last_activity_at = self.clock.now()
-
-        # A message during sleep pauses sleep: checkpoint, hand the GPU back, answer.
-        paused = False
-        if self.state.state is State.SLEEP:
-            paused = await self._pause_sleep("a user message arrived", wait=True)
-
+        paused = await self._prepare_to_answer()
+        stored, findings = self._store_text(message)
         async with self._chat_lock:
-            if not self.responder.loaded:
-                await self.lease.acquire(
-                    "inference", evictor=self._evict_inference, reason="serving", timeout=None
-                )
-                await self.responder.load()
-            session_id = self._touch_session(session)
+            await self._ensure_loaded()
             history = self._history(session_id)
+            signal = self._implicit_signal(session_id, message)
             started = self.clock.monotonic()
             reply: Reply = await self.responder.respond(
                 session_id=session_id, message=message, history=history
             )
             latency_ms = int((self.clock.monotonic() - started) * 1000)
 
-        self._record_turn(session_id, "user", message)
+        turn_id = self._log_exchange(
+            session_id, message, stored, findings, reply, latency_ms, signal
+        )
+        self.last_activity_at = self.clock.now()
+        return {
+            "reply": reply.text,
+            "session": session_id,
+            "turn_id": turn_id,
+            "state": str(self.state.state),
+            "sleep_paused": paused,
+            "adapters": reply.adapter_versions,
+            "latency_ms": latency_ms,
+            "tokens_per_second": reply.tokens_per_second,
+            "redacted": [f.kind for f in findings],
+            "meta": reply.meta,
+        }
+
+    async def chat_stream(self, message: str, *, session: str | None = None):
+        """The same turn, streamed. Yields dicts the server turns into SSE events."""
+        session_id, command = self._before_model(session, message)
+        if command is not None:
+            payload = self._command_response(session_id, command)
+            yield {"type": "command", **payload}
+            yield {"type": "done", "session": session_id, "turn_id": None}
+            return
+
+        paused = await self._prepare_to_answer()
+        stored, findings = self._store_text(message)
+        yield {
+            "type": "start",
+            "session": session_id,
+            "sleep_paused": paused,
+            "redacted": [f.kind for f in findings],
+        }
+
+        pieces: list[str] = []
+        async with self._chat_lock:
+            await self._ensure_loaded()
+            history = self._history(session_id)
+            signal = self._implicit_signal(session_id, message)
+            started = self.clock.monotonic()
+            streamer = getattr(self.responder, "stream", None)
+            if streamer is None:
+                reply = await self.responder.respond(
+                    session_id=session_id, message=message, history=history
+                )
+                pieces.append(reply.text)
+                yield {"type": "chunk", "text": reply.text}
+            else:
+                async for chunk in streamer(
+                    session_id=session_id, message=message, history=history
+                ):
+                    if chunk.text:
+                        pieces.append(chunk.text)
+                        yield {"type": "chunk", "text": chunk.text}
+                reply = self._reply_from_stream(pieces)
+            latency_ms = int((self.clock.monotonic() - started) * 1000)
+
+        turn_id = self._log_exchange(
+            session_id, message, stored, findings, reply, latency_ms, signal
+        )
+        self.last_activity_at = self.clock.now()
+        yield {
+            "type": "done",
+            "session": session_id,
+            "turn_id": turn_id,
+            "latency_ms": latency_ms,
+            "adapters": reply.adapter_versions,
+            "tokens_per_second": reply.tokens_per_second,
+            "meta": reply.meta,
+        }
+
+    def _reply_from_stream(self, pieces: list[str]) -> Reply:
+        """Build the record for a streamed answer from the backend's own numbers."""
+        text = "".join(pieces)
+        getter = getattr(self.responder, "last_generation", None)
+        generation = getter() if callable(getter) else None
+        if generation is None:
+            return Reply(text=text)
+        if isinstance(generation, Reply):
+            return generation
+        return Reply(
+            text=text or generation.text,
+            adapter_versions=generation.adapters,
+            base_model=generation.base_model,
+            prompt_tokens=generation.prompt_tokens,
+            completion_tokens=generation.completion_tokens,
+            tokens_per_second=generation.tokens_per_second,
+            meta={
+                "finish_reason": generation.finish_reason,
+                "time_to_first_token_ms": generation.time_to_first_token_ms,
+                "cached_prompt_tokens": generation.meta.get("cached_prompt_tokens", 0),
+            },
+        )
+
+    # --- the pieces both paths share ------------------------------------
+    def _before_model(
+        self, session: str | None, message: str
+    ) -> tuple[int, CommandResult | None]:
+        if self.state.state in (State.STOPPING, State.STOPPED):
+            raise RuntimeError("daemon is shutting down")
+        self.last_activity_at = self.clock.now()
+        session_id = self._touch_session(session)
+        return session_id, self.commands.handle(session_id, message)
+
+    def _command_response(self, session_id: int, command: CommandResult) -> dict[str, Any]:
+        if command.clears_history:
+            self.db.execute(
+                "UPDATE sessions SET external_id = external_id || '-' || ?"
+                " WHERE id = ?",
+                (self.clock.now().strftime("%H%M%S"), session_id),
+            )
+        self.last_activity_at = self.clock.now()
+        return {
+            "reply": command.reply,
+            "session": session_id,
+            "turn_id": None,
+            "state": str(self.state.state),
+            "sleep_paused": False,
+            "command": command.action,
+            "adapters": {},
+            "latency_ms": 0,
+        }
+
+    async def _prepare_to_answer(self) -> bool:
+        """A message during sleep pauses it: checkpoint, hand the GPU back, answer."""
+        if self.state.state is State.SLEEP:
+            return await self._pause_sleep("a user message arrived", wait=True)
+        return False
+
+    async def _ensure_loaded(self) -> None:
+        if self.responder.loaded:
+            return
+        await self.lease.acquire(
+            "inference", evictor=self._evict_inference, reason="serving", timeout=None
+        )
+        if not await self._try_load_model("a chat request"):
+            raise RuntimeError(
+                f"the model is not available, so I cannot answer: {self.load_error}"
+            )
+        if self.state.state is State.SAFE_MODE:
+            self.state.transition(State.WAKE, "the model loaded on retry")
+
+    def _store_text(self, message: str) -> tuple[str, list]:
+        """What goes on disk. Secrets are replaced unless the operator opted out."""
+        findings = secret_scanner.scan(message)
+        if not findings:
+            return message, []
+        if not self.config.wake.redact_secrets:
+            self.events.emit(
+                "wake.secret_detected",
+                f"{secret_scanner.summarise(findings)} detected; the turn will never be "
+                f"trained on (redaction is off, so the text is stored as-is)",
+                level="warning",
+                kinds=sorted({f.kind for f in findings}),
+            )
+            return message, findings
+        redacted, _ = secret_scanner.redact(message)
+        self.events.emit(
+            "wake.secret_redacted",
+            f"{secret_scanner.summarise(findings)} detected: stored redacted and marked "
+            f"never-train",
+            level="warning",
+            kinds=sorted({f.kind for f in findings}),
+        )
+        return redacted, findings
+
+    def _implicit_signal(self, session_id: int, message: str):
+        previous = self.db.query_one(
+            "SELECT content FROM turns WHERE session_id = ? AND role = 'user'"
+            " ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        )
+        return detect_implicit(
+            message, previous_user=previous["content"] if previous else None
+        )
+
+    def _log_exchange(
+        self,
+        session_id: int,
+        message: str,
+        stored: str,
+        findings: list,
+        reply: Reply,
+        latency_ms: int,
+        signal,
+    ) -> int:
+        trainable = 0 if findings else 1
+        reason = (
+            f"secret:{secret_scanner.summarise(findings)}" if findings else None
+        )
+        user_turn = self._record_turn(
+            session_id, "user", stored,
+            trainable=trainable, redacted=1 if findings else 0, exclude_reason=reason,
+        )
         turn_id = self._record_turn(
             session_id,
             "assistant",
@@ -277,18 +534,30 @@ class Daemon:
             completion_tokens=reply.completion_tokens,
             latency_ms=latency_ms,
             tokens_per_second=reply.tokens_per_second,
+            trainable=trainable,
+            exclude_reason=reason,
         )
-        self.journal.add_pending_work("turn", ref=str(turn_id))
-        self.last_activity_at = self.clock.now()
-        return {
-            "reply": reply.text,
-            "session": session_id,
-            "turn_id": turn_id,
-            "state": str(self.state.state),
-            "sleep_paused": paused,
-            "adapters": reply.adapter_versions,
-            "latency_ms": latency_ms,
-        }
+        if trainable:
+            self.journal.add_pending_work("turn", ref=str(turn_id))
+        if signal is not None and signal.negative:
+            # A candidate for review, never training data on its own.
+            self.db.insert(
+                "feedback",
+                {
+                    "turn_id": user_turn,
+                    "kind": "implicit",
+                    "payload": f"{signal.kind}: {signal.reason}",
+                    "source": "detector",
+                    "reviewed": 0,
+                },
+            )
+            self.events.emit(
+                "wake.implicit_feedback",
+                f"{signal.kind} signal ({signal.confidence:.0%}): {signal.reason}",
+                level="debug",
+                turn=user_turn,
+            )
+        return turn_id
 
     def _touch_session(self, external_id: str | None) -> int:
         key = external_id or "default"
@@ -314,6 +583,121 @@ class Daemon:
             values["adapter_versions"] = adapter_versions
         values.update({k: v for k, v in extra.items() if v is not None})
         return self.db.insert("turns", values)
+
+    # ------------------------------------------------------------------
+    # benchmark
+    # ------------------------------------------------------------------
+    async def benchmark(self, *, max_tokens: int = 96, repeats: int = 1) -> dict[str, Any]:
+        """Measure this machine, and let the planner use measurements from now on."""
+        from gustav.hw.speed import Measurements
+        from gustav.inference.bench import run_benchmark
+
+        if not hasattr(self.responder, "backend"):
+            raise RuntimeError("this responder cannot be benchmarked (no model behind it)")
+        await self._ensure_loaded()
+        async with self._chat_lock:
+            result = await run_benchmark(
+                self.responder,
+                max_tokens=max_tokens,
+                repeats=repeats,
+                measurements=Measurements(self.db),
+            )
+        self.events.emit("bench.completed", result.summary(), **{
+            "tokens_per_second": result.tokens_per_second,
+            "vram_peak_mb": result.vram_peak_mb,
+        })
+        # The plan's speed numbers were estimates until now.
+        self._plan_hardware(reason="a benchmark measured this machine", force=True)
+        return result.to_dict()
+
+    # ------------------------------------------------------------------
+    # model weights
+    # ------------------------------------------------------------------
+    def list_models(self) -> dict[str, Any]:
+        from gustav.inference.models import list_models
+
+        ladder = self.hw._ladder_with_local_configs()
+        local = list_models(self.paths.models, ladder)
+        plan = self.hw.stored_plan()
+        return {
+            "models_dir": str(self.paths.models),
+            "models": [
+                {
+                    "id": m.id, "size_mb": m.size_mb, "complete": m.complete,
+                    "missing": m.missing, "repo": m.repo, "params_b": m.params_b,
+                    "active": bool(plan and plan.base_model == m.id),
+                }
+                for m in local
+            ],
+            "ladder": [
+                {"id": s.id, "repo": s.repo, "params_b": s.params_b, "rung": s.rung}
+                for s in ladder.rungs()
+            ],
+            "plan_model": plan.base_model if plan else None,
+        }
+
+    async def pull_model(self, model_id: str) -> dict[str, Any]:
+        """Fetch weights in a supervised child process. The only network access here."""
+        ladder = self.hw._ladder_with_local_configs()
+        try:
+            spec = ladder.model(model_id)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+        destination = self.paths.models / spec.id
+        self.events.emit(
+            "model.pull.started", f"fetching {spec.repo} into {destination}", model=spec.id
+        )
+        result = await self.supervisor.run(
+            ChildSpec(
+                name=f"pull:{spec.id}",
+                target="gustav.inference.models:pull_child",
+                kwargs={"repo": spec.repo, "destination": str(destination)},
+                timeout_seconds=7200.0,
+                heartbeat_timeout_seconds=300.0,
+                memory_limit_mb=0,
+            )
+        )
+        if not result.ok:
+            self.events.emit(
+                "model.pull.failed",
+                f"could not fetch {spec.repo}: {result.error}",
+                level="error",
+                model=spec.id,
+            )
+            return {"ok": False, "model": spec.id, "error": result.error,
+                    "outcome": str(result.outcome)}
+        payload = result.payload or {}
+        self.events.emit(
+            "model.pull.done",
+            f"{spec.repo} fetched ({payload.get('size_mb', 0) / 1024:.2f} GiB)",
+            model=spec.id,
+        )
+        # A newly downloaded model makes the plan's numbers exact, so re-plan.
+        self._plan_hardware(reason="new weights on disk", force=True)
+        return {"ok": True, "model": spec.id, **payload}
+
+    # ------------------------------------------------------------------
+    # adapter control (used by /adapter/*)
+    # ------------------------------------------------------------------
+    def adapter_status(self) -> dict[str, Any]:
+        getter = getattr(self.responder, "adapter_status", None)
+        if callable(getter):
+            return getter()
+        return {"modules": {}, "active_in_model": {}, "note": "this responder has no adapters"}
+
+    async def rollback_adapter(self, module: str) -> dict[str, Any]:
+        rollback = getattr(self.responder, "rollback_adapter", None)
+        if not callable(rollback):
+            raise RuntimeError("this responder has no adapters to roll back")
+        version = await rollback(module)
+        return {"module": module, "version": version.version}
+
+    async def activate_adapter(self, module: str, version: str) -> dict[str, Any]:
+        activate = getattr(self.responder, "activate_adapter", None)
+        if not callable(activate):
+            raise RuntimeError("this responder has no adapters to activate")
+        target = await activate(module, version)
+        return {"module": module, "version": target.version}
 
     # ------------------------------------------------------------------
     # sleep
@@ -573,6 +957,7 @@ class Daemon:
             "learning_paused": self.learning_paused,
             "last_activity_at": self.last_activity_at.isoformat(timespec="seconds"),
             "model": self.responder.describe(),
+            "load_error": self.load_error,
             "gpu": {
                 "holder": self.lease.holder,
                 "return_requested": self.lease.return_requested,

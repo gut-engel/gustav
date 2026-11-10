@@ -68,6 +68,29 @@ class Client:
     def get(self, path: str, **kwargs: Any) -> Any:
         return self.request("GET", path, **kwargs)
 
+    def stream(self, path: str, body: dict[str, Any]):
+        """Iterate server-sent events from the daemon."""
+        try:
+            with self._client.stream("POST", path, json=body) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise RuntimeError(f"daemon returned {response.status_code}: {response.text}")
+                for line in response.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[6:]
+                    if payload == "[DONE]":
+                        return
+                    try:
+                        yield json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+        except httpx.ConnectError as exc:
+            raise DaemonUnreachable(
+                f"no daemon is listening on {self.socket}.\n"
+                f"Start it with 'ai start' (or 'python daemon.py')."
+            ) from exc
+
     def post(self, path: str, **kwargs: Any) -> Any:
         return self.request("POST", path, **kwargs)
 
@@ -125,6 +148,8 @@ def _print_status(status: dict[str, Any]) -> None:
     if hardware.get("problem"):
         lines.append(f"  ! {hardware['problem']}")
     lines.append(f"last backup      {status.get('last_backup') or 'none yet'}")
+    if status.get("load_error"):
+        lines.append(f"  ! the model is not loaded: {status['load_error'].splitlines()[0]}")
     if status["failed_steps"]:
         lines.append("failed steps")
         for step in status["failed_steps"]:
@@ -211,17 +236,59 @@ def cmd_start(args: argparse.Namespace) -> int:
     return daemon_main(forwarded)
 
 
-def cmd_chat(args: argparse.Namespace, client: Client) -> int:
-    if args.message:
-        result = client.post(
-            "/chat", json={"message": " ".join(args.message), "session": args.session}
-        )
+def _say(client: Client, message: str, session: str, *, stream: bool, prefix: str = "") -> int:
+    """One turn, streamed token by token unless asked otherwise."""
+    if not stream:
+        result = client.post("/chat", json={"message": message, "session": session})
         if result.get("sleep_paused"):
             print("(sleep paused to answer you)", file=sys.stderr)
-        print(result["reply"])
+        for kind in result.get("redacted") or []:
+            print(f"(a {kind} was detected: stored redacted, never trained on)", file=sys.stderr)
+        print(prefix + result["reply"])
         return 0
 
-    print("Chatting with gustav. Ctrl-D or /quit to leave.")
+    printed_prefix = False
+    for event in client.stream("/chat", {"message": message, "session": session, "stream": True}):
+        kind = event.get("type")
+        if kind == "start":
+            if event.get("sleep_paused"):
+                print("(sleep paused to answer you)", file=sys.stderr)
+            for redaction in event.get("redacted") or []:
+                print(
+                    f"(a {redaction} was detected: stored redacted, never trained on)",
+                    file=sys.stderr,
+                )
+        elif kind in ("chunk", "command"):
+            text = event.get("text") or event.get("reply") or ""
+            if prefix and not printed_prefix:
+                print(prefix, end="", flush=True)
+                printed_prefix = True
+            print(text, end="", flush=True)
+        elif kind == "error":
+            print(f"\n[error: {event['error']}]", file=sys.stderr)
+            return 1
+        elif kind == "done":
+            speed = event.get("tokens_per_second")
+            print()
+            if speed:
+                meta = event.get("meta") or {}
+                ttft = meta.get("time_to_first_token_ms")
+                detail = f"{speed:.1f} tok/s"
+                if ttft:
+                    detail += f", {ttft:.0f} ms to first token"
+                modules = meta.get("modules")
+                if modules:
+                    detail += f", modules: {', '.join(modules)}"
+                print(f"[{detail}]", file=sys.stderr)
+    return 0
+
+
+def cmd_chat(args: argparse.Namespace, client: Client) -> int:
+    stream = not args.no_stream
+    if args.message:
+        return _say(client, " ".join(args.message), args.session, stream=stream)
+
+    print("Chatting with gustav. /help for commands, Ctrl-D to leave.")
     while True:
         try:
             line = input("you> ").strip()
@@ -232,10 +299,78 @@ def cmd_chat(args: argparse.Namespace, client: Client) -> int:
             continue
         if line in {"/quit", "/exit"}:
             return 0
-        result = client.post("/chat", json={"message": line, "session": args.session})
-        if result.get("sleep_paused"):
-            print("(sleep paused to answer you)", file=sys.stderr)
-        print(f"ai > {result['reply']}")
+        _say(client, line, args.session, stream=stream, prefix="ai > ")
+
+
+def cmd_model(args: argparse.Namespace, client: Client) -> int:
+    if args.action == "list":
+        payload = client.get("/models")
+        print(f"models in {payload['models_dir']}:")
+        if not payload["models"]:
+            print("  (none yet — 'ai model pull <id>' fetches one)")
+        for model in payload["models"]:
+            mark = "*" if model["active"] else " "
+            print(f" {mark} {model['id']:<16} {model['size_mb'] / 1024:>7.2f} GiB  "
+                  + ("ready" if model["complete"] else
+                     f"INCOMPLETE ({len(model['missing'])} file(s) missing)"))
+        print("\non the ladder (fetch with 'ai model pull <id>'):")
+        have = {m["id"] for m in payload["models"] if m["complete"]}
+        for spec in payload["ladder"]:
+            state = "local" if spec["id"] in have else "not fetched"
+            print(f"   {spec['id']:<16} {spec['params_b']:>6.1f}B  {spec['repo']:<28} {state}")
+        return 0
+
+    print(f"fetching {args.model_id} (this goes to the network; it is the only part that does)")
+    result = client.post("/models/pull", json={"model_id": args.model_id})
+    if not result.get("ok"):
+        print(f"failed: {result.get('error')}", file=sys.stderr)
+        return 1
+    print(f"done: {result['path']} ({result['size_mb'] / 1024:.2f} GiB)")
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace, client: Client) -> int:
+    print("benchmarking (this loads the model and generates a few hundred tokens)...")
+    result = client.post(
+        "/bench", params={"max_tokens": args.max_tokens, "repeats": args.repeats}
+    )
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    print(result["summary"])
+    for note in result.get("notes") or []:
+        print(f"  note: {note}")
+    print("\nrecorded: the planner now uses this measurement instead of its estimate")
+    return 0
+
+
+def cmd_adapters(args: argparse.Namespace, client: Client) -> int:
+    status = client.get("/adapter/status")
+    if args.json:
+        print(json.dumps(status, indent=2))
+        return 0
+    modules = status.get("modules") or {}
+    if not modules:
+        print("no adapters yet — they are trained during sleep (stage 5)")
+    for name, info in modules.items():
+        versions = ", ".join(info["versions"]) or "none"
+        print(
+            f"{name:<18} active={info['active'] or '-':<6} loaded={info['loaded']!s:<5} "
+            f"tier={info['tier'] or '-':<5} versions=[{versions}]"
+        )
+    active = status.get("active_in_model") or {}
+    print(f"\nactive in the model: {active or 'none'}")
+    cache = status.get("cache")
+    if cache:
+        print(f"adapter cache: VRAM {cache['vram']['used_mb']:.0f}/"
+              f"{cache['vram']['budget_mb']:.0f} MiB, hit rate {cache['hit_rate']}")
+    return 0
+
+
+def cmd_rollback(args: argparse.Namespace, client: Client) -> int:
+    result = client.post("/adapter/rollback", json={"module": args.module})
+    print(f"{result['module']} rolled back to {result['version']}")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace, client: Client) -> int:
@@ -475,6 +610,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("chat", help="chat with the model (interactive if no message)")
     p.add_argument("message", nargs="*")
     p.add_argument("--session", default="default")
+    p.add_argument("--no-stream", action="store_true", help="wait for the whole answer")
+
+    p = sub.add_parser("model", help="list or fetch model weights")
+    model_sub = p.add_subparsers(dest="action", required=True)
+    model_sub.add_parser("list", help="what is on disk, and what the ladder offers")
+    pull = model_sub.add_parser("pull", help="fetch a checkpoint (uses the network)")
+    pull.add_argument("model_id")
+
+    p = sub.add_parser("bench", help="measure tokens/s, latency and peak VRAM")
+    p.add_argument("--max-tokens", type=int, default=96)
+    p.add_argument("--repeats", type=int, default=1)
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("adapters", help="adapter modules, versions and what is loaded")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("rollback", help="roll an adapter back to its previous version")
+    p.add_argument("module")
 
     p = sub.add_parser("status", help="show state, schedule, adapters, approvals")
     p.add_argument("--json", action="store_true")
@@ -582,6 +735,14 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_events(args, client)
         if args.command == "runs":
             return cmd_runs(args, client)
+        if args.command == "model":
+            return cmd_model(args, client)
+        if args.command == "bench":
+            return cmd_bench(args, client)
+        if args.command == "adapters":
+            return cmd_adapters(args, client)
+        if args.command == "rollback":
+            return cmd_rollback(args, client)
         if args.command == "plan-hardware":
             return cmd_plan_hardware(args, client)
         if args.command == "hardware":

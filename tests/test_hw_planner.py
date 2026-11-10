@@ -34,8 +34,19 @@ def test_12gb_desktop_lands_on_a_4b_model_that_can_train(ladder):
     assert plan.training_allowed
     assert plan.training_gpus == [0] and plan.inference_gpus == [0]
     assert plan.vram_training_mb < 12288
-    assert plan.attention == "flash_attention_2"
     assert plan.compute_dtype == "bfloat16"
+
+
+def test_the_attention_backend_matches_what_is_installed(ladder):
+    """The GPU supporting FlashAttention-2 is not the same as having the package."""
+    from gustav.hw.detect import flash_attention_available
+
+    plan = planner("small-12gb", ladder).plan()
+    expected = "flash_attention_2" if flash_attention_available() else "sdpa"
+    assert plan.attention == expected
+    if expected == "sdpa":
+        assert any("flash-attn package is not installed" in line
+                   for line in plan.explanation)
 
 
 def test_4gb_turing_laptop_gets_fp16_sdpa_and_a_small_model(ladder):

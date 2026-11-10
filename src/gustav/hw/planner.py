@@ -21,6 +21,7 @@ from typing import Any
 
 import yaml
 
+from gustav.hw.detect import flash_attention_available
 from gustav.hw.ladder import Ladder, ModelSpec, QuantSpec, load_ladder
 from gustav.hw.memory import (
     MemoryEstimate,
@@ -404,6 +405,13 @@ class Planner:
     def _optimizer(self) -> str:
         return "paged_adamw_8bit"
 
+    def _attention(self, gpu) -> str:
+        if gpu is None:
+            return "sdpa"
+        if gpu.attention_backend == "flash_attention_2" and not flash_attention_available():
+            return "sdpa"
+        return gpu.attention_backend
+
     @property
     def effective_floor(self) -> float:
         """The speed a candidate must beat, after `balance` has had its say.
@@ -548,7 +556,7 @@ class Planner:
                 gpu.preferred_dtype if gpu and chosen.quant.compute_dtype == "auto"
                 else chosen.quant.compute_dtype
             ),
-            attention=gpu.attention_backend if gpu else "sdpa",
+            attention=self._attention(gpu),
             lora_rank=rank,
             train_seq_len=chosen.train_seq_len,
             batch_size=1,
@@ -595,6 +603,12 @@ class Planner:
         ]
         if gpu:
             lines.append(gpu.describe())
+            if gpu.supports_flash_attention_2 and plan.attention != "flash_attention_2":
+                lines.append(
+                    "This GPU supports FlashAttention-2 but the flash-attn package is not "
+                    "installed, so PyTorch SDPA is used instead; install it to get a little "
+                    "more speed on long prompts."
+                )
             budget = self._budget(gpu.index)
             if budget:
                 lines.append(budget.describe())

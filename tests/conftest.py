@@ -30,7 +30,9 @@ def project(tmp_path: Path) -> Path:
         "  cooldown_minutes: 0\n  min_pending_items: 0\n"
         "supervisor:\n  heartbeat_timeout_seconds: 5\n  step_timeout_seconds: 30\n"
         "  max_attempts: 2\n  retry_backoff_seconds: 0.05\n  memory_limit_mb: 0\n"
-        "sleep:\n  simulated_step_seconds: 0.02\n",
+        "sleep:\n  simulated_step_seconds: 0.02\n"
+        # Deterministic and GPU-free: the tests that need real weights are marked `gpu`.
+        "inference:\n  responder: echo\n",
         encoding="utf-8",
     )
     return root
@@ -92,12 +94,12 @@ def _clean_fault_env():
         os.environ.pop("GUSTAV_FAULT", None)
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def repo_root() -> Path:
     return REPO_ROOT
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def python_exe() -> str:
     venv = REPO_ROOT / ".venv" / "bin" / "python"
     return str(venv) if venv.exists() else shutil.which("python3") or "python3"

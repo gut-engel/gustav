@@ -65,6 +65,17 @@ hardware:
   # deny_models: [qwen3-30b-a3b]
   replan_on_hardware_change: true
 
+inference:
+  # auto = the real harness when the ML extras are installed; echo = a placeholder
+  # responder that needs no GPU or weights (useful for development and tests).
+  responder: auto
+  max_tokens: 512
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 20
+  repetition_penalty: 1.05
+  # stop: ["\nUser:"]
+
 supervisor:
   # A child that stops heart-beating for this long is killed and retried.
   heartbeat_timeout_seconds: 60
@@ -94,5 +105,8 @@ tunable:
   batch_size: 1
   speculative_decoding: false
   router_threshold: 0.45
+  # Reuse the KV cache across turns of a conversation. Big speed win; the cost is that
+  # a greedy answer is no longer bit-identical to the same question asked cold.
+  prefix_cache: true
   prefix_cache_mb: 512
   warm_cache_mb: 8192

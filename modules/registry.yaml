@@ -1,0 +1,53 @@
+# The modular model: one base plus domain LoRA adapters.
+#
+# Be clear about what "modular" means here. A dense transformer cannot be split into a
+# "coding part" and a "chat part" — the knowledge is spread across every weight. What is
+# modular is the set of LoRA adapters layered on top (and, for a Mixture-of-Experts base,
+# which experts are resident). Adding a module means adding an entry here plus a training
+# dataset; the router then learns when to use it.
+#
+# `size_mb` and `load_ms` are filled in by measurement once a module has been trained.
+
+base:
+  # "auto" means: whatever the hardware plan chose (see `ai plan-hardware`).
+  model: auto
+
+defaults:
+  # Modules scoring below the router's threshold are not loaded.
+  threshold: 0.45
+  # At most this many adapters stacked on one request.
+  max_active: 3
+
+modules:
+  - name: general
+    description: >
+      Everyday conversation, explanation, summarising and reasoning that does not belong
+      to a more specific domain.
+    keywords: [explain, summarise, summarize, why, how, what, opinion, write, draft]
+    always_on: true
+    priority: 0
+
+  - name: personal-memory
+    description: >
+      Durable facts, preferences and corrections about the user: their name, their
+      machine, their projects, how they like answers formatted.
+    keywords: [my, me, i, mine, remember, prefer, favourite, favorite, usually, always,
+               name, setup, machine, project]
+    always_on: true
+    priority: 10
+
+  - name: coding
+    description: >
+      Programming in general: languages, APIs, debugging, build systems, tests,
+      error messages and stack traces.
+    keywords: [code, function, class, bug, error, compile, test, api, library, import,
+               traceback, exception, refactor, python, type, async, git, shell, regex]
+    priority: 5
+
+  - name: rust
+    description: >
+      Rust specifically: ownership, borrowing, lifetimes, traits, cargo, crates and
+      rustc diagnostics. Verified against the compiler during sleep.
+    keywords: [rust, cargo, crate, borrow, borrowck, lifetime, trait, impl, unsafe,
+               tokio, serde, clippy, rustc, mut, box, arc, mutex]
+    priority: 8

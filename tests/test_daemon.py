@@ -278,7 +278,8 @@ async def test_the_scheduler_triggers_sleep_by_itself(project, monkeypatch):
         "  pending_threshold: 2\n  min_idle_seconds: 0\n  cooldown_minutes: 0\n"
         "  min_pending_items: 0\n"
         "supervisor:\n  memory_limit_mb: 0\n  max_attempts: 1\n"
-        "sleep:\n  simulated_step_seconds: 0.01\n",
+        "sleep:\n  simulated_step_seconds: 0.01\n"
+        "inference:\n  responder: echo\n",
         encoding="utf-8",
     )
     config, paths = load_config(project / "config.yaml")

@@ -144,6 +144,10 @@ class SleepConfig(Strict):
 class WakeConfig(Strict):
     session_idle_minutes: int = 120
     max_history_turns: int = 40
+    #: Store a redacted copy when a secret is detected. The live request still sees the
+    #: original text; only what is persisted changes. Turning this off keeps the raw
+    #: text on disk — it is still never trained on.
+    redact_secrets: bool = True
 
 
 class TunableConfig(Strict):
@@ -153,6 +157,11 @@ class TunableConfig(Strict):
     batch_size: int = 1
     speculative_decoding: bool = False
     router_threshold: float = 0.45
+    #: Reuse the KV cache for the shared prefix of consecutive prompts. A large win on
+    #: multi-turn chat (the prompt is re-sent every turn), at the cost of bit-exact
+    #: reproducibility: a reused cache computes the prefill differently, so a greedy
+    #: answer can differ by a token from the same question asked cold.
+    prefix_cache: bool = True
     prefix_cache_mb: int = 512
     warm_cache_mb: int = 8192
 

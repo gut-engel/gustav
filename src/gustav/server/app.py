@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import json
+import time
+import uuid
+
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
@@ -19,6 +24,34 @@ if TYPE_CHECKING:
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     session: str | None = None
+    stream: bool = False
+
+
+class OpenAIMessage(BaseModel):
+    role: str
+    content: str
+
+
+class OpenAIRequest(BaseModel):
+    """The subset of the OpenAI chat API that makes sense here."""
+
+    model: str | None = None
+    messages: list[OpenAIMessage]
+    stream: bool = False
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    stop: list[str] | str | None = None
+    user: str | None = None
+
+
+class AdapterRequest(BaseModel):
+    module: str
+    version: str | None = None
+
+
+class ModelRequest(BaseModel):
+    model_id: str
 
 
 class SleepRequest(BaseModel):
@@ -79,12 +112,113 @@ def create_app(daemon: "Daemon") -> FastAPI:
     async def status() -> dict[str, Any]:
         return daemon.status()
 
+    def sse(payload: dict[str, Any]) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
     @app.post("/chat", dependencies=guard)
-    async def chat(req: ChatRequest) -> dict[str, Any]:
+    async def chat(req: ChatRequest):
+        if not req.stream:
+            try:
+                return await daemon.chat(req.message, session=req.session)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        async def events():
+            try:
+                async for event in daemon.chat_stream(req.message, session=req.session):
+                    yield sse(event)
+            except Exception as exc:  # noqa: BLE001 - the client gets the error, not a hang
+                daemon.log.exception("streaming chat failed")
+                yield sse({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/v1/chat/completions", dependencies=guard)
+    async def openai_chat(req: OpenAIRequest):
+        """OpenAI-compatible, so existing clients work against the local daemon."""
+        user_messages = [m for m in req.messages if m.role == "user"]
+        if not user_messages:
+            raise HTTPException(status_code=400, detail="no user message in the request")
+        prompt = user_messages[-1].content
+        session = req.user or "openai"
+        created = int(time.time())
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        model_name = req.model or (daemon.status()["model"].get("base_model") or "gustav")
+
+        if not req.stream:
+            result = await daemon.chat(prompt, session=session)
+            meta = result.get("meta") or {}
+            return {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": result["reply"]},
+                        "finish_reason": meta.get("finish_reason", "stop"),
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": meta.get("prompt_tokens", 0),
+                    "completion_tokens": meta.get("completion_tokens", 0),
+                    "total_tokens": meta.get("prompt_tokens", 0)
+                    + meta.get("completion_tokens", 0),
+                },
+            }
+
+        async def events():
+            def frame(delta: dict[str, Any], finish: str | None = None) -> str:
+                return sse(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    }
+                )
+
+            yield frame({"role": "assistant", "content": ""})
+            try:
+                async for event in daemon.chat_stream(prompt, session=session):
+                    if event["type"] == "chunk":
+                        yield frame({"content": event["text"]})
+                    elif event["type"] == "command":
+                        yield frame({"content": event["reply"]})
+            except Exception as exc:  # noqa: BLE001
+                daemon.log.exception("openai-compatible streaming failed")
+                yield sse({"error": {"message": str(exc), "type": type(exc).__name__}})
+            yield frame({}, finish="stop")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.get("/adapter/status", dependencies=guard)
+    async def adapter_status() -> dict[str, Any]:
+        return daemon.adapter_status()
+
+    @app.post("/adapter/rollback", dependencies=guard)
+    async def adapter_rollback(req: AdapterRequest) -> dict[str, Any]:
         try:
-            return await daemon.chat(req.message, session=req.session)
+            return await daemon.rollback_adapter(req.module)
         except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/adapter/activate", dependencies=guard)
+    async def adapter_activate(req: AdapterRequest) -> dict[str, Any]:
+        if not req.version:
+            raise HTTPException(status_code=400, detail="a version is required")
+        try:
+            return await daemon.activate_adapter(req.module, req.version)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/control/sleep", dependencies=guard)
     async def sleep_now(req: SleepRequest) -> dict[str, Any]:
@@ -147,6 +281,24 @@ def create_app(daemon: "Daemon") -> FastAPI:
                 for s in record.steps
             ],
         }
+
+    @app.post("/bench", dependencies=guard)
+    async def bench(max_tokens: int = 96, repeats: int = 1) -> dict[str, Any]:
+        try:
+            return await daemon.benchmark(max_tokens=max_tokens, repeats=repeats)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/models", dependencies=guard)
+    async def models() -> dict[str, Any]:
+        return daemon.list_models()
+
+    @app.post("/models/pull", dependencies=guard)
+    async def pull_model(req: ModelRequest) -> dict[str, Any]:
+        try:
+            return await daemon.pull_model(req.model_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/hardware", dependencies=guard)
     async def hardware() -> dict[str, Any]:
