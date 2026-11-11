@@ -420,10 +420,21 @@ def create_app(daemon: "Daemon") -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return result
 
+    @app.get("/facts", dependencies=guard)
+    async def facts(
+        limit: int = 100, module: str | None = None, subject: str | None = None
+    ) -> dict[str, Any]:
+        return daemon.facts(limit=limit, module=module, subject=subject)
+
+    @app.get("/skills", dependencies=guard)
+    async def skills() -> dict[str, Any]:
+        return daemon.skills()
+
     @app.get("/report", dependencies=guard)
-    async def report() -> dict[str, Any]:
-        raise HTTPException(
-            status_code=501, detail="HTML reports arrive with the sleep phase (stage 5)"
-        )
+    async def report(run_id: int | None = None) -> dict[str, Any]:
+        try:
+            return daemon.write_report(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return app

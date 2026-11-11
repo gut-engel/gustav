@@ -106,6 +106,7 @@ class Daemon:
             events=self.events,
             lease=self.lease,
             clock=self.clock,
+            paths=self.paths,
             logger=get_logger("sleep"),
         )
 
@@ -739,6 +740,54 @@ class Daemon:
             "file_count": snapshot.file_count, "verified": snapshot.verified,
             "path": str(snapshot.path),
         }
+
+    # ------------------------------------------------------------------
+    # what it learned
+    # ------------------------------------------------------------------
+    def facts(self, *, module: str | None = None, limit: int = 100,
+              subject: str | None = None) -> dict[str, Any]:
+        """Durable statements the night extracted, newest and most confident first."""
+        from gustav.learn.facts import FactStore
+
+        store = FactStore(self.db)
+        if subject:
+            return {"subject": subject, "history": store.history(subject)}
+        return {
+            "facts": store.active(module=module, limit=limit),
+            "total": store.count(),
+            "retracted": store.count("retracted"),
+        }
+
+    def skills(self) -> dict[str, Any]:
+        """The measured skill table: what it can do, how often it was asked."""
+        from gustav.learn.skills import SkillStore
+
+        store = SkillStore(self.db)
+        return {
+            "skills": [
+                {
+                    "module": s.module, "topic": s.topic, "trials": s.trials,
+                    "passes": s.passes, "score": round(s.score, 3),
+                    "demand": round(s.demand, 3), "weakness": round(s.weakness, 3),
+                    "studied_at": s.studied_at,
+                }
+                for s in sorted(store.all(), key=lambda s: (-s.weakness, s.module, s.topic))
+            ],
+            "summary": store.summary(),
+        }
+
+    def write_report(self, run_id: int | None = None) -> dict[str, Any]:
+        """Render a run's report. Regenerated from the store, so any past run works."""
+        from gustav.report.html import write_report as render
+
+        if run_id is None:
+            row = self.db.query_one("SELECT id FROM sleep_runs ORDER BY id DESC LIMIT 1")
+            if row is None:
+                raise KeyError("there are no sleep runs yet, so there is nothing to report")
+            run_id = int(row["id"])
+        path = render(self.db, run_id, self.paths.reports, instance=self.config.instance.name)
+        self.db.set_meta("sleep.last_report", str(path))
+        return {"run_id": run_id, "path": str(path), "bytes": path.stat().st_size}
 
     def verify_backup(self, snapshot_id: str) -> dict[str, Any]:
         result = self.backups.verify(snapshot_id, check_extra=True)

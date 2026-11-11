@@ -104,6 +104,44 @@ def missing_weight_files(path: Path) -> list[str]:
     return ["model.safetensors"]
 
 
+def resolve_model_path(models_dir: Path, spec: ModelSpec) -> Path:
+    """Where a model's weights are on this machine, or a clear refusal.
+
+    Shared with the trainer, which has to find the same checkpoint the server is
+    running — an adapter trained against other weights is not an adapter.
+    """
+    candidates = [models_dir / spec.id, models_dir / spec.repo.replace("/", "--")]
+    for candidate in candidates:
+        if (candidate / "config.json").exists():
+            missing = missing_weight_files(candidate)
+            if missing:
+                raise ModelIncomplete(candidate, missing)
+            return candidate
+    # The HF cache counts as local, so a model pulled by any tool works.
+    from huggingface_hub import try_to_load_from_cache
+
+    cached = try_to_load_from_cache(spec.repo, "config.json")
+    if isinstance(cached, str) and Path(cached).exists():
+        return Path(cached).parent
+    raise ModelNotAvailable(spec.id, spec.repo, candidates)
+
+
+def quantization_config(quant: QuantSpec, dtype: Any):
+    """The bitsandbytes configuration for a quantisation, or None for full precision."""
+    if not quant.quantized:
+        return None
+    from transformers import BitsAndBytesConfig
+
+    if quant.bytes_per_param <= 0.6:
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=dtype,
+        )
+    return BitsAndBytesConfig(load_in_8bit=True)
+
+
 class TransformersBackend(InferenceBackend):
     name = "transformers"
 
@@ -163,23 +201,7 @@ class TransformersBackend(InferenceBackend):
 
     def resolve_path(self) -> Path:
         """Where the weights are, or a clear refusal."""
-        candidates = [
-            self.models_dir / self.spec.id,
-            self.models_dir / self.spec.repo.replace("/", "--"),
-        ]
-        for candidate in candidates:
-            if (candidate / "config.json").exists():
-                missing = missing_weight_files(candidate)
-                if missing:
-                    raise ModelIncomplete(candidate, missing)
-                return candidate
-        # The HF cache counts as local, so a model pulled by any tool works.
-        from huggingface_hub import try_to_load_from_cache
-
-        cached = try_to_load_from_cache(self.spec.repo, "config.json")
-        if isinstance(cached, str) and Path(cached).exists():
-            return Path(cached).parent
-        raise ModelNotAvailable(self.spec.id, self.spec.repo, candidates)
+        return resolve_model_path(self.models_dir, self.spec)
 
     def preflight(self) -> None:
         """Refuse before CUDA has a chance to fail."""
@@ -312,18 +334,7 @@ class TransformersBackend(InferenceBackend):
         return {self._logits_kwarg: 1}
 
     def _quantization_config(self, dtype: Any):
-        if not self.quant.quantized:
-            return None
-        from transformers import BitsAndBytesConfig
-
-        if self.quant.bytes_per_param <= 0.6:
-            return BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=dtype,
-            )
-        return BitsAndBytesConfig(load_in_8bit=True)
+        return quantization_config(self.quant, dtype)
 
     async def unload(self) -> None:
         """Free the GPU completely. A training child needs every megabyte."""

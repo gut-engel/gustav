@@ -136,14 +136,35 @@ class SupervisorConfig(Strict):
 
 
 class SleepConfig(Strict):
-    """The sleep pipeline. Stage 1 ships a journalled skeleton; real stages land later."""
+    """The sleep pipeline."""
 
     #: Steps the user can switch off entirely.
     disabled_steps: list[str] = []
-    #: Stage-1 placeholder pipeline: seconds of simulated work per step.
+    #: Steps that still run the simulated placeholder handler. Everything not listed
+    #: here does real work; this is how an unfinished stage stays runnable instead of
+    #: being a hole in the night.
+    simulated_steps: list[str] = ["expansion", "speed"]
+    #: Seconds of simulated work per placeholder step.
     simulated_step_seconds: float = 0.5
-    #: Replay share for anti-forgetting (used from stage 5).
+    #: Replay share for anti-forgetting: this fraction of every training mix is drawn
+    #: from examples that earlier runs already learned, so new data cannot quietly
+    #: overwrite old skills.
     replay_fraction: float = 0.30
+    #: How far back consolidation looks when nothing has been consolidated yet.
+    lookback_hours: int = 72
+    #: Per-night ceilings, so one busy day cannot produce a night that never ends.
+    max_facts_per_run: int = 200
+    max_examples_per_run: int = 2000
+    #: Share of new examples held back for the gate. These are never trained on.
+    heldout_fraction: float = 0.15
+    #: Topics `reflect` may pick per night, and the pass rate below which a topic is weak.
+    max_topics_per_run: int = 5
+    weak_score_threshold: float = 0.6
+    #: Use the model for consolidation and study. With it off, only the deterministic
+    #: extractors run — much less data, but no GPU and no model errors in the dataset.
+    use_model: bool = True
+    #: Tokens the model may spend per consolidation/study/practice answer.
+    max_new_tokens: int = 384
 
 
 class WakeConfig(Strict):
@@ -233,6 +254,97 @@ class BackupConfig(Strict):
     verify_after_write: bool = True
 
 
+class FetcherConfig(Strict):
+    """The one component that touches the network, and the allowlist that limits it."""
+
+    enabled: bool = True
+    #: Hosts documentation may be fetched from. Nothing else is ever requested, and a
+    #: redirect that leaves the list is dropped rather than followed.
+    allowed_hosts: list[str] = [
+        "docs.python.org",
+        "doc.rust-lang.org",
+        "docs.rs",
+        "developer.mozilla.org",
+        "pkg.go.dev",
+        "peps.python.org",
+    ]
+    #: Extra local directories to study from. Useful offline, and the only source used
+    #: when `enabled` is false.
+    local_sources: list[str] = []
+    user_agent: str = "gustav-docs/0.1 (local documentation fetcher)"
+    timeout_seconds: float = 20.0
+    max_bytes_per_document: int = 2 * 1024 * 1024
+    max_documents_per_run: int = 12
+    #: Don't re-fetch something already in the cache this recently.
+    cache_ttl_hours: int = 168
+    #: Be a polite client: this many seconds between requests to the same host.
+    delay_seconds: float = 1.0
+
+
+class SandboxConfig(Strict):
+    """Where practice answers are judged. Nothing here trusts the model's own opinion."""
+
+    #: Interpreter for python tasks. Default: the one running the daemon.
+    python: str | None = None
+    timeout_seconds: float = 10.0
+    memory_limit_mb: int = 1024
+    #: Hard cap on how much a verifier may print back.
+    max_output_bytes: int = 64 * 1024
+    #: Candidate code runs with no network namespace access we can grant it anyway;
+    #: this clears proxy variables and sets a throwaway HOME and cwd per attempt.
+    isolate_env: bool = True
+
+
+class TrainingConfig(Strict):
+    """LoRA training. Everything here is a ceiling, not a target."""
+
+    enabled: bool = True
+    #: LoRA shape. `rank: null` takes the rank from the hardware plan.
+    rank: int | None = None
+    alpha_ratio: float = 2.0
+    dropout: float = 0.05
+    learning_rate: float = 1e-4
+    #: Effective batch = batch_size * grad_accum; the plan sizes memory for batch_size.
+    batch_size: int = 1
+    grad_accum: int = 8
+    epochs: float = 1.0
+    #: Hard caps so a night cannot run away: whichever is hit first stops training.
+    max_steps: int = 200
+    max_seconds: float = 1800.0
+    #: Don't bother training a module with less than this much new material.
+    min_examples: int = 16
+    #: Train only on examples something other than the model agreed with: a correction,
+    #: a thumbs-up, a passing test. The strict setting — it throws away most of what a
+    #: night produces (cited study answers, self-consistent rewrites) in exchange for a
+    #: dataset where every row has an external authority behind it.
+    verified_only: bool = False
+    #: Modules to train. Empty = every module with enough examples.
+    modules: list[str] = []
+    warmup_ratio: float = 0.03
+    max_grad_norm: float = 1.0
+    #: Save a checkpoint this often, so a preempted night resumes rather than restarts.
+    checkpoint_every_steps: int = 25
+
+
+class GateConfig(Strict):
+    """The regression gate. Nothing is promoted unless this passes."""
+
+    enabled: bool = True
+    #: A candidate must beat the baseline on the held-out suite by at least this much.
+    min_improvement: float = 0.0
+    #: And may not lose more than this on the regression suite — the anti-forgetting
+    #: check. 0.02 is one item in fifty, i.e. noise, not a skill.
+    max_regression: float = 0.02
+    #: Below this many items a score is not a measurement; the gate skips instead of
+    #: promoting on three questions.
+    min_items: int = 8
+    max_items: int = 120
+    max_new_tokens: int = 256
+    #: Promote only one module per night by default: if something breaks, the cause is
+    #: unambiguous. Raise it once the gate has earned your trust.
+    max_promotions_per_run: int = 1
+
+
 class Config(Strict):
     instance: InstanceConfig = InstanceConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -248,5 +360,7 @@ class Config(Strict):
     backup: BackupConfig = BackupConfig()
     inference: dict[str, Any] = {}
     expansion: dict[str, Any] = {}
-    fetcher: dict[str, Any] = {}
-    sandbox: dict[str, Any] = {}
+    fetcher: FetcherConfig = FetcherConfig()
+    sandbox: SandboxConfig = SandboxConfig()
+    training: TrainingConfig = TrainingConfig()
+    gate: GateConfig = GateConfig()

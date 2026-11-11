@@ -12,9 +12,16 @@ from gustav.core.clock import FakeClock
 from gustav.core.events import Events
 from gustav.core.journal import Journal
 from gustav.paths import Paths
+from gustav.sleep.pipeline import default_pipeline
 from gustav.store.db import open_db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: Every step of the night, simulated. The pipeline machinery (resume, retry, watchdog,
+#: preemption) is what most tests are about, and the placeholder handler is what makes
+#: those behaviours provokable on demand. Tests of the real steps opt in by calling the
+#: step directly or by overriding `sleep.simulated_steps`.
+ALL_STEPS = [step.spec.name for step in default_pipeline(Config()).steps]
 
 
 @pytest.fixture
@@ -34,6 +41,7 @@ def project(tmp_path: Path) -> Path:
         "supervisor:\n  heartbeat_timeout_seconds: 5\n  step_timeout_seconds: 30\n"
         "  max_attempts: 2\n  retry_backoff_seconds: 0.05\n  memory_limit_mb: 0\n"
         "sleep:\n  simulated_step_seconds: 0.02\n"
+        f"  simulated_steps: [{', '.join(ALL_STEPS)}]\n"
         # Deterministic and GPU-free: the tests that need real weights are marked `gpu`.
         "inference:\n  responder: echo\n",
         encoding="utf-8",
@@ -60,7 +68,7 @@ def config() -> Config:
                 "retry_backoff_seconds": 0.01,
                 "memory_limit_mb": 0,
             },
-            "sleep": {"simulated_step_seconds": 0.02},
+            "sleep": {"simulated_step_seconds": 0.02, "simulated_steps": ALL_STEPS},
         }
     )
 

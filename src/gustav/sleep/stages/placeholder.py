@@ -81,6 +81,7 @@ def run_step(
     attempt: int = 1,
     dry_run: bool = False,
     simulated_seconds: float = 0.5,
+    **_ignored: Any,
 ) -> dict[str, Any]:
     directory = Path(run_dir) if run_dir else None
     if directory is not None:

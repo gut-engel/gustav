@@ -141,6 +141,10 @@ class HardwareService:
                     )
         return self.ladder.with_overrides(overrides) if overrides else self.ladder
 
+    def effective_ladder(self) -> Ladder:
+        """The ladder as it applies on this machine. What the trainer and gate use."""
+        return self._ladder_with_local_configs()
+
     # --- plans ----------------------------------------------------------
     def stored_plan(self) -> Plan | None:
         raw = self.db.get_meta(META_PLAN)

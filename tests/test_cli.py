@@ -101,9 +101,32 @@ def test_a_missing_daemon_says_how_to_start_one(project, repo_root):
 
 
 def test_later_stage_commands_explain_themselves(project, repo_root):
-    result = ai(project, "report", repo_root=repo_root)
+    result = ai(project, "expansion", repo_root=repo_root)
     assert result.returncode == 2
-    assert "stage 5" in result.stderr
+    assert "stage 6" in result.stderr
+
+
+def test_facts_and_skills_are_honest_when_nothing_was_learned_yet(running, project, repo_root):
+    facts = ai(project, "facts", repo_root=repo_root)
+    assert facts.returncode == 0, facts.stderr
+    assert "not learned any facts yet" in facts.stdout
+    skills = ai(project, "skills", repo_root=repo_root)
+    assert "nothing has been measured yet" in skills.stdout
+
+
+def test_a_report_can_be_written_for_a_run(running, project, repo_root):
+    assert ai(project, "sleep", "now", repo_root=repo_root).returncode == 0
+    result = ai(project, "report", repo_root=repo_root)
+    assert result.returncode == 0, result.stderr
+    assert "report for run 1" in result.stdout
+    written = Path(result.stdout.split(": ", 1)[1].strip())
+    assert written.exists() and "Sleep run 1" in written.read_text(encoding="utf-8")
+
+
+def test_a_report_for_a_run_that_does_not_exist_says_so(running, project, repo_root):
+    result = ai(project, "report", "99", repo_root=repo_root)
+    assert result.returncode == 1
+    assert "no sleep run 99" in result.stderr
 
 
 def test_plan_hardware_explains_its_choice(running, project, repo_root):
@@ -154,7 +177,7 @@ def test_parser_covers_the_documented_command_surface():
     for expected in (
         "chat", "status", "sleep", "wake", "pause-learning", "resume-learning",
         "report", "backup", "approve-expansion", "approve-base-change",
-        "plan-hardware", "optimize", "expansion", "facts", "start", "stop",
+        "plan-hardware", "optimize", "expansion", "facts", "skills", "start", "stop",
     ):
         assert expected in names, expected
 

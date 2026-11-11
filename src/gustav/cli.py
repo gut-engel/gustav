@@ -23,8 +23,6 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0)
 #: Commands whose implementation lands in a later stage. Listed so `ai --help` shows the
 #: full surface and the message is an explanation rather than "unknown command".
 NOT_YET: dict[str, str] = {
-    "report": "stage 5 (sleep phase)",
-    "facts": "stage 5 (sleep phase)",
     "approve-expansion": "stage 6 (self-expansion)",
     "expansion": "stage 6 (self-expansion)",
     "optimize": "stage 6 (self-optimisation)",
@@ -217,7 +215,12 @@ def _print_run(run: dict[str, Any]) -> None:
             "preempted": "⏸",
             "pending": " ",
         }.get(step["status"], "?")
+        from gustav.report.summary import step_summary
+
         extra = ""
+        summary = step_summary(step["name"], step.get("result"))
+        if summary:
+            extra += f" {summary}"
         if step["attempts"] > 1:
             extra += f" attempts={step['attempts']}"
         if step.get("checkpoint"):
@@ -672,6 +675,71 @@ def cmd_runs(args: argparse.Namespace, client: Client) -> int:
     return 0
 
 
+def cmd_facts(args: argparse.Namespace, client: Client) -> int:
+    params: dict[str, Any] = {"limit": args.limit}
+    if args.module:
+        params["module"] = args.module
+    if args.subject:
+        params["subject"] = args.subject
+    payload = client.get("/facts", params=params)
+
+    if args.subject:
+        history = payload["history"]
+        if not history:
+            print(f"nothing is known about '{args.subject}'")
+            return 0
+        print(f"everything it has believed about '{args.subject}':")
+        for fact in history:
+            marker = {"active": "now", "superseded": "was", "retracted": "no"}.get(
+                fact["status"], fact["status"]
+            )
+            print(f"  {marker}  {fact['created_at']}  {fact['text']}")
+        return 0
+
+    facts = payload["facts"]
+    if not facts:
+        print("it has not learned any facts yet (they come from the sleep phase)")
+        return 0
+    print(f"{payload['total']} facts held" + (
+        f", {payload['retracted']} retracted" if payload["retracted"] else ""))
+    for fact in facts:
+        subject = f"  [{fact['subject']}]" if fact["subject"] else ""
+        print(f"  {fact['confidence']:.2f}  {fact['text']}{subject}")
+    return 0
+
+
+def cmd_skills(args: argparse.Namespace, client: Client) -> int:
+    payload = client.get("/skills")
+    skills = payload["skills"]
+    if not skills:
+        print("nothing has been measured yet (the sleep phase fills this in)")
+        return 0
+    summary = payload["summary"]
+    mean = summary.get("mean_score")
+    print(
+        f"{summary['measured']} of {summary['topics']} topics measured"
+        + (f", mean score {mean:.2f}" if mean is not None else "")
+    )
+    print(f"  {'module':<16} {'topic':<16} {'score':>6} {'trials':>7} {'demand':>7}")
+    for skill in skills:
+        if not args.all and skill["trials"] == 0 and skill["demand"] == 0:
+            continue
+        print(
+            f"  {skill['module']:<16} {skill['topic']:<16} {skill['score']:>6.2f} "
+            f"{skill['trials']:>7} {skill['demand']:>7.2f}"
+        )
+    return 0
+
+
+def cmd_report(args: argparse.Namespace, client: Client) -> int:
+    params = {"run_id": args.run_id} if args.run_id else {}
+    payload = client.get("/report", params=params)
+    print(f"report for run {payload['run_id']}: {payload['path']}")
+    if args.show:
+        print(Path(payload["path"]).read_text(encoding="utf-8"))
+    return 0
+
+
 def cmd_not_yet(name: str) -> int:
     print(f"'ai {name}' arrives in {NOT_YET[name]}.", file=sys.stderr)
     return 2
@@ -790,6 +858,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id", nargs="?", type=int)
     p.add_argument("--limit", type=int, default=20)
 
+    p = sub.add_parser("facts", help="durable facts it has learned about you")
+    p.add_argument("--module", help="only this module's facts")
+    p.add_argument("--subject", help="every statement it has believed about one subject")
+    p.add_argument("--limit", type=int, default=100)
+
+    p = sub.add_parser("skills", help="the measured skill table: what it can do")
+    p.add_argument("--all", action="store_true", help="include never-measured topics")
+
+    p = sub.add_parser("report", help="write the HTML report for a sleep run")
+    p.add_argument("run_id", nargs="?", type=int, help="default: the most recent run")
+    p.add_argument("--show", action="store_true", help="also print the HTML")
+
     for name, stage in NOT_YET.items():
         stub = sub.add_parser(name, help=f"(arrives in {stage})")
         stub.add_argument("rest", nargs="*", help=argparse.SUPPRESS)
@@ -850,6 +930,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_events(args, client)
         if args.command == "runs":
             return cmd_runs(args, client)
+        if args.command == "facts":
+            return cmd_facts(args, client)
+        if args.command == "skills":
+            return cmd_skills(args, client)
+        if args.command == "report":
+            return cmd_report(args, client)
         if args.command == "model":
             return cmd_model(args, client)
         if args.command == "backup":

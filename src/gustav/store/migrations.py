@@ -184,7 +184,204 @@ MIGRATION_0002 = [
     "CREATE INDEX idx_weight_changes_step ON weight_changes (run_id, step)",
 ]
 
+MIGRATION_0003 = [
+    # --- what the day left behind -------------------------------------------
+    # Durable statements about the user and their world. Consolidation writes them,
+    # `ai facts` shows them, and the personal-memory module trains on them. A fact is
+    # never edited in place: a newer one supersedes it, so the history stays readable.
+    """
+    CREATE TABLE facts (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        module        TEXT NOT NULL DEFAULT 'personal-memory',
+        subject       TEXT,
+        text          TEXT NOT NULL,
+        confidence    REAL NOT NULL DEFAULT 0.5,
+        source        TEXT,
+        source_turn_id INTEGER,
+        run_id        INTEGER,
+        status        TEXT NOT NULL DEFAULT 'active',  -- active | superseded | retracted
+        superseded_by INTEGER,
+        fingerprint   TEXT NOT NULL UNIQUE
+    )
+    """,
+    "CREATE INDEX idx_facts_active ON facts (status, subject)",
+    # Every candidate the night produced, whatever produced it. One table, because the
+    # trainer's job is to mix sources in known proportions and it can only do that if
+    # they are comparable: same columns, a weight, and a fingerprint so the same example
+    # discovered twice is stored once.
+    """
+    CREATE TABLE training_examples (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        run_id        INTEGER,
+        module        TEXT NOT NULL DEFAULT 'general',
+        kind          TEXT NOT NULL,
+                      -- correction | preference | fact | study | practice | dream
+        prompt        TEXT NOT NULL,
+        completion    TEXT NOT NULL,
+        rejected      TEXT,                            -- the worse answer of a pair
+        weight        REAL NOT NULL DEFAULT 1.0,
+        source        TEXT,
+        source_ref    TEXT,
+        citation      TEXT,                            -- where a study example came from
+        -- 1 only if something other than the model said it was right: the user, a test,
+        -- a compiler. The trainer can be told to use nothing else.
+        verified      INTEGER NOT NULL DEFAULT 0,
+        split         TEXT NOT NULL DEFAULT 'train',   -- train | heldout
+        status        TEXT NOT NULL DEFAULT 'ready',   -- ready | used | dropped
+        trained_run_id INTEGER,
+        fingerprint   TEXT NOT NULL UNIQUE
+    )
+    """,
+    "CREATE INDEX idx_examples_ready ON training_examples (status, split, module)",
+    "CREATE INDEX idx_examples_run ON training_examples (run_id, kind)",
+    # --- study --------------------------------------------------------------
+    """
+    CREATE TABLE documents (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        fetched_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        url          TEXT NOT NULL UNIQUE,
+        host         TEXT,
+        topic        TEXT,
+        title        TEXT,
+        sha256       TEXT,
+        bytes        INTEGER NOT NULL DEFAULT 0,
+        path         TEXT,                             -- relative to var/doc_cache
+        content_type TEXT,
+        -- What docs/sources.yaml declared for this source. Training on documentation
+        -- is a licence question, and an unrecorded licence is one you cannot answer
+        -- later, so a missing value is stored as NULL and warned about rather than
+        -- quietly assumed to be fine.
+        license      TEXT,
+        status       TEXT NOT NULL DEFAULT 'fresh',    -- fresh | cached | failed | skipped
+        run_id       INTEGER,
+        error        TEXT,
+        studied_run_id INTEGER
+    )
+    """,
+    "CREATE INDEX idx_documents_topic ON documents (topic, fetched_at DESC)",
+    # --- practice -----------------------------------------------------------
+    # A task carries its own verifier, so "did it pass" is never the model's opinion.
+    """
+    CREATE TABLE tasks (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        run_id      INTEGER,
+        module      TEXT NOT NULL DEFAULT 'general',
+        topic       TEXT,
+        kind        TEXT NOT NULL,                     -- python | qa
+        prompt      TEXT NOT NULL,
+        verifier    TEXT NOT NULL,                     -- JSON: tests, or the answer
+        difficulty  REAL NOT NULL DEFAULT 0.5,
+        source      TEXT,
+        source_ref  TEXT,
+        document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+        status      TEXT NOT NULL DEFAULT 'open',      -- open | solved | failed | retired
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        passes      INTEGER NOT NULL DEFAULT 0,
+        fingerprint TEXT NOT NULL UNIQUE
+    )
+    """,
+    "CREATE INDEX idx_tasks_open ON tasks (status, module, topic)",
+    """
+    CREATE TABLE task_attempts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        run_id      INTEGER,
+        step        TEXT,
+        attempt     INTEGER NOT NULL DEFAULT 1,
+        answer      TEXT,
+        passed      INTEGER NOT NULL DEFAULT 0,
+        detail      TEXT,
+        duration_ms INTEGER
+    )
+    """,
+    "CREATE INDEX idx_attempts_task ON task_attempts (task_id, id DESC)",
+    # --- what it can and cannot do -----------------------------------------
+    # The measured skill table. `reflect` ranks on it, `retest` updates it, and it is
+    # what makes "it got worse at Rust" a number rather than an impression.
+    """
+    CREATE TABLE skills (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        module        TEXT NOT NULL,
+        topic         TEXT NOT NULL,
+        trials        INTEGER NOT NULL DEFAULT 0,
+        passes        INTEGER NOT NULL DEFAULT 0,
+        score         REAL NOT NULL DEFAULT 0.0,       -- smoothed pass rate
+        demand        REAL NOT NULL DEFAULT 0.0,       -- how often it is actually asked
+        first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        studied_at    TEXT,
+        note          TEXT,
+        UNIQUE (module, topic)
+    )
+    """,
+    # --- the gate -----------------------------------------------------------
+    # Held-out and regression suites. Items are never trained on: the dataset builder
+    # filters on split, and benchmark items live here rather than in the example table
+    # so there is no way to accidentally select them.
+    """
+    CREATE TABLE benchmark_items (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        suite       TEXT NOT NULL,                     -- heldout | regression
+        module      TEXT NOT NULL DEFAULT 'general',
+        topic       TEXT,
+        kind        TEXT NOT NULL,                     -- qa | python
+        prompt      TEXT NOT NULL,
+        expected    TEXT,
+        verifier    TEXT,
+        run_id      INTEGER,
+        retired     INTEGER NOT NULL DEFAULT 0,
+        fingerprint TEXT NOT NULL UNIQUE
+    )
+    """,
+    "CREATE INDEX idx_bench_suite ON benchmark_items (suite, module, retired)",
+    """
+    CREATE TABLE training_runs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at TEXT,
+        run_id      INTEGER,
+        module      TEXT NOT NULL,
+        version     TEXT,
+        examples    INTEGER NOT NULL DEFAULT 0,
+        replay      INTEGER NOT NULL DEFAULT 0,
+        steps       INTEGER NOT NULL DEFAULT 0,
+        loss_start  REAL,
+        loss_end    REAL,
+        seconds     REAL,
+        status      TEXT NOT NULL DEFAULT 'running',
+                    -- running | trained | promoted | rejected | failed | skipped
+        detail      TEXT
+    )
+    """,
+    "CREATE INDEX idx_training_runs_run ON training_runs (run_id, module)",
+    """
+    CREATE TABLE gate_results (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        run_id          INTEGER,
+        module          TEXT NOT NULL,
+        candidate       TEXT,
+        baseline        TEXT,
+        suite           TEXT NOT NULL,
+        items           INTEGER NOT NULL DEFAULT 0,
+        candidate_score REAL,
+        baseline_score  REAL,
+        delta           REAL,
+        verdict         TEXT NOT NULL DEFAULT 'pending',  -- pass | fail | skip
+        detail          TEXT
+    )
+    """,
+    "CREATE INDEX idx_gate_run ON gate_results (run_id, module)",
+]
+
 MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (1, "initial_daemon_schema", MIGRATION_0001),
     (2, "weight_change_log", MIGRATION_0002),
+    (3, "learning_store", MIGRATION_0003),
 ]

@@ -131,12 +131,21 @@ def test_approving_a_base_change_applies_it(service_factory, db, events):
     assert approved and "no longer apply" in approved[0]["message"]
 
 
-def test_approval_is_honest_that_no_backup_was_taken_yet(service_factory, events):
+def test_the_service_itself_takes_no_backup(service_factory, events):
+    """The hardware service changes metadata; it must not pretend to be the guard.
+
+    Approving a base change is a weight change, and the backup for it is taken by
+    `Daemon.approve_base_change`, which wraps this call in `guard.change(...)` with the
+    base checkpoint included. This test pins the division: the service records the
+    decision and warns what it costs, and says nothing about having taken a snapshot.
+    """
     service_factory("tiny-4gb", min_tokens_per_second=10).ensure_plan()
     service = service_factory("server-multigpu")
-    service.approve_base_change(service.ensure_plan().approval_id)
+    result = service.approve_base_change(service.ensure_plan().approval_id)
+    assert "snapshot" not in result
     event = next(e for e in events.recent() if e["kind"] == "hardware.base_change_approved")
-    assert "stage 4" in event["data"]["backup"]
+    assert "no longer apply" in event["message"]
+    assert "snapshot" not in (event["data"] or {})
 
 
 def test_approving_twice_is_refused(service_factory):

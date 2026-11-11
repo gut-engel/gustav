@@ -1,9 +1,12 @@
 """The sleep pipeline and its runner.
 
 The runner is the only thing that executes steps, and it does so strictly through the
-journal: a step is recorded, run in a child process, and recorded again. Stage 1 ships
-the real step *names* and crash policies with placeholder handlers, so the hard parts
-(resume, retry, preemption, watchdog) are proven before real work hangs off them.
+journal: a step is recorded, run in a child process, and recorded again. The step
+*names* and crash policies came first, with placeholder handlers behind them, so the
+hard parts — resume, retry, preemption, watchdog — were proven before real work hung
+off them. ``STAGE_TARGETS`` is where that real work is attached, and
+``sleep.simulated_steps`` is how a step whose stage has not landed yet keeps running
+the placeholder instead of being a hole in the night.
 """
 
 from __future__ import annotations
@@ -27,8 +30,26 @@ from gustav.core.journal import (
 )
 from gustav.core.logs import get_logger
 from gustav.core.supervisor import ChildSpec, Outcome, Supervisor
+from gustav.paths import Paths
+from gustav.sleep.stages._base import step_context
 
 PLACEHOLDER = "gustav.sleep.stages.placeholder:run_step"
+
+#: The real handler for each step. A name missing here, or listed in
+#: ``sleep.simulated_steps``, runs the placeholder.
+STAGE_TARGETS: dict[str, str] = {
+    "snapshot": "gustav.sleep.stages.snapshot:run_step",
+    "consolidation": "gustav.sleep.stages.consolidation:run_step",
+    "reflect": "gustav.sleep.stages.reflect:run_step",
+    "fetch_docs": "gustav.sleep.stages.fetch_docs:run_step",
+    "study": "gustav.sleep.stages.study:run_step",
+    "practice": "gustav.sleep.stages.practice:run_step",
+    "dreaming": "gustav.sleep.stages.dreaming:run_step",
+    "training": "gustav.sleep.stages.training:run_step",
+    "gate": "gustav.sleep.stages.gate:run_step",
+    "retest": "gustav.sleep.stages.retest:run_step",
+    "report": "gustav.sleep.stages.report:run_step",
+}
 
 
 @dataclass(frozen=True)
@@ -96,7 +117,20 @@ def default_pipeline(config: Config) -> Pipeline:
                       description="write the HTML report for this run")),
     ]
     disabled = set(config.sleep.disabled_steps)
-    return Pipeline(name="sleep", steps=tuple(s for s in steps if s.spec.name not in disabled))
+    simulated = set(config.sleep.simulated_steps)
+    resolved = [
+        Step(
+            step.spec,
+            target=(
+                PLACEHOLDER
+                if step.spec.name in simulated
+                else STAGE_TARGETS.get(step.spec.name, PLACEHOLDER)
+            ),
+        )
+        for step in steps
+        if step.spec.name not in disabled
+    ]
+    return Pipeline(name="sleep", steps=tuple(resolved))
 
 
 @dataclass
@@ -121,9 +155,11 @@ class PipelineRunner:
         events: Events,
         lease: GpuLease | None = None,
         clock: Clock | None = None,
+        paths: Paths | None = None,
         logger=None,
     ):
         self.config = config
+        self.paths = paths
         self.journal = journal
         self.supervisor = supervisor
         self.events = events
@@ -264,6 +300,8 @@ class PipelineRunner:
                         "attempt": attempt,
                         "dry_run": run.dry_run,
                         "simulated_seconds": self.config.sleep.simulated_step_seconds,
+                        # A child starts with nothing: this is how it finds the project.
+                        "context": step_context(self.paths) if self.paths else None,
                     },
                     timeout_seconds=spec.timeout_seconds or sup.step_timeout_seconds,
                     heartbeat_timeout_seconds=sup.heartbeat_timeout_seconds,
