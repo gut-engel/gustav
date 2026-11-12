@@ -66,6 +66,12 @@ useful kind of result:
 
 ## Install
 
+You can install Gustav with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client --no-prompt
+```
+
 The project can be installed in several ways:
 
 ### 1️⃣ Python package (editable)
