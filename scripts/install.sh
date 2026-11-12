@@ -9,10 +9,34 @@
 # writes outside the directories it tells you about, and refuses rather than guessing
 # when something is in the way. Run it again any time to update.
 #
-# The repository is private, so fetching it needs a credential. Set GUSTAV_TOKEN to a
-# GitHub token with read access to this one repository, or have SSH access configured
-# and pass --ssh. See the README for how to mint a token that can do nothing else.
+# The repository is public, so this needs no credential. If you have made your own fork
+# private, set GUSTAV_TOKEN to a token with read access to it, or pass --ssh.
 set -euo pipefail
+
+# Asking a question through /dev/tty rather than stdin. The one-liner pipes this script
+# into bash, so stdin is the download, not the person at the keyboard — reading from it
+# would consume the rest of the script. There is still a terminal; it is just over here.
+TTY=""
+if [ -t 0 ]; then
+  TTY="/dev/stdin"
+elif { : < /dev/tty; } 2>/dev/null; then
+  # The device node exists on machines with no controlling terminal too, so the
+  # only honest test is to open it.
+  TTY="/dev/tty"
+fi
+asking() { [ -n "$TTY" ]; }
+ask() {  # ask <variable> <prompt>
+  local __reply=""
+  asking || return 1
+  if [ "$TTY" = /dev/tty ]; then
+    printf '%s' "$2" > /dev/tty
+    IFS= read -r __reply < /dev/tty || true
+  else
+    printf '%s' "$2"
+    IFS= read -r __reply || true
+  fi
+  printf -v "$1" '%s' "$__reply"
+}
 
 REPO_SLUG="${GUSTAV_REPO:-gut-engel/gustav}"
 REF="${GUSTAV_REF:-main}"
@@ -32,7 +56,15 @@ say()  { [ "$QUIET" = true ] || printf '%s\n' "$*"; }
 step() { [ "$QUIET" = true ] || printf '\n\033[1m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
-run()  { if [ "$DRY_RUN" = true ]; then printf '  would run: %s\n' "$*"; else "$@"; fi; }
+# A dry run prints the command it would have run — with any credential masked, because
+# "would run" output ends up pasted into issues and scrollback.
+run()  {
+  if [ "$DRY_RUN" = true ]; then
+    printf '  would run: %s\n' "${*//x-access-token:*@github.com/x-access-token:***@github.com}"
+  else
+    "$@"
+  fi
+}
 
 usage() {
   cat <<EOF
@@ -44,7 +76,7 @@ Usage: install.sh [--server | --client] [options]
   --dir <path>        where to install (default: $DIR)
   --ref <git-ref>     branch or tag to install (default: $REF)
   --source <path>     install from a local checkout instead of cloning
-  --ssh               clone over SSH instead of using GUSTAV_TOKEN
+  --ssh               clone over SSH (for a fork you have made private)
   --service / --no-service
                       install (or skip) the systemd user service, server only
   --python <path>     interpreter to build the virtualenv with
@@ -79,12 +111,11 @@ done
 
 # --- what are we installing? -------------------------------------------------
 if [ -z "$MODE" ]; then
-  if [ -t 0 ]; then
+  if asking; then
     say "What is this machine?"
     say "  1) a server — runs the model, sleeps, learns  (needs an NVIDIA GPU)"
     say "  2) a client — just the 'ai' command, talking to a server you already run"
-    printf 'Choose [1/2]: '
-    read -r choice
+    ask choice 'Choose [1/2]: '
     case "$choice" in
       1) MODE=server ;;
       2) MODE=client ;;
@@ -173,7 +204,8 @@ else
     remote="https://x-access-token:${TOKEN}@github.com/${REPO_SLUG}.git"
     say "  cloning with the token from GUSTAV_TOKEN"
   else
-    die "this repository is private: set GUSTAV_TOKEN, or pass --ssh, or use --source"
+    remote="https://github.com/${REPO_SLUG}.git"
+    say "  cloning $REPO_SLUG"
   fi
   run git clone --quiet --branch "$REF" --depth 1 "$remote" "$DIR"
   # The token must not survive in .git/config, where it would end up in backups.
@@ -209,7 +241,9 @@ fi
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) warn "  $BIN_DIR is not on your PATH. Add this to your shell profile:"
-     warn "      export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+     # Name the directory it actually used, not the default: --dir and GUSTAV_BIN
+     # move it, and advice that points somewhere else is worse than none.
+     warn "      export PATH=\"${BIN_DIR/#$HOME/\$HOME}:\$PATH\"" ;;
 esac
 
 # --- make it a project -------------------------------------------------------
@@ -218,9 +252,8 @@ if [ "$MODE" = server ]; then
   run "$VENV/bin/ai" init "$DIR"
 
   if [ -z "$WITH_SERVICE" ]; then
-    if [ -t 0 ]; then
-      printf 'Run it as a systemd user service, so it is always on? [Y/n]: '
-      read -r answer
+    if asking; then
+      ask answer 'Run it as a systemd user service, so it is always on? [Y/n]: '
       case "$answer" in [nN]*) WITH_SERVICE=no ;; *) WITH_SERVICE=yes ;; esac
     else
       WITH_SERVICE=no
@@ -231,9 +264,8 @@ if [ "$MODE" = server ]; then
   fi
 else
   step "Pointing the client at your server"
-  if [ -z "$URL" ] && [ -t 0 ]; then
-    printf 'Server URL (e.g. https://box.example:8713), blank to do it later: '
-    read -r URL
+  if [ -z "$URL" ] && asking; then
+    ask URL 'Server URL (e.g. https://box.example:8713), blank to do it later: '
   fi
   if [ -n "$URL" ]; then
     say "  ai login $URL"

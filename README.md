@@ -68,26 +68,27 @@ useful kind of result:
 
 ## Install
 
-One command on the machine you want it on. The repository is private, so the command
-carries a credential — see [below](#the-token) for how to mint one that can do nothing
-else.
+One command on the machine you want it on.
 
 **A server** — runs the model, learns, sleeps. Needs an NVIDIA GPU:
 
 ```bash
-GUSTAV_TOKEN=github_pat_… bash -c "$(curl -fsSL \
-  -H "Authorization: Bearer $GUSTAV_TOKEN" -H 'Accept: application/vnd.github.raw' \
-  https://api.github.com/repos/gut-engel/gustav/contents/scripts/install.sh)" -- --server
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | bash -s -- --server
 ```
 
 **A client** — just the `ai` command, talking to a server you already run. No CUDA, no
 model, a few megabytes:
 
 ```bash
-GUSTAV_TOKEN=github_pat_… bash -c "$(curl -fsSL \
-  -H "Authorization: Bearer $GUSTAV_TOKEN" -H 'Accept: application/vnd.github.raw' \
-  https://api.github.com/repos/gut-engel/gustav/contents/scripts/install.sh)" -- \
-  --client --url https://your-server:8713
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | bash -s -- --client --url https://your-server:8713
+```
+
+Leave the flags off and it asks what this machine is, whether to run it as a service,
+and which server to point at — the questions go to your terminal, not to the pipe the
+script arrived on, so piping it into `bash` stays interactive:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | bash
 ```
 
 Both install into `~/gustav`, run as you, and put `ai` in `~/.local/bin`. Neither asks
@@ -96,29 +97,21 @@ running as root has none of those. Run the same command again to update — your
 `config.yaml`, your database, your adapters and your tools are left alone.
 
 `--dry-run` prints what it would do and changes nothing. `--help` lists the rest:
-`--dir`, `--ref`, `--ssh` (clone over SSH instead of using a token), `--source` (install
-from a checkout you already have), `--no-service`.
+`--dir`, `--ref`, `--source` (install from a checkout you already have), `--no-service`,
+and `--ssh` / `GUSTAV_TOKEN` for a fork you have made private.
 
-`scripts/uninstall.sh` takes away what the installer put there — the virtualenv, the
-`ai` symlink, the service — and **leaves what it learned**: the database, the adapters,
-the tools you approved, the backups. `--purge` deletes those too, after listing them.
-Uninstalling a program should not silently delete a year of learning.
+### Taking it off again
 
-### The token
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/uninstall.sh | bash
+```
 
-A one-liner that can read a private repository *is* a credential — treat it like one.
-Make a fine-grained token that can do nothing else:
-
-1. github.com → Settings → Developer settings → **Fine-grained tokens** → Generate new
-2. Repository access: **Only select repositories** → `gustav`
-3. Permissions: **Contents: Read-only**. Nothing else.
-4. Set an expiry you are comfortable with.
-
-Then keep it out of your shell history — `read -rs GUSTAV_TOKEN` before pasting the
-command, or put it in a file only you can read. The installer uses it to clone and then
-**removes it from `.git/config`**, so it does not end up in a backup of the machine.
-
-With SSH access to GitHub already set up, `--ssh` skips the token entirely.
+It takes away what the installer put there — the virtualenv, the `ai` symlink (only if
+it points into the install being removed), the service — and **leaves what it learned**:
+the database, the adapters, the tools you approved, the backups. `--purge` deletes those
+too, after listing them and asking. Uninstalling a program should not silently delete a
+year of learning. `scripts/uninstall.sh` is also in the checkout, if you would rather
+read it before running it.
 
 ### From a checkout
 
