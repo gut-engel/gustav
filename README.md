@@ -66,10 +66,16 @@ useful kind of result:
 
 ## Install
 
-You can install Gustav with a single command:
+You can install the CLI client with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client --no-prompt
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client
+```
+
+You can install the systemd service (server) with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --service
 ```
 
 The project can be installed in several ways:

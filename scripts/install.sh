@@ -16,7 +16,7 @@ CLIENT_ONLY=false
 SERVICE_ONLY=false
 SOURCE=""
 REF="main"
-NO_PROMPT=false
+INTERACTIVE=false
 
 default_limit="0"
 
@@ -47,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     --ref) REF="$2"; shift 2 ;;
     --source) SOURCE="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
-    --no-prompt) NO_PROMPT=true; shift ;;
+    --interactive) INTERACTIVE=true; shift ;;
     --one-liner) echo "curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- ${*:2}"; exit 0 ;;
     --help) usage ;;
     --*) echo "Unknown option: $1"; usage ;;
@@ -61,13 +61,8 @@ if [ "$CLIENT_ONLY" = false ] && [ "$SERVICE_ONLY" = false ]; then
   SERVICE_ONLY=true
 fi
 
-# Defaults when no prompt
-if [ "${NO_PROMPT}" = true ]; then
-  SERVICE_USER="$(whoami)"
-  ENABLE_WEB=false
-  CREATE_ADMIN=false
-  default_limit="0"
-else
+# Defaults when not interactive
+if [ "${INTERACTIVE}" = true ]; then
   # Prompt for service user if installing service
   if [ "$SERVICE_ONLY" = true ]; then
     echo "Select the user that will run the Gustav service:"
@@ -112,6 +107,12 @@ else
     echo "Invalid number – defaulting to 0 (unlimited)."
     default_limit=0
   fi
+else
+  # Non‑interactive defaults
+  SERVICE_USER="$(whoami)"
+  ENABLE_WEB=false
+  CREATE_ADMIN=false
+  default_limit="0"
 fi
 
 # Ensure install directory exists (needs root)
@@ -122,13 +123,14 @@ if [ "$CLIENT_ONLY" = true ]; then
   echo "Installing CLI client..."
   if [ -n "$SOURCE" ]; then
     sudo cp -r "$SOURCE" "$INSTALL_DIR"
-    PYEXE=$(command -v python3 || command -v python || echo "python")
-    sudo "$PYEXE" -m pip install "$INSTALL_DIR"
   else
     sudo git clone --depth 1 --branch "$REF" https://github.com/gut-engel/gustav.git "$INSTALL_DIR"
-    PYEXE=$(command -v python3 || command -v python || echo "python")
-    sudo "$PYEXE" -m pip install "$INSTALL_DIR"
   fi
+  # Create a virtual environment and install the package in editable mode
+  PYEXE=$(command -v python3 || command -v python || echo "python")
+  sudo "$PYEXE" -m venv "$INSTALL_DIR/.venv"
+  sudo "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip
+  sudo "$INSTALL_DIR/.venv/bin/pip" install -e "$INSTALL_DIR"
   echo "CLI installed. Add \"$INSTALL_DIR/.local/bin\" to your PATH if needed."
 fi
 
