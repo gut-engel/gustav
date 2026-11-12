@@ -22,11 +22,7 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0)
 
 #: Commands whose implementation lands in a later stage. Listed so `ai --help` shows the
 #: full surface and the message is an explanation rather than "unknown command".
-NOT_YET: dict[str, str] = {
-    "approve-expansion": "stage 6 (self-expansion)",
-    "expansion": "stage 6 (self-expansion)",
-    "optimize": "stage 6 (self-optimisation)",
-}
+NOT_YET: dict[str, str] = {}
 
 
 class DaemonUnreachable(RuntimeError):
@@ -740,6 +736,191 @@ def cmd_report(args: argparse.Namespace, client: Client) -> int:
     return 0
 
 
+def cmd_expansion(args: argparse.Namespace, client: Client) -> int:
+    if args.revert:
+        result = client.post("/expansion/revert")
+        print(
+            f"reverted {result['kind']} {result['subject']} from snapshot "
+            f"{result['snapshot']}"
+        )
+        print(f"  restored: {', '.join(result['restored']) or 'nothing'}")
+        print(f"  this revert is itself undoable: snapshot {result['undo_snapshot']}")
+        return 0
+
+    payload = client.get("/expansion", params={"limit": args.limit})
+    print("modules: " + ", ".join(payload["modules"]))
+    if payload["budget"]:
+        print("budget:")
+        for line in payload["budget"]:
+            print(f"  {line}")
+    if not payload["enabled"]:
+        print("expansion is disabled in config")
+
+    if payload["triggers"]:
+        print("what the measurements say now:")
+        for trigger in payload["triggers"]:
+            print(f"  [{trigger['strength']:.2f}] {trigger['kind']}: {trigger['rationale']}")
+    else:
+        print("nothing measured asks for more capacity")
+
+    if payload["history"]:
+        print("history:")
+        for item in payload["history"]:
+            snapshot = f"  snapshot={item['snapshot_id']}" if item["snapshot_id"] else ""
+            print(
+                f"  [{item['id']}] {item['created_at']}  {item['status']:<9} "
+                f"{item['kind']} {item['subject']}{snapshot}"
+            )
+            if item.get("detail"):
+                print(f"        {item['detail']}")
+    return 0
+
+
+def cmd_approve_expansion(args: argparse.Namespace, client: Client) -> int:
+    result = client.post(
+        f"/approvals/{args.approval_id}",
+        json={"approve": not args.reject, "note": args.note or ""},
+    )
+    if args.reject:
+        print(f"rejected: {result.get('subject', args.approval_id)}")
+        return 0
+    if not result.get("approved"):
+        print(f"could not apply it: {result.get('detail', 'unknown error')}", file=sys.stderr)
+        return 1
+    print(f"{result['kind']} {result['subject']}: {result['detail']}")
+    if result.get("snapshot"):
+        print(f"  snapshot before the change: {result['snapshot']}")
+    return 0
+
+
+def cmd_optimize(args: argparse.Namespace, client: Client) -> int:
+    if args.revert:
+        result = client.post("/optimisation/revert")
+        print(f"{result['setting']} was put back (it had been set to {result['was']})")
+        if result["learned"]:
+            print("still learned: " + ", ".join(f"{k}={v!r}" for k, v in
+                                                result["learned"].items()))
+        else:
+            print("nothing is set by self-optimisation any more")
+        return 0
+
+    payload = client.get("/optimisation", params={"limit": args.limit})
+    if not payload["enabled"]:
+        print("self-optimisation is disabled in config")
+    print("settings it may measure: " + ", ".join(payload["settings"]))
+    if payload["pinned"]:
+        print("pinned by you (never touched): " + ", ".join(payload["pinned"]))
+    print("in use:")
+    for setting, value in payload["in_use"].items():
+        learned = payload["learned"].get(setting)
+        mark = "  (learned)" if learned is not None else ""
+        print(f"  {setting:<22} {value!r}{mark}")
+
+    if payload["router"]:
+        router = payload["router"]
+        agreement = (
+            f", {router['agreement']:.0%} agreement with the keyword scorer"
+            if router.get("agreement") is not None
+            else ""
+        )
+        print(
+            f"router: fitted {router['trained_at']} on {router['material']} pieces of "
+            f"material, threshold {router['threshold']:.2f}{agreement}"
+        )
+    else:
+        print("router: the keyword scorer (nothing fitted yet)")
+
+    if payload["next_trials"]:
+        print("it would try next: " + ", ".join(
+            f"{t['setting']}={t['candidate']}" for t in payload["next_trials"]
+        ))
+    if payload["history"]:
+        print("history:")
+        for item in payload["history"]:
+            delta = f"{item['delta']:+.1%}" if item["delta"] is not None else "   —  "
+            print(
+                f"  [{item['id']}] {item['created_at']}  {item['status']:<9} "
+                f"{item['setting']}={item['candidate']}  {delta}  {item['detail'] or ''}"
+            )
+    else:
+        print("nothing has been measured yet; trials happen during sleep")
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Make a directory into a gustav project, without overwriting anything."""
+    from gustav.data import install_defaults
+
+    root = Path(args.directory or ".").expanduser().resolve()
+    result = install_defaults(root, dry_run=args.dry_run)
+    prefix = "would write" if args.dry_run else "wrote"
+    if not result.created:
+        print(f"{root} is already a gustav project")
+    for path in result.created:
+        print(f"{prefix} {path.relative_to(root)}")
+    for path in result.kept:
+        print(f"kept your {path.relative_to(root)}")
+    if not args.dry_run:
+        (root / "var").mkdir(exist_ok=True)
+        print()
+        print("next:")
+        print("  ai plan-hardware -v        # see what it would run on this machine")
+        print("  ai model pull <model>      # fetch the weights it chose")
+        print("  ai start                   # or 'ai service install' to run it always")
+    return 0
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    from gustav import service
+
+    root = Path(args.directory or ".").expanduser().resolve()
+    if args.action == "status":
+        state = service.status()
+        print(f"unit       {state['unit']}")
+        print(f"installed  {'yes' if state['installed'] else 'no'}")
+        if state["systemctl"]:
+            print(f"active     {state['active']}")
+            print(f"enabled    {state['enabled']}")
+        else:
+            print("systemctl  not available on this machine")
+        return 0
+
+    if args.action == "uninstall":
+        removed = service.uninstall()
+        if removed is None:
+            print("there was no unit file to remove")
+            return 0
+        print(f"removed {removed}")
+        print("systemctl --user daemon-reload")
+        return 0
+
+    plan = service.plan(root, python=args.python)
+    if args.dry_run:
+        print("would write:")
+        for line in plan.describe():
+            print(f"  {line}")
+        print()
+        print(plan.body)
+        return 0
+    try:
+        written = service.install(root, python=args.python, force=args.force)
+    except (FileExistsError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"wrote {written.unit_path}")
+    for line in written.describe()[1:]:
+        print(f"  {line}")
+    print()
+    print("now:")
+    print("  systemctl --user daemon-reload")
+    print("  systemctl --user enable --now gustav")
+    print("  journalctl --user -u gustav -f")
+    print()
+    print("This keeps the one always-on process running. It is not a scheduler:")
+    print("the daemon decides when to sleep by itself.")
+    return 0
+
+
 def cmd_not_yet(name: str) -> int:
     print(f"'ai {name}' arrives in {NOT_YET[name]}.", file=sys.stderr)
     return 2
@@ -762,6 +943,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("start", help="run the daemon in the foreground")
+    p.set_defaults(local=True)
+
+    p = sub.add_parser("init", help="make a directory into a gustav project")
+    p.add_argument("directory", nargs="?", help="default: the current directory")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(local=True)
+
+    p = sub.add_parser("service", help="run gustav as a systemd user service")
+    p.add_argument("action", choices=("install", "uninstall", "status"))
+    p.add_argument("--directory", help="the project to run (default: here)")
+    p.add_argument("--python", help="interpreter for the unit (default: this one)")
+    p.add_argument("--force", action="store_true", help="replace an existing unit")
+    p.add_argument("--dry-run", action="store_true", help="print the unit instead")
     p.set_defaults(local=True)
 
     p = sub.add_parser("chat", help="chat with the model (interactive if no message)")
@@ -858,6 +1052,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id", nargs="?", type=int)
     p.add_argument("--limit", type=int, default=20)
 
+    p = sub.add_parser("expansion", help="what it has grown, and what it would like to")
+    p.add_argument("--revert", action="store_true", help="undo the last applied change")
+    p.add_argument("--limit", type=int, default=20)
+
+    p = sub.add_parser("approve-expansion", help="accept a proposed structural change")
+    p.add_argument("approval_id", type=int)
+    p.add_argument("--reject", action="store_true")
+    p.add_argument("--note", help="why (recorded with the decision)")
+
+    p = sub.add_parser(
+        "optimize",
+        help="what it has tuned about itself (trials run during sleep)",
+    )
+    p.add_argument("--revert", action="store_true", help="undo the last kept change")
+    p.add_argument("--limit", type=int, default=20)
+
     p = sub.add_parser("facts", help="durable facts it has learned about you")
     p.add_argument("--module", help="only this module's facts")
     p.add_argument("--subject", help="every statement it has believed about one subject")
@@ -904,7 +1114,8 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "not_yet", None):
         return cmd_not_yet(args.not_yet)
     if getattr(args, "local", False):
-        return cmd_start(args)
+        local = {"start": cmd_start, "init": cmd_init, "service": cmd_service}
+        return local[args.command](args)
     if args.command == "plan-hardware" and (args.offline or args.simulate):
         return cmd_plan_hardware_offline(args)
 
@@ -954,6 +1165,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_approvals(args, client)
         if args.command == "approve-base-change":
             return cmd_approve_base_change(args, client)
+        if args.command == "expansion":
+            return cmd_expansion(args, client)
+        if args.command == "optimize":
+            return cmd_optimize(args, client)
+        if args.command == "approve-expansion":
+            return cmd_approve_expansion(args, client)
         parser.error(f"unhandled command {args.command}")
         return 2
     except DaemonUnreachable as exc:

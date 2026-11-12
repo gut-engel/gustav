@@ -221,11 +221,26 @@ def test_another_process_on_the_card_shrinks_the_choice(ladder):
 
 
 # --- speculative decoding -------------------------------------------------
-def test_speculative_decoding_is_offered_when_speed_matters(ladder):
+def test_a_draft_model_is_named_but_speculation_waits_to_be_measured(ladder):
+    """It is off by default even when the balance favours speed.
+
+    Measured on the development machine: a draft step costs nearly as much as a target
+    step at batch 1, so speculation came out slower. The plan still names the draft
+    model it would use, so `ai optimize` can try it on the machine it is actually on.
+    """
     plan = planner("small-12gb", ladder, balance=0.25).plan()
-    assert plan.speculative_decoding
+    assert not plan.speculative_decoding
     assert plan.draft_model is not None
-    assert ladder.model(plan.draft_model).total_params * 5 < ladder.model(plan.base_model).total_params
+    assert ladder.model(plan.draft_model).total_params * 5 < ladder.model(
+        plan.base_model
+    ).total_params
+    assert "until it is measured" in " ".join(plan.explanation)
+
+
+def test_speculation_can_be_forced_on(ladder):
+    plan = planner("small-12gb", ladder, balance=0.25, speculative_decoding="on").plan()
+    assert plan.speculative_decoding and plan.draft_model is not None
+    assert "forced on" in " ".join(plan.explanation)
 
 
 def test_speculative_decoding_is_left_off_when_capability_matters(ladder):

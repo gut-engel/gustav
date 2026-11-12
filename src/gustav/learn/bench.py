@@ -123,8 +123,19 @@ class BenchmarkStore:
         self.db.execute("UPDATE benchmark_items SET retired = 1 WHERE id = ?", (item_id,))
 
 
-def score_answer(item: BenchItem, answer: str | None, *, sandbox: Any = None) -> tuple[bool, str]:
-    """Did this answer pass this item? Returns (passed, why)."""
+def score_answer(
+    item: BenchItem,
+    answer: str | None,
+    *,
+    sandbox: Any = None,
+    matcher: Any = None,
+) -> tuple[bool, str]:
+    """Did this answer pass this item? Returns (passed, why).
+
+    ``matcher`` is an optional semantic comparator for free-text answers. With one, a
+    correct answer in different words passes; without one, the fallback is word overlap,
+    which cannot tell that apart from a wrong answer.
+    """
     if answer is None:
         return False, "no answer was produced"
     if item.kind == "python":
@@ -157,6 +168,9 @@ def score_answer(item: BenchItem, answer: str | None, *, sandbox: Any = None) ->
         wanted = re.findall(r"-?\d+(?:\.\d+)?", expected)
         passed = bool(wanted) and numbers[: len(wanted)] == wanted
     else:
+        if matcher is not None:
+            passed, score = matcher.matches(given, expected)
+            return passed, f"semantic {score:.2f}"
         overlap = similarity(given, expected)
         return overlap >= PROSE_MATCH, f"overlap {overlap:.2f}"
     return passed, "passed" if passed else f"expected {expected[:80]!r}"

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import zlib
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,13 +77,10 @@ class Harness:
         self.db = db
         self.log = logger or get_logger("harness")
 
+        self._notes: list[str] = []
         self.adapters = AdapterStore(paths.adapters)
         self.registry: Registry = load_registry(paths.registry)
-        self.router = Router(
-            self.registry,
-            threshold=config.tunable.router_threshold,
-            available=set(self.adapters.modules()) or None,
-        )
+        self.router = self._build_router()
         self.router_log = RouterLog(db)
         self.cache: TieredCache | None = None
         self._backend: InferenceBackend | None = backend
@@ -91,8 +89,9 @@ class Harness:
         self._spec: ModelSpec | None = None
         self._quant: QuantSpec | None = None
         self._load_lock = asyncio.Lock()
-        self._notes: list[str] = []
         self._last_route: RouteDecision | None = None
+        #: Summaries of turns that fell out of the window, per conversation.
+        self._summaries: dict[tuple[str, int, int], str] = {}
         #: Set when a load was attempted and failed. "Not loaded yet" is not a failure:
         #: the daemon's startup health check runs *before* the first load, and treating
         #: that as unhealthy would send it straight to safe mode.
@@ -105,6 +104,8 @@ class Harness:
         return self.hw._ladder_with_local_configs()
 
     def _build_backend(self) -> InferenceBackend:
+        import dataclasses
+
         from gustav.inference.transformers_backend import TransformersBackend
 
         plan = self.hw.stored_plan()
@@ -113,10 +114,44 @@ class Harness:
                 "there is no hardware plan yet; run 'ai plan-hardware --apply' "
                 "or start the daemon so it can plan"
             )
+        # `tunable.kv_cache_dtype` overrides the plan's choice when it is not "auto".
+        # This is the one place a tunable value may change what the plan said, and it
+        # is why self-optimisation is allowed to measure it: the plan sizes memory for
+        # the dtype it chose, and a *smaller* cache dtype always fits.
+        if self.config.tunable.kv_cache_dtype != "auto":
+            plan = dataclasses.replace(
+                plan, kv_cache_dtype=self.config.tunable.kv_cache_dtype
+            )
         ladder = self._ladder()
         spec = ladder.model(plan.base_model)
         quant = ladder.quant(plan.quantization)
         self._plan, self._spec, self._quant = plan, spec, quant
+
+        # Speculative decoding: the plan decides whether there is room for a draft
+        # model, and `tunable.speculative_decoding` can ask for it on a plan that did
+        # not budget one — in which case the backend says in its notes that there is no
+        # draft model rather than pretending.
+        speculative = bool(
+            plan.speculative_decoding or self.config.tunable.speculative_decoding
+        )
+        draft: ModelSpec | None = None
+        draft_quant: QuantSpec | None = None
+        if speculative:
+            if plan.draft_model is not None:
+                with contextlib.suppress(KeyError):
+                    draft = ladder.model(plan.draft_model)
+            else:
+                draft = ladder.draft_for(spec)
+            if draft is not None:
+                # The draft is quantised as hard as it supports: at batch 1 the cost of
+                # a decode step is mostly reading the weights, so an unquantised draft
+                # can cost half a target step and make speculation a net loss.
+                for candidate in ("4bit-nf4", "8bit", quant.id):
+                    if candidate in draft.quantizations:
+                        with contextlib.suppress(KeyError):
+                            draft_quant = ladder.quant(candidate)
+                        break
+
         return TransformersBackend(
             plan=plan,
             model=spec,
@@ -127,6 +162,9 @@ class Harness:
             reserve_fraction=self.config.hardware.vram_reserve_fraction,
             prefix_cache=self.config.tunable.prefix_cache,
             thinking=False,
+            speculative=speculative and draft is not None,
+            draft=draft,
+            draft_quant=draft_quant,
             logger=self.log,
         )
 
@@ -181,9 +219,13 @@ class Harness:
         if plan is None:
             return
         budget = plan.expansion
+        # `tunable.warm_cache_mb` may only *reduce* the pinned-RAM cache: the plan
+        # decided how much of this machine's RAM may be held, and self-optimisation
+        # cannot vote itself more.
+        warm = min(float(self.config.tunable.warm_cache_mb), float(budget.warm_cache_mb))
         self.cache = TieredCache(
             vram_budget_mb=budget.max_adapter_vram_mb or 512,
-            ram_budget_mb=budget.warm_cache_mb,
+            ram_budget_mb=warm,
         )
         for module in self.adapters.modules():
             version = self.adapters.active(module)
@@ -216,6 +258,18 @@ class Harness:
         self.router.available = set(self.adapters.modules()) or None
 
     def _adapter_matches_base(self, version: AdapterVersion) -> bool:
+        stale = version.meta.get("stale_base")
+        if stale:
+            # Merging an adapter into the base leaves every other adapter a delta from
+            # weights that no longer exist, and the model id is unchanged — so the
+            # check below cannot see it. The merge stamps them; this refuses them.
+            message = (
+                f"adapter {version.module}@{version.version} is stale: {stale}. "
+                f"It will be skipped until a night retrains it."
+            )
+            self._notes.append(message)
+            self.events.emit("inference.adapter_stale", message, level="warning")
+            return False
         base = version.base_model
         # Ask the backend what it actually loaded rather than what we planned to load.
         current = self.backend.describe().get("base_model") or (
@@ -256,7 +310,12 @@ class Harness:
         )
 
     async def _prepare(
-        self, message: str, history: Sequence[Message], params: GenerationParams
+        self,
+        message: str,
+        history: Sequence[Message],
+        params: GenerationParams,
+        *,
+        session_id: int | str = "default",
     ) -> tuple[list[Message], RouteDecision]:
         conversation = Conversation.from_history(
             history, max_turns=self.config.wake.max_history_turns
@@ -265,10 +324,75 @@ class Harness:
         decision = self.router.route(message, forced=params.adapters)
         self._last_route = decision
         await self._apply_route(decision)
-        fitted = self._budget().fit(conversation.messages(), self.backend.count_tokens)
+
+        budget = self._budget()
+        messages = conversation.messages()
+        fitted = budget.fit(messages, self.backend.count_tokens)
+        if fitted.dropped and self.config.wake.summarise_history:
+            # Fitting is synchronous and summarising means generating, so it happens
+            # between two fits: the first says what would fall off, the second is given
+            # the summary to put in its place.
+            summary = await self._summarise(session_id, fitted.dropped)
+            if summary:
+                fitted = budget.fit(
+                    messages, self.backend.count_tokens, summarize=lambda _dropped: summary
+                )
         for note in fitted.notes:
             self.log.debug("context: %s", note)
         return fitted.messages, decision
+
+    async def _summarise(self, session_id: int | str, dropped: Sequence[Message]) -> str:
+        """One short summary of the turns that no longer fit.
+
+        Cached per conversation and per *how much* has fallen off, so a long chat pays
+        for a summary once and then only when more turns drop out. The cache is small
+        and in-process: a restart forgets it, which costs one generation.
+        """
+        if not dropped:
+            return ""
+        # An in-process cache key, so a randomised hash would be fine — but a stable
+        # one costs nothing and keeps "same input, same behaviour" true across restarts.
+        key = (
+            str(session_id),
+            len(dropped),
+            zlib.crc32(str(dropped[-1].get("content", "")).encode("utf-8")),
+        )
+        cached = self._summaries.get(key)
+        if cached is not None:
+            return cached
+
+        transcript = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}" for m in dropped
+        )[:8000]
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Summarise the earlier part of a conversation so it can be carried "
+                    "forward. Keep names, decisions, numbers and anything the user asked "
+                    "to be remembered. Be terse and factual, no preamble, no new "
+                    "information."
+                ),
+            },
+            {"role": "user", "content": transcript},
+        ]
+        try:
+            generation = await self.backend.generate(
+                prompt,
+                self._params(
+                    max_tokens=self.config.wake.summary_tokens,
+                    temperature=0.0,
+                    adapters=(),
+                ),
+            )
+        except BackendError as exc:
+            self.log.warning("could not summarise the older turns: %s", exc)
+            return ""
+        summary = (generation.text or "").strip()
+        if len(self._summaries) > 32:
+            self._summaries.clear()
+        self._summaries[key] = summary
+        return summary
 
     async def _apply_route(self, decision: RouteDecision) -> None:
         wanted = tuple(
@@ -291,7 +415,9 @@ class Harness:
         params: GenerationParams | None = None,
     ) -> Reply:
         params = params or self._params()
-        messages, decision = await self._prepare(message, history, params)
+        messages, decision = await self._prepare(
+            message, history, params, session_id=session_id
+        )
         generation = await self.backend.generate(messages, params)
         self._record(generation, decision)
         return self._reply(generation, decision)
@@ -305,7 +431,9 @@ class Harness:
         params: GenerationParams | None = None,
     ) -> AsyncIterator[Chunk]:
         params = params or self._params()
-        messages, decision = await self._prepare(message, history, params)
+        messages, decision = await self._prepare(
+            message, history, params, session_id=session_id
+        )
         async for chunk in self.backend.stream(messages, params):
             yield chunk
         generation = getattr(self.backend, "_last_generation", None)
@@ -399,6 +527,47 @@ class Harness:
                         )
                 with contextlib.suppress(Exception):
                     await self.backend.set_active_adapters(previous_active)
+
+    # ------------------------------------------------------------------
+    # the registry
+    # ------------------------------------------------------------------
+    def _build_router(self) -> Router:
+        """The router, using a fitted scorer when the `speed` step has produced one.
+
+        A fitted model brings its own calibrated threshold, because its scores are on
+        a different scale from the keyword scorer's — using the configured threshold
+        with learned weights would silently change how much is called uncovered.
+        """
+        from gustav.optimize.router_fit import RouterModel
+
+        model = RouterModel.load(self.paths.data_dir / "router")
+        if model is not None and model.weights:
+            self._notes.append(
+                f"routing with the fitted router from {model.trained_at or 'an earlier run'}"
+            )
+            return Router(
+                self.registry,
+                scorer=model,
+                threshold=model.threshold,
+                available=set(self.adapters.modules()) or None,
+            )
+        return Router(
+            self.registry,
+            threshold=self.config.tunable.router_threshold,
+            available=set(self.adapters.modules()) or None,
+        )
+
+    def reload_registry(self) -> list[str]:
+        """Re-read ``modules/registry.yaml`` into the live router.
+
+        Self-expansion edits that file — a new module, a raised LoRA rank, a pruned
+        module — and the running router holds a parsed copy of it. Without this, a
+        change made at 3am would not route until the next restart.
+        """
+        self.registry = load_registry(self.paths.registry)
+        self.router = self._build_router()
+        self.log.info("registry reloaded: %s", ", ".join(self.registry.names))
+        return self.registry.names
 
     # ------------------------------------------------------------------
     # adapter control

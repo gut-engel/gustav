@@ -36,6 +36,7 @@ class FakeBackend(InferenceBackend):
         fail_to_load: str | None = None,
         fail_adapter: str | None = None,
         load_delay: float = 0.0,
+        embed_fails: str | None = None,
     ):
         self.base_model = base_model
         self.reply = reply
@@ -43,6 +44,7 @@ class FakeBackend(InferenceBackend):
         self.fail_to_load = fail_to_load
         self.fail_adapter = fail_adapter
         self.load_delay = load_delay
+        self.embed_fails = embed_fails
 
         self._loaded = False
         self._adapters: dict[str, str] = {}
@@ -136,6 +138,31 @@ class FakeBackend(InferenceBackend):
         return self._last_generation
 
     # --- tokens ---------------------------------------------------------
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """A hashed bag-of-words vector: deterministic, and similar text is similar.
+
+        Not an embedding in any meaningful sense — but it has the one property the
+        tests need, which is that two ways of saying the same words come out close
+        together and unrelated text does not.
+        """
+        if self.embed_fails:
+            raise NotImplementedError(self.embed_fails)
+        import math
+        import zlib
+
+        dimensions = 128
+        out: list[list[float]] = []
+        for text in texts:
+            vector = [0.0] * dimensions
+            for word in str(text).lower().split():
+                # crc32, not hash(): Python's hash is randomised per process, which
+                # would make these vectors — and any test that compares them — depend
+                # on the interpreter's seed.
+                vector[zlib.crc32(word.encode("utf-8")) % dimensions] += 1.0
+            length = math.sqrt(sum(v * v for v in vector)) or 1.0
+            out.append([v / length for v in vector])
+        return out
+
     def count_tokens(self, text: str) -> int:
         return max(len(text.split()), 1)
 

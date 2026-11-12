@@ -62,6 +62,8 @@ class StepEnv:
         self.facts = FactStore(self.db)
         self.skills = SkillStore(self.db)
         self._model: Any = None
+        #: Replaced by tests, and by anything that needs a model it controls.
+        self.model_factory: Callable[[StepEnv], Any] | None = None
 
     @property
     def work_dir(self) -> Path:
@@ -131,12 +133,26 @@ class StepEnv:
             return default
 
     # --- the model ------------------------------------------------------
-    def model(self):
-        """The base model, loaded on first use. Never raises: check ``.available``."""
-        if self._model is None:
-            from gustav.sleep.model import StepModel
+    def new_model(self):
+        """A fresh model handle. The step owns it and must close it.
 
-            self._model = StepModel(self)
+        Separate from ``model()`` because self-optimisation needs to load the model
+        again under a changed setting, and because it is the seam tests replace.
+        """
+        if self.model_factory is not None:
+            return self.model_factory(self)
+        from gustav.sleep.model import StepModel
+
+        return StepModel(self)
+
+    def model(self):
+        """The step's shared model, loaded on first use.
+
+        Never raises: a machine with no GPU, no weights or a broken checkpoint gives a
+        handle whose ``available`` is False, and every caller has a path for that.
+        """
+        if self._model is None:
+            self._model = self.new_model()
         return self._model
 
     def close(self) -> None:

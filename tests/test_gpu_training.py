@@ -294,3 +294,74 @@ def test_a_resume_with_no_adapter_on_disk_starts_over_rather_than_pretending(
     assert outcome.detail["resumed"] is False
     assert outcome.steps == 2, "two real steps, not 'already at step 5'"
     assert any("starting this module over" in note for note in notes)
+
+
+def pair_mix(count: int = 4, *, module: str = "coding"):
+    """A mix of preference pairs: a good answer and a clearly worse one."""
+    from gustav.train.dataset import Mix, Sample
+
+    mix = Mix(module=module)
+    mix.samples = [
+        Sample(
+            prompt=f"what is the gustav codeword number {index}?",
+            completion=f"the codeword is quilt-{index}",
+            rejected="I have absolutely no idea what you are talking about",
+            kind="preference",
+            module=module,
+            example_id=index,
+        )
+        for index in range(count)
+    ]
+    mix.fresh_ids = [s.example_id for s in mix.samples]
+    mix.by_kind = {"preference": count}
+    return mix
+
+
+def test_preference_pairs_can_be_trained_against_the_base_as_reference(
+    pieces, training_config, tmp_path
+):
+    """DPO with the adapter disabled as the reference: no second model in VRAM."""
+    from gustav.train.lora import train_adapter
+
+    _hardware, ladder, spec, plan, repo_root = pieces
+    config = training_config.model_copy(
+        update={"preference_objective": "dpo", "max_steps": 4, "learning_rate": 5e-4}
+    )
+    outcome = train_adapter(
+        mix=pair_mix(),
+        plan=plan,
+        spec=spec,
+        quant=ladder.quant("bf16"),
+        models_dir=repo_root / "models",
+        output_dir=tmp_path / "dpo",
+        config=config,
+    )
+
+    assert outcome.trained, outcome.stopped_by
+    assert outcome.detail["objective"] == "dpo"
+    assert outcome.detail["preference_pairs"] == 4
+    assert outcome.detail["dpo_pairs_seen"] >= 1
+    # The DPO loss starts at -log(sigmoid(0)) = 0.693 when policy and reference agree,
+    # and training it should push the preferred answer ahead of the rejected one.
+    assert outcome.loss_start is not None and outcome.loss_end is not None
+    assert outcome.loss_end < outcome.loss_start, (outcome.loss_start, outcome.loss_end)
+    assert 0.0 <= outcome.detail["dpo_accuracy"] <= 1.0
+
+
+def test_the_same_pairs_train_as_plain_sft_when_asked(pieces, training_config, tmp_path):
+    from gustav.train.lora import train_adapter
+
+    _hardware, ladder, spec, plan, repo_root = pieces
+    outcome = train_adapter(
+        mix=pair_mix(),
+        plan=plan,
+        spec=spec,
+        quant=ladder.quant("bf16"),
+        models_dir=repo_root / "models",
+        output_dir=tmp_path / "sft",
+        config=training_config,
+    )
+    assert outcome.trained
+    assert outcome.detail["objective"] == "sft"
+    assert outcome.detail["preference_pairs"] == 0, "the rejected side is simply unused"
+    assert "dpo_accuracy" not in outcome.detail

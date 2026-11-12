@@ -11,6 +11,10 @@ that make an *always-on* trainer different from a script are all in the loop:
   because an unbounded night is a machine that is hot at breakfast.
 * **it weights examples.** A per-sample loss scale is the whole point of the dataset
   mix, and a framework's label-smoothing path would quietly average it away.
+* **it can train a preference objective against its own base.** With
+  ``training.preference_objective: dpo``, an example that carries a rejected answer is
+  trained as a preference pair, using the *adapter-disabled* model as the reference —
+  which is exactly the base model, already in memory, at no extra VRAM.
 
 What it does *not* do is decide anything about promotion. It writes a candidate version
 into a staging directory and returns; the gate measures it, and the guard is the only
@@ -79,7 +83,19 @@ def _lr_at(step: int, total: int, *, base: float, warmup: int) -> float:
     return base * 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
 
-def _collate(batch: Sequence[tuple[list[int], list[int], float]], pad_id: int, torch: Any):
+@dataclass
+class Encoded:
+    """One example, tokenised: the preferred answer and, for a pair, the worse one."""
+
+    input_ids: list[int]
+    labels: list[int]
+    weight: float
+    rejected: tuple[list[int], list[int]] | None = None
+
+
+def _collate(
+    batch: Sequence[tuple[list[int], list[int], float]], pad_id: int, torch: Any
+):
     width = max(len(ids) for ids, _, _ in batch)
     input_ids, labels, mask, weights = [], [], [], []
     for ids, lab, weight in batch:
@@ -94,6 +110,81 @@ def _collate(batch: Sequence[tuple[list[int], list[int], float]], pad_id: int, t
         torch.tensor(mask, dtype=torch.long),
         torch.tensor(weights, dtype=torch.float32),
     )
+
+
+def _to_device(batch: Sequence[tuple[list[int], list[int], float]], model, tokenizer, torch):
+    tensors = _collate(batch, tokenizer.pad_token_id or 0, torch)
+    return tuple(tensor.to(model.device) for tensor in tensors)
+
+
+def _sft_loss(model, batch: Sequence[Encoded], *, tokenizer, torch, F):
+    """Weighted cross-entropy on the answer tokens only."""
+    rows = [(item.input_ids, item.labels, item.weight) for item in batch]
+    input_ids, labels, mask, weights = _to_device(rows, model, tokenizer, torch)
+    logits = model(input_ids=input_ids, attention_mask=mask).logits[:, :-1, :]
+    target = labels[:, 1:]
+    per_token = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)).float(),
+        target.reshape(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(target.shape)
+    counted = (target != -100).float()
+    per_sample = (per_token * counted).sum(1) / counted.sum(1).clamp(min=1.0)
+    return (per_sample * weights).mean()
+
+
+def _sequence_logprob(model, input_ids, labels, mask, *, torch) -> Any:
+    """Total log-probability the model assigns to the answer tokens."""
+    logits = model(input_ids=input_ids, attention_mask=mask).logits[:, :-1, :]
+    target = labels[:, 1:]
+    logprobs = torch.log_softmax(logits.float(), dim=-1)
+    counted = target != -100
+    safe = target.masked_fill(~counted, 0)
+    gathered = logprobs.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
+    return (gathered * counted.float()).sum(1)
+
+
+def _preference_loss(
+    model, batch: Sequence[Encoded], *, tokenizer, torch, F, beta: float
+):
+    """Direct preference optimisation, with the adapter-disabled model as reference.
+
+    The reference model is free: disabling the LoRA *is* the base model, already
+    resident, so there is no second checkpoint in VRAM. It costs forward passes
+    instead — four per pair — which is why the gate measures whether it was worth it.
+    """
+    chosen_rows, rejected_rows, weights = [], [], []
+    for item in batch:
+        if item.rejected is None:
+            continue
+        chosen_rows.append((item.input_ids, item.labels, item.weight))
+        rejected_rows.append((item.rejected[0], item.rejected[1], item.weight))
+        weights.append(item.weight)
+    if not chosen_rows:
+        return _sft_loss(model, batch, tokenizer=tokenizer, torch=torch, F=F), {
+            "accuracy": None
+        }
+
+    chosen = _to_device(chosen_rows, model, tokenizer, torch)
+    rejected = _to_device(rejected_rows, model, tokenizer, torch)
+    policy_chosen = _sequence_logprob(model, chosen[0], chosen[1], chosen[2], torch=torch)
+    policy_rejected = _sequence_logprob(
+        model, rejected[0], rejected[1], rejected[2], torch=torch
+    )
+    with torch.no_grad(), model.disable_adapter():
+        reference_chosen = _sequence_logprob(
+            model, chosen[0], chosen[1], chosen[2], torch=torch
+        )
+        reference_rejected = _sequence_logprob(
+            model, rejected[0], rejected[1], rejected[2], torch=torch
+        )
+
+    margin = (policy_chosen - policy_rejected) - (reference_chosen - reference_rejected)
+    weight_tensor = chosen[3]
+    loss = -(F.logsigmoid(beta * margin) * weight_tensor).mean()
+    accuracy = float((margin > 0).float().mean().detach())
+    return loss, {"accuracy": round(accuracy, 4)}
 
 
 def train_adapter(
@@ -154,15 +245,27 @@ def train_adapter(
 
     # --- encode before touching the optimiser --------------------------
     seq_len = plan.train_seq_len or 1024
-    encoded: list[tuple[list[int], list[int], float]] = []
+    encoded: list[Encoded] = []
     weights = normalised_weights(mix.samples)
     skipped = 0
+    prefer = config.preference_objective == "dpo"
+    pairs = 0
     for sample, weight in zip(mix.samples, weights, strict=True):
         pair = encode(tokenizer, sample, max_len=seq_len)
         if pair is None:
             skipped += 1
             continue
-        encoded.append((pair[0], pair[1], weight))
+        rejected = None
+        if prefer and sample.is_pair:
+            worse = encode(
+                tokenizer,
+                Sample(prompt=sample.prompt, completion=sample.rejected or ""),
+                max_len=seq_len,
+            )
+            if worse is not None:
+                rejected = worse
+                pairs += 1
+        encoded.append(Encoded(pair[0], pair[1], weight, rejected))
     if not encoded:
         outcome.stopped_by = "every example was empty after encoding"
         del model
@@ -170,6 +273,8 @@ def train_adapter(
         return outcome
     outcome.examples = len(encoded)
     outcome.detail["skipped_examples"] = skipped
+    outcome.detail["preference_pairs"] = pairs
+    outcome.detail["objective"] = config.preference_objective
 
     if quant_config is not None:
         from peft import prepare_model_for_kbit_training
@@ -230,6 +335,9 @@ def train_adapter(
     order = list(range(len(encoded)))
     cursor = (resume_step * micro * accum) % len(order)
     losses: list[float] = []
+    #: How often the preferred answer outranks the rejected one, per pair seen. The
+    #: number that says whether a preference objective is doing anything.
+    accuracies: list[float] = []
     step = resume_step
     deadline = started + config.max_seconds
 
@@ -249,31 +357,29 @@ def train_adapter(
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
         for _ in range(accum):
-            batch = []
+            batch: list[Encoded] = []
             for _ in range(micro):
                 batch.append(encoded[order[cursor % len(order)]])
                 cursor += 1
-            input_ids, labels, mask, sample_weights = _collate(
-                batch, tokenizer.pad_token_id or 0, torch
-            )
-            input_ids = input_ids.to(model.device)
-            labels = labels.to(model.device)
-            mask = mask.to(model.device)
-            sample_weights = sample_weights.to(model.device)
-
-            logits = model(input_ids=input_ids, attention_mask=mask).logits[:, :-1, :]
-            target = labels[:, 1:]
-            per_token = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                target.reshape(-1),
-                reduction="none",
-                ignore_index=-100,
-            ).view(target.shape)
-            counted = (target != -100).float()
-            per_sample = (per_token * counted).sum(1) / counted.sum(1).clamp(min=1.0)
-            loss = (per_sample * sample_weights).mean() / accum
+            # A preference pair is trained on its own: it needs four forward passes
+            # (chosen and rejected, policy and reference) and cannot share a batch
+            # with plain examples.
+            if prefer and any(item.rejected for item in batch):
+                loss, detail = _preference_loss(
+                    model, batch, tokenizer=tokenizer, torch=torch, F=F,
+                    beta=config.dpo_beta,
+                )
+                if detail["accuracy"] is not None:
+                    accuracies.append(detail["accuracy"])
+            else:
+                loss = _sft_loss(
+                    model, batch, tokenizer=tokenizer, torch=torch, F=F
+                )
+            loss = loss / accum
             loss.backward()
-            step_loss += float(loss.detach()) * accum / accum
+            # The loss is already divided by `accum`, so summing the micro-batches
+            # gives the mean over the step.
+            step_loss += float(loss.detach())
 
         torch.nn.utils.clip_grad_norm_(trainable, config.max_grad_norm)
         optimizer.step()
@@ -299,6 +405,9 @@ def train_adapter(
         _save(model, output_dir)
         outcome.path = output_dir
     outcome.seconds = round(time.monotonic() - started, 1)
+    if accuracies:
+        outcome.detail["dpo_accuracy"] = round(sum(accuracies) / len(accuracies), 4)
+        outcome.detail["dpo_pairs_seen"] = len(accuracies)
     outcome.detail.update(
         {
             "rank": rank,

@@ -1,0 +1,82 @@
+# Where documentation comes from.
+#
+# Nothing is searched for. A topic from `reflect` is looked up in this file, and only
+# the hosts listed in `fetcher.allowed_hosts` are ever requested — so the one component
+# that touches the network can only reach places you put here, on purpose.
+#
+# An entry matches a topic when its `module` matches (or is absent) and the topic is in
+# its `topics` (or `topics` is absent, which makes it the module's fallback reading).
+# Add your own entries freely; `fetcher.local_sources` in config.yaml points at local
+# directories instead, which is also how this works with no network at all.
+#
+# `license` is recorded with every document fetched from the entry and shown in the
+# report. Nothing verifies it and nothing refuses to study without it — it is here so
+# that "was this allowed to be trained on" is a question you can still answer in six
+# months. An entry with no licence is fetched, and warned about.
+
+sources:
+  - module: rust
+    license: MIT OR Apache-2.0   # the Rust book and the Nomicon
+    topics: [lifetime, borrow, borrowck, mut]
+    urls:
+      - https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html
+      - https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html
+
+  - module: rust
+    license: MIT OR Apache-2.0
+    topics: [trait, impl, generic]
+    urls:
+      - https://doc.rust-lang.org/book/ch10-02-traits.html
+
+  - module: rust
+    license: MIT OR Apache-2.0
+    topics: [arc, mutex, tokio, async]
+    urls:
+      - https://doc.rust-lang.org/book/ch16-03-shared-state.html
+      - https://doc.rust-lang.org/book/ch17-01-futures-and-syntax.html
+
+  - module: rust
+    license: MIT OR Apache-2.0
+    topics: [cargo, crate, clippy, rustc, unsafe, box, serde]
+    urls:
+      - https://doc.rust-lang.org/book/ch07-01-packages-and-crates.html
+      - https://doc.rust-lang.org/nomicon/intro.html
+
+  - module: coding
+    license: PSF-2.0   # docs.python.org
+    topics: [async, await, asyncio, coroutine]
+    urls:
+      - https://docs.python.org/3/library/asyncio-task.html
+      - https://docs.python.org/3/library/asyncio-sync.html
+
+  - module: coding
+    license: PSF-2.0   # docs.python.org
+    topics: [type, typing, annotation, generic]
+    urls:
+      - https://docs.python.org/3/library/typing.html
+
+  - module: coding
+    license: PSF-2.0   # docs.python.org
+    topics: [exception, traceback, error]
+    urls:
+      - https://docs.python.org/3/library/exceptions.html
+      - https://docs.python.org/3/tutorial/errors.html
+
+  - module: coding
+    license: PSF-2.0   # docs.python.org
+    topics: [regex, re]
+    urls:
+      - https://docs.python.org/3/library/re.html
+
+  - module: coding
+    license: PSF-2.0   # docs.python.org
+    topics: [test, pytest, unittest]
+    urls:
+      - https://docs.python.org/3/library/unittest.html
+
+  - module: coding
+    license: PSF-2.0
+    # No `topics`: the module's fallback reading when nothing more specific matched.
+    urls:
+      - https://docs.python.org/3/library/dataclasses.html
+      - https://docs.python.org/3/library/itertools.html

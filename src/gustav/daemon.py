@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import signal
 import socket
@@ -60,9 +61,11 @@ class Daemon:
         responder: Responder | None = None,
         db: Database | None = None,
         detector=None,
+        config_file: Path | None = None,
     ):
         self.config = config
         self.paths = paths.ensure()
+        self._config_file = Path(config_file) if config_file else None
         self.clock = clock or RealClock()
         self.log = get_logger("daemon")
 
@@ -189,6 +192,22 @@ class Daemon:
             pid=os.getpid(),
             data_dir=str(self.paths.data_dir),
         )
+
+        # A project that has no registry or source map yet gets the shipped defaults,
+        # once. An absent config.yaml is left absent: every key has a default, so an
+        # empty project is already a valid one, and writing a file nobody asked for
+        # would be the opposite of helpful.
+        from gustav.data import install_defaults
+
+        installed = install_defaults(self.paths.root, only=("registry.yaml", "sources.yaml"))
+        for path in installed.created:
+            self.log.info("wrote the default %s", path)
+            self.events.emit(
+                "startup.defaults",
+                f"this project had no {path.name}, so the shipped default was written "
+                f"to {path}",
+                path=str(path),
+            )
 
         # An interrupted weight change is undone before anything else runs.
         undone = self.guard.rollback_interrupted()
@@ -742,6 +761,224 @@ class Daemon:
         }
 
     # ------------------------------------------------------------------
+    # self-expansion (section 8)
+    # ------------------------------------------------------------------
+    def _expander(self):
+        from gustav.expansion.actions import Expander
+        from gustav.inference.adapters import AdapterStore
+
+        return Expander(
+            paths=self.paths,
+            config=self.config,
+            db=self.db,
+            events=self.events,
+            guard=self.guard,
+            adapters=AdapterStore(self.paths.adapters),
+            logger=get_logger("expansion"),
+        )
+
+    def expansion_status(self, limit: int = 20) -> dict[str, Any]:
+        """What it has proposed, done, and been refused — newest first."""
+        from gustav.expansion.triggers import measure
+        from gustav.inference.adapters import AdapterStore
+        from gustav.inference.registry import load_registry
+
+        plan = self.hw.stored_plan()
+        registry = load_registry(self.paths.registry)
+        triggers = measure(
+            self.db, registry, self.config.expansion, adapters=AdapterStore(self.paths.adapters)
+        )
+        return {
+            "enabled": self.config.expansion.enabled,
+            "budget": plan.expansion.describe() if plan else [],
+            "modules": registry.names,
+            "triggers": [
+                {"kind": t.kind, "subject": t.subject, "strength": round(t.strength, 3),
+                 "rationale": t.rationale}
+                for t in triggers
+            ],
+            "history": self._expander().history(limit),
+        }
+
+    async def approve_expansion(self, approval_id: int) -> dict[str, Any]:
+        """Accept a proposed structural change and apply it now.
+
+        The apply path is the same one the night uses, guard and all. A base merge
+        rewrites the checkpoint the running model was loaded from, so the model is
+        unloaded first and reloaded afterwards rather than left pointing at weights
+        that no longer exist.
+        """
+        from gustav.expansion.proposals import Proposal
+
+        row = self.db.query_one(
+            "SELECT * FROM approvals WHERE id = ? AND kind = 'expansion'", (approval_id,)
+        )
+        if row is None:
+            raise KeyError(f"there is no pending expansion approval #{approval_id}")
+        if row["status"] != "pending":
+            raise ValueError(
+                f"approval #{approval_id} was already {row['status']}"
+            )
+        payload = json.loads(row["payload"] or "{}")
+        proposal = Proposal(
+            kind=payload.get("kind", ""),
+            subject=payload.get("subject", ""),
+            rationale=row["rationale"] or "",
+            evidence=payload.get("evidence") or {},
+            cost=payload.get("cost") or {},
+            payload=payload.get("payload") or {},
+            needs_approval=True,
+        )
+        log_row = self.db.query_one(
+            "SELECT id FROM expansion_log WHERE approval_id = ? ORDER BY id DESC LIMIT 1",
+            (approval_id,),
+        )
+        expander = self._expander()
+        heavy = proposal.kind == "merge_to_base"
+        if heavy:
+            await self._pause_sleep(f"merging {proposal.subject} into the base", wait=True)
+            await self.release_gpu(f"merging {proposal.subject} into the base")
+
+        applied = expander.apply(
+            proposal,
+            log_id=int(log_row["id"]) if log_row else None,
+            progress=lambda message: self.log.info("expansion: %s", message),
+        )
+        self.db.execute(
+            "UPDATE approvals SET status = ?, decided_at = datetime('now'), snapshot_id = ?"
+            " WHERE id = ?",
+            ("approved" if applied.ok else "pending", applied.snapshot_id, approval_id),
+        )
+        if heavy:
+            await self._reload_for_serving()
+        if applied.ok:
+            # The registry decides routing and which adapters exist, so the serving
+            # side has to be told rather than finding out on the next restart.
+            await self._reload_registry()
+        return {
+            "approved": applied.ok,
+            "kind": proposal.kind,
+            "subject": proposal.subject,
+            "detail": applied.detail,
+            "snapshot": applied.snapshot_id,
+        }
+
+    def reject_expansion(self, approval_id: int, note: str = "") -> dict[str, Any]:
+        row = self.db.query_one(
+            "SELECT * FROM approvals WHERE id = ? AND kind = 'expansion'", (approval_id,)
+        )
+        if row is None:
+            raise KeyError(f"there is no expansion approval #{approval_id}")
+        self.db.execute(
+            "UPDATE approvals SET status = 'rejected', decided_at = datetime('now'),"
+            " note = ? WHERE id = ?",
+            (note or None, approval_id),
+        )
+        self.db.execute(
+            "UPDATE expansion_log SET status = 'rejected', decided_at = datetime('now'),"
+            " detail = ? WHERE approval_id = ?",
+            (note or "rejected", approval_id),
+        )
+        self.events.emit(
+            "expansion.rejected",
+            f"expansion #{approval_id} ({row['subject']}) was rejected",
+            approval=approval_id,
+        )
+        return {"rejected": True, "id": approval_id, "subject": row["subject"]}
+
+    async def revert_expansion(self) -> dict[str, Any]:
+        """Undo the most recent applied expansion, from its own snapshot."""
+        await self._pause_sleep("reverting an expansion", wait=True)
+        result = self._expander().revert_last()
+        await self._reload_registry()
+        if "base_model" in (result.get("restored") or []):
+            await self.release_gpu("the base checkpoint was restored")
+            await self._reload_for_serving()
+        return result
+
+    async def _reload_registry(self) -> None:
+        """Re-read modules/registry.yaml into the live router and adapter store."""
+        reload = getattr(self.responder, "reload_registry", None)
+        if reload is None:
+            return
+        try:
+            result = reload()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - a bad registry must not kill the daemon
+            self.log.error("could not reload the registry: %s", exc)
+
+    # ------------------------------------------------------------------
+    # self-optimisation (section 10)
+    # ------------------------------------------------------------------
+    @property
+    def config_file(self) -> Path:
+        """The configuration file this daemon was started from.
+
+        It matters for exactly one thing: knowing which `tunable` values *you* pinned,
+        which self-optimisation may never touch. Guessing the filename would mean
+        guessing wrong for anyone who runs `ai start -c other.yaml`.
+        """
+        return self._config_file or (self.paths.root / "config.yaml")
+
+    def _tuner(self):
+        from gustav.config.load import pinned_tunables
+        from gustav.optimize.tuner import Tuner
+
+        return Tuner(
+            config=self.config.optimisation,
+            tunable=self.config.tunable,
+            paths=self.paths,
+            db=self.db,
+            events=self.events,
+            pinned=pinned_tunables(self.config_file),
+            logger=get_logger("optimise"),
+        )
+
+    def optimisation_status(self, limit: int = 20) -> dict[str, Any]:
+        from gustav.config.load import pinned_tunables, read_learned_tunable
+        from gustav.optimize.router_fit import RouterModel
+
+        tuner = self._tuner()
+        router = RouterModel.load(self.paths.data_dir / "router")
+        return {
+            "enabled": self.config.optimisation.enabled,
+            "settings": self.config.optimisation.settings,
+            "pinned": sorted(pinned_tunables(self.config_file)),
+            "in_use": {
+                setting: getattr(self.config.tunable, setting, None)
+                for setting in self.config.optimisation.settings
+            },
+            "learned": read_learned_tunable(self.paths.data_dir),
+            "next_trials": [
+                {"setting": setting, "candidate": repr(value)}
+                for setting, value in tuner.candidates()
+            ],
+            "history": tuner.history(limit),
+            "router": (
+                {
+                    "trained_at": router.trained_at,
+                    "threshold": router.threshold,
+                    "agreement": router.agreement,
+                    "modules": len(router.modules),
+                    "material": sum(router.documents.values()),
+                }
+                if router is not None
+                else None
+            ),
+        }
+
+    async def revert_optimisation(self) -> dict[str, Any]:
+        """Undo the last kept tunable change and reload with the old value."""
+        result = self._tuner().revert_last()
+        # Re-read the configuration so the running daemon uses what is now on disk.
+        reloaded, _paths = load_config(self.config_file)
+        self.config.tunable = reloaded.tunable
+        await self.release_gpu(f"reverting {result['setting']}")
+        await self._reload_for_serving()
+        return result
+
+    # ------------------------------------------------------------------
     # what it learned
     # ------------------------------------------------------------------
     def facts(self, *, module: str | None = None, limit: int = 100,
@@ -1067,6 +1304,9 @@ class Daemon:
             self._current_run_id = None
             if self.state.state is State.SLEEP:
                 self.state.transition(State.WAKE, "sleep finished")
+            # The night may have changed the registry (a new module, a raised rank, one
+            # archived), and the serving router holds a parsed copy of it.
+            await self._reload_registry()
             await self._reload_for_serving()
 
     async def _pause_sleep(self, reason: str, *, wait: bool) -> bool:
@@ -1446,8 +1686,10 @@ def _version() -> str:
     return __version__
 
 
-async def run_daemon(config: Config, paths: Paths) -> int:
-    daemon = Daemon(config, paths)
+async def run_daemon(
+    config: Config, paths: Paths, *, config_file: str | None = None
+) -> int:
+    daemon = Daemon(config, paths, config_file=Path(config_file) if config_file else None)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, daemon.request_shutdown, f"received {sig.name}")
@@ -1487,7 +1729,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(config.logging, log_file, force=True)
 
     try:
-        return asyncio.run(run_daemon(config, paths))
+        return asyncio.run(run_daemon(config, paths, config_file=args.config))
     except KeyboardInterrupt:
         return 130
 

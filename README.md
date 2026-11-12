@@ -20,10 +20,10 @@ ai sleep now
 
 ## Status
 
-Built in reviewable stages. **Stages 1-5 are complete** — it loads real weights, answers,
-learns from the day, studies, practises under a verifier, trains LoRA adapters and
-promotes them only if a regression gate says they are better — and stage 6 is scaffolded
-behind the interfaces it defines. `ai <command>` tells you when a command arrives.
+Built in reviewable stages, and all six are done. It loads real weights and answers;
+it learns from the day, studies, practises under a verifier, trains LoRA adapters and
+promotes them only if a regression gate says they are better; and it grows and tunes
+itself within budgets the hardware sets, asking first for anything it cannot take back.
 
 | Stage | What it is | State |
 |---|---|---|
@@ -32,7 +32,7 @@ behind the interfaces it defines. `ai <command>` tells you when a command arrive
 | 3 | Inference harness (transformers + PEFT), streaming chat, adapters, the wake phase | **done** |
 | 4 | Backups, verification, atomic promotion, the weight-change guard | **done** |
 | 5 | Sleep phase: consolidation, study, practice, training, the gate, the report | **done** |
-| 6 | Self-expansion, self-optimisation, packaging | next |
+| 6 | Self-expansion, self-optimisation, router training, packaging | **done** |
 
 Measured on the development machine (RTX 4070 SUPER, 12 GB) with Qwen3-4B in 4-bit NF4:
 **54 tok/s**, 25 ms to first token, 4.3 GiB peak VRAM. It hands the GPU over for real:
@@ -40,11 +40,26 @@ VRAM drops from 6.8 GiB to 1.8 GiB when a sleep step takes the card, and a chat 
 takes it back and answers within two seconds, reload included.
 
 A complete night on the small model (Qwen3-0.6B, bf16, so it fits beside everything else
-on the card) takes **44 seconds** end to end in `tests/test_gpu_night.py`: snapshot,
-consolidation, reflect, fetch, study, practice, dreaming, a two-step LoRA, the gate, the
-retest and the report — each in its own child process, with the model loaded and dropped
-per step. Two steps are still simulated and say so in the report: `expansion` and `speed`
-belong to stage 6.
+on the card) runs end to end in **57 seconds** in `tests/test_gpu_night.py`: snapshot,
+consolidation, reflect, fetch, study, practice, dreaming, a LoRA, the gate, the expansion
+review, the retest, the measured tuning and the report — thirteen steps, each in its own
+child process, with the model loaded and dropped per step. That run is also where the
+tuning loop earns its keep in miniature: it measured `prefix_cache: False` at +1.6%,
+decided that was noise rather than a win, and put it back.
+
+Two things stage 6 measured and then refused to pretend about, because they are the
+useful kind of result:
+
+- **Speculative decoding is implemented and off by default.** The loop works and a
+  model drafting for itself accepts over 90% of proposals, but on this backend a draft
+  step costs nearly as much as a target step — a decode step at batch 1 is dominated by
+  per-layer launch and framework overhead, not arithmetic — so a 0.6B draft for a 4B
+  target measured **0.5x**, slower than not speculating. The planner therefore names a
+  draft model and leaves it off, and `ai optimize` measures it on *your* machine and
+  keeps it only if it wins.
+- **Self-optimisation only tunes what the serving path actually reads.** `batch_size`
+  sits in `tunable` because the planner reasons about it, but requests are served one at
+  a time, so "tuning" it would have been measuring noise and keeping the winner by luck.
 
 ## Install
 
@@ -55,6 +70,24 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[ml,dev]"   # ~4 GB of CUDA wheels
 .venv/bin/python daemon.py             # plans, then loads the model it chose
 ```
+
+Installed rather than cloned, start with an empty directory:
+
+```bash
+pip install gustav[ml]
+mkdir ~/gustav && cd ~/gustav
+ai init                    # writes config.yaml, modules/registry.yaml, docs/sources.yaml
+ai plan-hardware -v        # what it would run here, and why
+ai model pull qwen3-4b
+ai service install         # a systemd *user* unit, so it runs as you
+```
+
+`ai init` never overwrites a file you already have, and the daemon writes the default
+registry and source map by itself if they are missing — a project with neither is not a
+useful default, and a file under `site-packages` is not somewhere anyone would think to
+edit. The service unit keeps the one always-on process running and is **not** a
+scheduler: the daemon decides when to sleep by itself, and a timer there would break the
+rule the whole design rests on.
 
 In another terminal:
 
@@ -157,10 +190,12 @@ min-p, repetition penalty), the stop sequences and the KV handling are this proj
   a reused cache computes the prefill differently, so a *greedy* answer can differ by a
   token from the same question asked cold. Set `tunable.prefix_cache: false` if you need
   bit-exactness.
-- **The context budget keeps room for the answer.** Old turns are dropped to fit the
-  window — summarising them instead is a stage-6 idea, and the interface for it is in
-  `ContextBudget`. The system prompt and the newest message always survive, and a single
-  over-long message is trimmed in the middle rather than cut off.
+- **The context budget keeps room for the answer.** When the conversation outgrows the
+  window, the turns that fall off are folded into one summary message rather than
+  dropped — one short generation per conversation, cached until more turns fall off, so
+  a long chat pays for it once. The system prompt and the newest message always survive,
+  and a single over-long message is trimmed in the middle rather than cut off.
+  `wake.summarise_history: false` goes back to simply dropping them.
 
 Commands are handled before the model sees anything, and they are your control over what
 the system learns:
@@ -214,9 +249,9 @@ store rather than from whatever the steps happened to print.
 | `dreaming` | sample until something passes, and keep only that |
 | `training` | one new LoRA version per module, written but not switched on |
 | `gate` | measure the candidate against what is being served, and promote or refuse |
-| `expansion` | *simulated — stage 6* |
+| `expansion` | grow capacity where measurements demand it, or ask |
 | `retest` | ask the things it got wrong again, with the new weights |
-| `speed` | *simulated — stage 6* |
+| `speed` | refit the router, and measure one tunable change |
 | `report` | the HTML report for the run |
 
 ### Nothing is learned on the model's word alone
@@ -306,8 +341,8 @@ nobody asks about does not earn a night of GPU time.
 Topics with **no** measurement are not treated as weaknesses — "we have never tested this"
 is a different problem — but a topic in demand and never measured is the fallback choice
 when nothing is measurably weak. A request no module covered at all is recorded as a
-**gap**, which is a measured trigger for self-expansion in stage 6 and goes in the report
-so the decision stays yours.
+**gap**, which is one of the measured triggers the `expansion` step acts on — and goes in
+the report, so when it proposes a whole new module the evidence is in front of you.
 
 ### Study: cited answers, and exercises that are checked twice
 
@@ -379,6 +414,13 @@ training       done  {'modules': ['coding'], 'trained': 1, 'skipped': 0}
 - **It writes a version; it does not switch one on.** The adapter lands in
   `adapters/<module>/vNNN` with `active` untouched, inside `guard.change(...)` — so a
   verified snapshot exists first, and a failure restores from it.
+- **Preference pairs can train as preferences.** With
+  `training.preference_objective: dpo`, an example that carries a rejected answer — a
+  `/good`, a `/bad` the night replaced, a rewrite the samples agreed on — is trained
+  against the *adapter-disabled* model as the reference. That reference is free: turning
+  the LoRA off **is** the base model, already resident, so there is no second checkpoint
+  in VRAM. It costs four forward passes per pair instead of one, and the gate decides
+  whether it was worth it. The default is still plain SFT on the preferred answer.
 
 ### The gate
 
@@ -412,7 +454,124 @@ every night will drift, and the only defence is a measurement it cannot talk its
 
 A rejected candidate stays on disk, unpromoted, with its scores in `gate_results` — so
 "why did it not promote" is answerable, and a disabled gate refuses to promote rather than
-promoting blind.
+promoting blind. A **tie** is not an improvement either: `min_improvement: 0.0` means "any
+improvement at all", because changing the weights being served needs a measurement that
+moved.
+
+Scoring code is easy — it is run. Scoring prose is the weak link, so free-text answers are
+compared with mean-pooled hidden states from the model already in VRAM (`gate.scorer:
+embedding`), which recognises a right answer in different words that word overlap would
+have called a failure. It is still blunt, so it is used carefully: a share over a minimum
+number of items, with a threshold, and with word overlap as the fallback when the backend
+cannot embed — the report says which was used.
+
+### Growing, only where it is measured
+
+```
+$ ai expansion
+modules: general, personal-memory, coding, rust
+budget:
+  up to 6 adapters, LoRA rank <= 32
+  at most 200M adapter parameters (1024 MiB of VRAM)
+  warm (pinned RAM) cache 8 GiB, cold (disk) 64 GiB
+  10% of VRAM kept free at peak
+what the measurements say now:
+  [0.63] uncovered_topics: 9 of 14 requests no module covered are about 'kubernetes'
+history:
+  [3] 2026-11-11 03:12  applied   new_module kubernetes  snapshot=20261111T031200-expansion
+        registered module 'kubernetes' with 7 keywords; it has no adapter until a
+        night has material for it
+```
+
+Section 8 says capacity may grow *only if measurements demand it*, so the triggers are
+all things the system already counts:
+
+| trigger | what it means | what it proposes |
+|---|---|---|
+| `uncovered_topics` | requests the router could not place, clustered by the words they share | a new module |
+| `saturated_module` | a module trained repeatedly whose held-out score stopped moving | a higher LoRA rank |
+| `unused_module` | an adapter with no demand and no routing hits | archiving it |
+| `merge_candidate` | an always-on module promoted again and again | merging it into the base |
+
+A cluster has to be a subject rather than a pile: eight requests by default, sharing
+enough vocabulary, and question words (`question`, `number`, `error`, `help`) are
+excluded from naming one — otherwise "how do I write a kubernetes manifest" asked five
+ways produces a module called `write`.
+
+The **budget is derived, not configured**: `ExpansionBudget` comes from the card — how
+many adapters fit beside inference, the largest LoRA rank that fits, how much warm cache
+there is. A proposal that does not fit is recorded as *refused with the arithmetic*,
+which is more useful than silence.
+
+Then the brakes:
+
+- **One structural change per night**, so tomorrow's "what broke" has one answer.
+- **Everything goes through the guard.** The registry counts as weights here: it decides
+  which adapters load and how requests are routed, so it is written to a staging file and
+  moved into place with one `os.replace`, with a verified snapshot already taken.
+- **A new module gets no weights.** It is registered so that tonight's routing and
+  tomorrow's consolidation can start collecting material for it; the first adapter is
+  trained by the normal training step and promoted by the normal gate.
+- **Only one kind happens unsupervised, by default.** `expansion.require_approval` ships
+  as `[merge_to_base, prune_module, new_module]`, so out of the box the only change it
+  makes by itself is raising a LoRA rank — which the gate then has to agree was an
+  improvement, and which a rollback undoes. Everything else is filed with its evidence
+  for `ai approvals`. Take `new_module` out of that list if you want it to add modules on
+  its own; it is in there because a new module changes how every later request is routed.
+- **The irreversible ones are off entirely.** Archiving a module changes what the system
+  can do. Merging an adapter into the base rewrites the weights everything else is built
+  on — so it is off, approval-gated even when on, and its snapshot includes the base
+  checkpoint. `ai approve-expansion <id>` applies one; `ai expansion --revert` restores
+  the last applied change from its own snapshot, and that revert is itself undoable.
+
+Merging has two catches worth stating plainly.
+
+It cannot be done in the quantised weights the server runs, because a 4-bit NF4 linear
+layer has no fp16 matrix to add a LoRA delta to. So it loads the original checkpoint
+unquantised (on the CPU, while the GPU keeps serving), merges there, and replaces the
+checkpoint atomically under the same model id — which stays valid because merging
+`W + BA` changes no shapes.
+
+And it invalidates **every other adapter**, because they were all trained as a delta from
+the base as it was before. The model id does not change, so the loader's base-model check
+cannot see this: the merge stamps the other versions instead, and the harness refuses to
+load a stamped adapter until a night has retrained it, with a warning in `ai status`.
+Refusing is the point — quietly applying a delta to the wrong weights shows up as the
+model getting mysteriously worse, which is the hardest kind of problem to find.
+
+### Tuning itself, by measurement
+
+```
+$ ai optimize
+settings it may measure: prefix_cache, kv_cache_dtype, warm_cache_mb, speculative_decoding
+in use:
+  prefix_cache           True
+  kv_cache_dtype         'auto'
+  warm_cache_mb          8192
+  speculative_decoding   False
+router: fitted 2026-11-11T03:14:02 on 412 pieces of material, threshold 0.38,
+        86% agreement with the keyword scorer
+it would try next: kv_cache_dtype='fp16'
+history:
+  [2] 2026-11-11 03:14  reverted  speculative_decoding=True  -48.9%  -48.9% is below
+                                  the 5.0% that counts as a win
+```
+
+Section 10 draws a hard line: the daemon may change the values in `tunable` and nothing
+else — never its source, never the hardware plan, never a threshold that decides what
+gets learned. What it learns goes in `var/tunable.yaml`, which sits *underneath* your
+`config.yaml`, so anything you pin stays pinned and the file it owns can never clobber
+your comments.
+
+The loop is deliberately boring, because the failure mode of self-optimisation is
+believing noise: measure the current setting on a short fixed benchmark, change one
+value, measure again, and — for anything that can change what the model *says* — score a
+slice of the held-out suite too. A win has to clear `min_relative_gain` (5%) on speed and
+cost no more than `max_quality_loss` (2%) in quality. Anything else goes back and is
+remembered, so the same losing value is not re-tried every night for the rest of time.
+
+That is how the speculative-decoding result above was reached: the system tried it,
+measured it, found it half as fast on this machine, put it back, and wrote down why.
 
 ### The report
 
@@ -434,10 +593,21 @@ A router picks which modules a request needs *before* generation, so the right a
 are resident when the first token is produced. It scores the request against each
 module's description with IDF-weighted keyword overlap — cheap and explainable, and
 replaceable by an embedding model behind the same interface. Every decision is logged
-with its scores, which is what will let the `speed` step train it on outcomes instead of
-thresholds (stage 6; today the threshold is `tunable.router_threshold`).
+with its scores, which is what the `speed` step fits a router on.
+
+**The fitted router.** A keyword list is only as wide as somebody remembered to make it:
+the rust module's keywords do not contain `axum`, so a question about an axum extractor
+scored zero and was recorded as uncovered. The `speed` step fits a scorer from the
+vocabulary each module has actually accumulated — the prompts of its examples, its
+tasks, its benchmark items, with its description as an anchor — weighted so that a word
+only one module uses counts and a word everything uses does not. It is installed only if
+it still agrees with the keyword scorer on the requests that scorer was confident about,
+and only with a threshold calibrated so the share of requests called *uncovered* does not
+jump; otherwise self-expansion would be flooded with false triggers. The honest caveat is
+in the module's own docstring: the labels come from the keyword router, so this widens its
+vocabulary rather than correcting its mistakes.
 When nothing scores above the threshold, that is recorded as an *uncovered topic* — one
-of the measured triggers for self-expansion in stage 6.
+of the measured triggers for self-expansion.
 
 Modules are held in a tiered cache (VRAM → pinned RAM → disk, LRU) inside the adapter
 budget the hardware plan computed, so the VRAM ceiling is never exceeded by accident.
@@ -590,7 +760,9 @@ and the estimates become exact.
 
 | | |
 |---|---|
+| `ai init [dir]` | make a directory into a gustav project (never overwrites) |
 | `ai start` | run the daemon in the foreground |
+| `ai service install\|uninstall\|status` | run it as a systemd user service |
 | `ai status [--json]` | state, schedule, adapters, GPU holder, pending work, failures, approvals |
 | `ai chat [message]` | one message, or an interactive session |
 | `ai sleep now [--dry-run]` | sleep immediately; `--dry-run` plans the night without doing it |
@@ -607,11 +779,15 @@ and the estimates become exact.
 | `ai runs [id]` | sleep runs and their steps, with what each one did, checkpoints and errors |
 | `ai facts [--subject S]` | durable facts it holds; `--subject` shows everything it has believed about one |
 | `ai skills [--all]` | the measured skill table: score, trials and demand per topic |
+| `ai expansion [--revert]` | what it has grown and would like to; undo the last change |
+| `ai approve-expansion <id> [--reject]` | accept a proposed structural change |
+| `ai optimize [--revert]` | what it has tuned about itself; put the last change back |
 | `ai report [run]` | write the HTML report for a run (the newest by default) |
 | `ai events [--kind K]` | the daemon's event log |
 | `ai stop` | graceful shutdown |
 
-Stage 6 adds `ai approve-expansion`, `ai expansion --revert` and `ai optimize --revert`.
+Every command in that table exists; a test parses this table and the parser and fails if
+they disagree.
 
 Everything goes through the running daemon over a Unix socket at `var/gustav.sock`.
 Set `instance.http_enabled` (and `http_token`) to also listen on TCP for remote clients.
@@ -619,13 +795,15 @@ Set `instance.http_enabled` (and `http_token`) to also listen on TCP for remote 
 The HTTP API has `/chat` (JSON or SSE), `/v1/chat/completions` (OpenAI-compatible, so
 existing clients work against the local daemon), `/health`, `/status`, `/adapter/status`,
 `/adapter/rollback`, `/adapter/activate`, `/hardware`, `/models`, `/bench`, `/runs`,
-`/facts`, `/skills` and `/report`.
+`/facts`, `/skills`, `/report`, `/approvals`, `/expansion`, `/expansion/revert`,
+`/optimisation` and `/optimisation/revert`.
 
 ## Configuration
 
 `config.yaml` in the project root; every key has a default, so an empty file is valid and
 an unknown key is an error rather than a silent default. The `tunable` section is the only
-thing the daemon's own self-optimisation may ever change (stage 6) — never its source code.
+thing the daemon's own self-optimisation may ever change — never its source code. What it
+has learned lives in `var/tunable.yaml`, underneath this file, so your values always win.
 
 The sections the night reads, with the defaults worth knowing:
 
@@ -635,7 +813,9 @@ The sections the night reads, with the defaults worth knowing:
 | `fetcher` | `enabled`, `allowed_hosts`, `local_sources`, `max_documents_per_run` (12), `cache_ttl_hours` (168), `delay_seconds` (1.0) |
 | `sandbox` | `timeout_seconds` (10), `memory_limit_mb` (1024), `isolate_env` |
 | `training` | `rank` (from the plan), `learning_rate` (1e-4), `grad_accum` (8), `max_steps` (200), `max_seconds` (1800), `min_examples` (16), `verified_only` (off) |
-| `gate` | `min_improvement` (0.0), `max_regression` (0.02), `min_items` (8), `max_promotions_per_run` (1) |
+| `gate` | `min_improvement` (0.0), `max_regression` (0.02), `min_items` (8), `max_promotions_per_run` (1), `scorer` (embedding) |
+| `expansion` | `max_changes_per_run` (1), `min_uncovered_requests` (8), `saturation_runs` (3), `rank_step` (8), `allow_pruning` (off), `allow_base_merge` (off), `require_approval` |
+| `optimisation` | `settings` (the knobs it may measure), `max_trials_per_run` (2), `min_relative_gain` (0.05), `max_quality_loss` (0.02) |
 
 `docs/sources.yaml` maps topics to documentation URLs and records the licence of each
 source. It is the complete list of what the fetcher can ever request, so an entry you did
@@ -675,10 +855,14 @@ src/gustav/
   backup/              snapshots, manifests, atomic swaps, restore, retention, the guard
   sleep/               the pipeline, its steps, and the model as a step sees it
   learn/               facts, examples, tasks, skills, benchmarks, chunking, grounding
+  expansion/           triggers, proposals, the actions, merging into the base
+  optimize/            the measured tunable loop and the router fitting
   fetcher/             the allowlist, the cache, HTML to text — the only network use
   sandbox/             where practice answers are run and judged
   train/               the dataset mix and the LoRA trainer
   report/              the HTML report
+  data/                the defaults a fresh project is given
+packaging/             the systemd user unit
   wake/                the chat side
   server/ cli.py       control plane and its client
   store/               SQLite schema and migrations
@@ -695,11 +879,12 @@ var/                   databases, logs, run checkpoints, doc cache, reports, soc
 
 Three sets, with different jobs.
 
-**The fast set** (around 700 tests) runs on any machine with no GPU and no weights. Most
+**The fast set** (around 850 tests) runs on any machine with no GPU and no weights. Most
 of the sleep tests call a step's body directly with a *scripted* model, which is what
 makes the interesting cases cheap to pin down: an ungrounded fact, an exercise whose tests
 pass without a solution, a candidate adapter that is better on new material and worse on
-old, a replacement answer that just restates the one you rejected.
+old, a replacement answer that just restates the one you rejected, an expansion proposal
+the hardware budget cannot afford, a tunable change that bought speed with quality.
 
 **The slow set** starts the real daemon as a subprocess and `kill -9`s it while **each**
 step of the night is running, then restarts it and checks that finished steps were not
@@ -707,11 +892,15 @@ re-run, that checkpoints survived, and that the night finishes. `tests/test_slee
 runs the whole pipeline in real child processes with no model at all — which is how a
 laptop without CUDA behaves, and it has to end with a completed run and a report.
 
-**The GPU set** needs `models/qwen3-0.6b` (`ai model pull qwen3-0.6b`) and takes about a
-minute: `test_gpu_training.py` trains a LoRA, checks the loss falls when it is shown the
-same thing repeatedly, interrupts training and resumes it, and loads the result through
-the *serving* path — and `test_gpu_night.py` runs an entire night with the model loaded
-and asserts only on structure, never on the quality of a 0.6B model's answers.
+**The GPU set** needs `models/qwen3-0.6b` (`ai model pull qwen3-0.6b`) and takes a couple
+of minutes. `test_gpu_training.py` trains a LoRA, checks the loss falls when it is shown
+the same thing repeatedly, interrupts training and resumes it, trains a preference
+objective against the adapter-disabled model, and loads the result through the *serving*
+path. `test_gpu_speculative.py` checks the one thing that makes speculative decoding safe
+— a model drafting for itself accepts over 90% of its proposals, which is what fails
+loudly if the cache rollback or the logits alignment is wrong. And `test_gpu_night.py`
+runs an entire night with the model loaded, asserting only on structure, never on the
+quality of a 0.6B model's answers.
 
 The planner is tested against simulated machines — a 4 GB Turing laptop, a 12 GB desktop,
 a four-card server, and a machine with no GPU at all — so none of it needs the hardware it
@@ -722,13 +911,23 @@ against one of them too.
 
 - **A dense model has no "coding part" to split out.** Modularity here means LoRA
   adapters and, for a Mixture-of-Experts base, expert offloading. Nothing else.
-- **No layer or depth growth.** Self-expansion adds adapters, raises LoRA ranks, adds
-  frozen-base experts, and (with your approval) merges into the base. Growing the network
-  itself is documented as a future direction, not implemented.
-- **Preference pairs are trained as plain SFT on the chosen side.** `/good`, `/bad` and
-  the rewrites `dreaming` produces are stored as pairs, with the rejected answer kept, but
-  the trainer fits the preferred answer rather than running DPO. The data is in the shape a
-  preference objective needs; the objective is not implemented.
+- **No layer or depth growth.** Self-expansion adds modules, raises LoRA ranks, archives
+  what nothing uses and (with your approval) merges an adapter into the base. Growing the
+  network itself — more layers, wider ones, new frozen-base experts — is a documented
+  future direction, not implemented.
+- **The fitted router widens the keyword list; it does not correct it.** Its training
+  labels come from the keyword scorer that assigned each example's module, so it learns
+  the vocabulary that surrounds words that list already knew. Properly learned routing
+  needs per-module credit for an answer, which nothing measures yet. The check that keeps
+  this safe is that a new router is installed only if it still agrees with the keyword
+  scorer where that one was confident.
+- **Speculative decoding is implemented and measured slower here.** A model drafting for
+  itself accepts over 90% of proposals, so the mechanism is right, but at batch 1 a decode
+  step costs mostly per-layer launch and framework overhead rather than arithmetic — so a
+  0.6B draft forward costs nearly as much as a 4B target forward and the result was 0.5x.
+  CUDA graphs or a leaner draft path would change that; until then it is off by default
+  and `ai optimize` measures it per machine. Its output is also greedy-but-not-identical
+  to the sequential path, for the same batched-forward reason the prefix cache is.
 - **One GPU means no chatting during training.** Sleep pauses to answer you and resumes
   afterwards. Two GPUs remove the trade-off.
 - **Training on your own output has a ceiling.** Test verification, documentation
@@ -736,12 +935,12 @@ against one of them too.
   on narrow verifiable skills, not open-ended self-improvement. A night with no
   corrections, no practice passes and nothing new to read is a night that should and
   usually does change nothing.
-- **The weakest link is scoring free text.** Code is run; a `/correct` is authoritative.
-  But a held-out prose answer is scored by content-word overlap with the reference, which
-  is a blunt instrument: it cannot tell a differently-worded right answer from a wrong
-  one. That is why the gate needs a minimum number of items, refuses to promote on a tie,
-  and promotes one module a night. An embedding or a judge model behind the same
-  `score_answer` interface is the obvious improvement.
+- **Scoring free text is still the weakest link.** Code is run; a `/correct` is
+  authoritative. A prose answer is now compared with mean-pooled hidden states from the
+  model itself, which is much better than word overlap at recognising a right answer in
+  different words — but it is a similarity, not a judgement, and a confidently wrong
+  answer that *sounds* like the reference can pass. That is why the gate needs a minimum
+  number of items, refuses to promote on a tie, and promotes one module a night.
 - **Self-generated exercises are only as good as their tests.** Both checks (the reference
   solution passes, the stubbed version fails) catch incoherent and vacuous tasks, but not
   a task that tests the wrong thing correctly. Small models mostly fail to produce usable
@@ -757,6 +956,11 @@ against one of them too.
   54 — conservative, which is the safe direction.)
 - **Requests are served one at a time.** The GPU is single-tenant, so generation is
   serialised behind a lock. The queue interface is in place for continuous batching
-  later; it is not implemented yet, and concurrent callers wait their turn.
+  later; it is not implemented yet, concurrent callers wait their turn, and this is why
+  `batch_size` is not something self-optimisation pretends to tune.
+- **Self-optimisation can only tune four things.** `prefix_cache`, `kv_cache_dtype`,
+  `warm_cache_mb` and `speculative_decoding` are the `tunable` values the serving path
+  actually reads. The others are there for the planner, and a measured loop over settings
+  that do nothing would be a machine for keeping noise.
 - **Architecture numbers come from `ladder.yaml`** until the weights are downloaded;
   the planner says so in its warnings, and reads the real `config.json` when it exists.

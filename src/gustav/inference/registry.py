@@ -25,6 +25,9 @@ class ModuleSpec:
     always_on: bool = False
     #: Higher wins when the active set has to be trimmed.
     priority: int = 0
+    #: LoRA rank for this module. 0 means "whatever the hardware plan chose"; a value
+    #: here is what self-expansion raises when a module stops improving (section 8).
+    lora_rank: int = 0
     #: Measured once the module exists.
     size_mb: float = 0.0
     load_ms: float = 0.0
@@ -77,14 +80,32 @@ class Registry:
         """Register a new module (self-expansion, section 8, action 1)."""
         if spec.name in self._by_name:
             raise ValueError(f"module {spec.name!r} already exists")
-        return Registry(
-            modules=(*self.modules, spec),
-            base_model=self.base_model,
-            threshold=self.threshold,
-            max_active=self.max_active,
-            source=self.source,
-            raw=self.raw,
+        return self._with(modules=(*self.modules, spec))
+
+    def replace(self, spec: ModuleSpec) -> "Registry":
+        """Change one module's entry — a raised LoRA rank, a measured size."""
+        if spec.name not in self._by_name:
+            raise KeyError(f"unknown module {spec.name!r}")
+        return self._with(
+            modules=tuple(spec if m.name == spec.name else m for m in self.modules)
         )
+
+    def remove(self, name: str) -> "Registry":
+        """Take a module out of the registry (it is archived, not deleted, on disk)."""
+        if name not in self._by_name:
+            raise KeyError(f"unknown module {name!r}")
+        return self._with(modules=tuple(m for m in self.modules if m.name != name))
+
+    def _with(self, **changes: Any) -> "Registry":
+        fields = {
+            "modules": self.modules,
+            "base_model": self.base_model,
+            "threshold": self.threshold,
+            "max_active": self.max_active,
+            "source": self.source,
+            "raw": self.raw,
+        }
+        return Registry(**{**fields, **changes})
 
     def to_yaml(self) -> str:
         payload = {
@@ -97,6 +118,7 @@ class Registry:
                     "keywords": list(m.keywords),
                     **({"always_on": True} if m.always_on else {}),
                     "priority": m.priority,
+                    **({"lora_rank": m.lora_rank} if m.lora_rank else {}),
                     **({"size_mb": m.size_mb} if m.size_mb else {}),
                     **({"load_ms": m.load_ms} if m.load_ms else {}),
                 }

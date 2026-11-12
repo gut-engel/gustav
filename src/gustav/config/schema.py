@@ -140,10 +140,11 @@ class SleepConfig(Strict):
 
     #: Steps the user can switch off entirely.
     disabled_steps: list[str] = []
-    #: Steps that still run the simulated placeholder handler. Everything not listed
-    #: here does real work; this is how an unfinished stage stays runnable instead of
-    #: being a hole in the night.
-    simulated_steps: list[str] = ["expansion", "speed"]
+    #: Steps that run the simulated placeholder handler instead of their real body.
+    #: Empty now that every step is implemented; it stays because it is how an
+    #: unfinished or deliberately disabled step keeps the night runnable, and because
+    #: the tests of the pipeline machinery itself use it.
+    simulated_steps: list[str] = []
     #: Seconds of simulated work per placeholder step.
     simulated_step_seconds: float = 0.5
     #: Replay share for anti-forgetting: this fraction of every training mix is drawn
@@ -168,12 +169,21 @@ class SleepConfig(Strict):
 
 
 class WakeConfig(Strict):
+    """The chat side."""
+
     #: Release the GPU after this long without a request, so the VRAM is free for
     #: whatever else you are doing. The next message reloads the model.
     #: 0 disables it and keeps the model resident.
     idle_unload_minutes: int = 15
     session_idle_minutes: int = 120
     max_history_turns: int = 40
+    #: When the conversation no longer fits the window, fold the turns that fall off
+    #: into one summary message instead of dropping them. It costs one short generation
+    #: per conversation (cached until more turns fall off), and it is the difference
+    #: between "we were discussing the deploy script" and an answer that has forgotten
+    #: the question.
+    summarise_history: bool = True
+    summary_tokens: int = 160
     #: Store a redacted copy when a secret is detected. The live request still sees the
     #: original text; only what is persisted changes. Turning this off keeps the raw
     #: text on disk — it is still never trained on.
@@ -194,6 +204,66 @@ class TunableConfig(Strict):
     prefix_cache: bool = True
     prefix_cache_mb: int = 512
     warm_cache_mb: int = 8192
+
+
+class ExpansionConfig(Strict):
+    """Section 8: growing its own capacity, within a budget the hardware sets.
+
+    Every knob here is a brake. The triggers are measurements the system already takes
+    — requests no module covered, a module that stopped improving, one nobody uses —
+    and the defaults are chosen so that the cheap, reversible changes happen by
+    themselves and the expensive, destructive ones wait for you.
+    """
+
+    enabled: bool = True
+    #: Structural changes per night. One, so that if something breaks tomorrow the
+    #: cause is a single named change.
+    max_changes_per_run: int = 1
+    #: A new module needs this many requests nothing covered, sharing enough vocabulary
+    #: to be one subject rather than a pile of unrelated questions.
+    min_uncovered_requests: int = 8
+    min_cluster_share: float = 0.4
+    #: A module is "saturated" when this many consecutive gate results moved the
+    #: held-out score by less than `saturation_delta`. More rank is then worth trying.
+    saturation_runs: int = 3
+    saturation_delta: float = 0.01
+    rank_step: int = 8
+    #: A module with an adapter, no demand and no activations for this long is a
+    #: candidate for archiving (never deletion).
+    unused_days: int = 30
+    allow_new_modules: bool = True
+    allow_rank_increase: bool = True
+    #: Off by default: archiving a module changes what the system can do.
+    allow_pruning: bool = False
+    #: Merging an adapter into the base rewrites the base checkpoint. It is the one
+    #: operation that can lose the weights everything else is built on, so it is off,
+    #: and approval-gated even when on.
+    allow_base_merge: bool = False
+    #: Kinds that may never be applied without you saying so.
+    require_approval: list[str] = ["merge_to_base", "prune_module", "new_module"]
+
+
+class OptimisationConfig(Strict):
+    """Section 10: tuning itself, by measurement, inside `tunable` and nowhere else."""
+
+    enabled: bool = True
+    #: Settings it may try. Anything not listed is out of reach even though it lives in
+    #: `tunable`, and anything pinned in config.yaml wins over whatever it learns.
+    settings: list[str] = [
+        "prefix_cache",
+        "kv_cache_dtype",
+        "warm_cache_mb",
+        "speculative_decoding",
+    ]
+    #: Trials per night, and how long one measurement may take.
+    max_trials_per_run: int = 2
+    bench_tokens: int = 96
+    bench_repeats: int = 2
+    #: Keep a change only if it is this much better, in relative terms. Noise is the
+    #: enemy here: a 1% "win" measured once is not a win.
+    min_relative_gain: float = 0.05
+    #: Never trade this much answer quality for speed; measured on the gate's suites.
+    max_quality_loss: float = 0.02
 
 
 class HardwareConfig(Strict):
@@ -322,6 +392,17 @@ class TrainingConfig(Strict):
     modules: list[str] = []
     warmup_ratio: float = 0.03
     max_grad_norm: float = 1.0
+    #: How preference pairs (a `/good`, a `/bad` the night replaced, a rewrite the
+    #: samples agreed on) are trained.
+    #:
+    #: ``sft``  fit the preferred answer and ignore the rejected one — simple, and it
+    #:          cannot push probability mass anywhere in particular.
+    #: ``dpo``  direct preference optimisation against the base model as the reference,
+    #:          which is what the stored pairs are shaped for. It costs four forward
+    #:          passes per pair instead of one, so it is measured by the gate like
+    #:          everything else.
+    preference_objective: Literal["sft", "dpo"] = "sft"
+    dpo_beta: float = 0.1
     #: Save a checkpoint this often, so a preempted night resumes rather than restarts.
     checkpoint_every_steps: int = 25
 
@@ -340,6 +421,14 @@ class GateConfig(Strict):
     min_items: int = 8
     max_items: int = 120
     max_new_tokens: int = 256
+    #: How a free-text answer is compared with its reference.
+    #:
+    #: ``embedding`` uses mean-pooled hidden states from the model already in VRAM, so
+    #: a right answer in different words still counts. ``overlap`` compares content
+    #: words, which is cruder and has no dependencies. "embedding" falls back to
+    #: "overlap" when the backend cannot embed, and the report says which was used.
+    scorer: Literal["embedding", "overlap"] = "embedding"
+    embedding_match: float = 0.72
     #: Promote only one module per night by default: if something breaks, the cause is
     #: unambiguous. Raise it once the gate has earned your trust.
     max_promotions_per_run: int = 1
@@ -359,7 +448,8 @@ class Config(Strict):
     #: file still loads under this build.
     backup: BackupConfig = BackupConfig()
     inference: dict[str, Any] = {}
-    expansion: dict[str, Any] = {}
+    expansion: ExpansionConfig = ExpansionConfig()
+    optimisation: OptimisationConfig = OptimisationConfig()
     fetcher: FetcherConfig = FetcherConfig()
     sandbox: SandboxConfig = SandboxConfig()
     training: TrainingConfig = TrainingConfig()

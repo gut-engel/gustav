@@ -47,6 +47,8 @@ STAGE_TARGETS: dict[str, str] = {
     "dreaming": "gustav.sleep.stages.dreaming:run_step",
     "training": "gustav.sleep.stages.training:run_step",
     "gate": "gustav.sleep.stages.gate:run_step",
+    "expansion": "gustav.sleep.stages.expansion:run_step",
+    "speed": "gustav.sleep.stages.speed:run_step",
     "retest": "gustav.sleep.stages.retest:run_step",
     "report": "gustav.sleep.stages.report:run_step",
 }

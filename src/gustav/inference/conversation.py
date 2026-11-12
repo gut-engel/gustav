@@ -37,6 +37,10 @@ class FitResult:
     dropped_turns: int = 0
     truncated: bool = False
     notes: list[str] = field(default_factory=list)
+    #: The turns that did not fit, oldest first. The caller needs them to summarise
+    #: them — which it cannot do inside ``fit``, because generating a summary means
+    #: calling the model and this function is synchronous by design.
+    dropped: list[Message] = field(default_factory=list)
 
 
 @dataclass
@@ -120,6 +124,7 @@ class ContextBudget:
             dropped_turns=dropped_count,
             truncated=truncated,
             notes=notes,
+            dropped=list(rest[:dropped_count]),
         )
 
 

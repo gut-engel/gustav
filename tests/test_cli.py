@@ -100,10 +100,23 @@ def test_a_missing_daemon_says_how_to_start_one(project, repo_root):
     assert "ai start" in result.stderr
 
 
-def test_later_stage_commands_explain_themselves(project, repo_root):
-    result = ai(project, "expansion", repo_root=repo_root)
-    assert result.returncode == 2
-    assert "stage 6" in result.stderr
+def test_every_command_the_readme_documents_exists(repo_root):
+    """The README's command table and the parser cannot drift apart."""
+    import re
+
+    from gustav.cli import NOT_YET
+
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    table = readme[readme.index("## Commands"):readme.index("## Configuration")]
+    documented = {
+        match.group(1)
+        for match in re.finditer(r"`ai ([a-z][a-z-]*)", table)
+    }
+    parser = build_parser()
+    known = set(next(a for a in parser._actions if a.dest == "command").choices)
+    assert documented, "the command table should not be empty"
+    assert documented <= known, f"documented but missing: {sorted(documented - known)}"
+    assert not NOT_YET, f"these commands still say 'not yet': {sorted(NOT_YET)}"
 
 
 def test_facts_and_skills_are_honest_when_nothing_was_learned_yet(running, project, repo_root):

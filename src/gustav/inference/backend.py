@@ -137,6 +137,15 @@ class InferenceBackend(abc.ABC):
     def render_prompt(self, messages: Sequence[Message]) -> str:
         """Apply the model's own chat template. No hardcoded formats anywhere."""
 
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """Mean-pooled hidden states, normalised. Optional: not every backend has them.
+
+        The gate uses these to compare a free-text answer with its reference, which is
+        the weakest link in the whole measurement. A backend that cannot produce them
+        raises, and the gate falls back to word overlap and says so.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot produce embeddings")
+
     # --- adapters -------------------------------------------------------
     @abc.abstractmethod
     async def load_adapter(self, module: str, path: Any, *, version: str) -> None: ...

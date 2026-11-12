@@ -6,6 +6,17 @@ build-backend = "hatchling.build"
 name = "gustav"
 version = "0.1.0"
 description = "Self-learning local AI with a wake/sleep cycle, run by a single always-on daemon"
+readme = "README.md"
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.9",
@@ -41,6 +52,14 @@ gustav = "gustav.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gustav"]
+# The model ladder, the default module registry, the documentation source map and the
+# default config travel with the package: an installed wheel starting in an empty
+# directory has to be able to write a working project.
+artifacts = ["src/gustav/data/*.yaml", "src/gustav/hw/*.yaml"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "modules", "profiles", "packaging", "README.md",
+           "config.yaml", "daemon.py", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -1,0 +1,37 @@
+# A systemd *user* unit, so gustav runs as you, with your GPU access and your files.
+#
+# This is not a scheduler. The daemon decides when to sleep by itself — there is no
+# timer here and there must not be one. All this unit does is keep the one always-on
+# process running and restart it if it dies.
+#
+#   ai service install     # writes this to ~/.config/systemd/user/gustav.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now gustav
+#   journalctl --user -u gustav -f
+#
+# `loginctl enable-linger $USER` if you want it to keep running when you log out.
+
+[Unit]
+Description=gustav: a local self-learning AI with a wake/sleep cycle
+Documentation=https://github.com/gut-engel/gustav
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%WORKDIR%
+ExecStart=%PYTHON% %WORKDIR%/daemon.py
+Restart=on-failure
+RestartSec=10
+# Give it time to finish writing weights and checkpoint the night before it is killed.
+TimeoutStopSec=120
+KillSignal=SIGTERM
+# It is already polite about the GPU; this keeps it polite about the CPU too.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# A crash loop should be loud, not infinite.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target

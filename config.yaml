@@ -207,3 +207,43 @@ tunable:
   prefix_cache: true
   prefix_cache_mb: 512
   warm_cache_mb: 8192
+
+expansion:
+  # Section 8: growing its own capacity, within a budget the hardware sets. The triggers
+  # are measurements it already takes — requests no module covered, a module that stopped
+  # improving, one nothing uses.
+  enabled: true
+  # One structural change per night, so tomorrow's "what broke" has one answer.
+  max_changes_per_run: 1
+  # A new module needs this many requests nothing covered, sharing enough vocabulary to
+  # be one subject rather than a pile of unrelated questions.
+  min_uncovered_requests: 8
+  min_cluster_share: 0.4
+  # "Saturated": this many gate results in a row that moved the score less than this.
+  saturation_runs: 3
+  saturation_delta: 0.01
+  rank_step: 8
+  unused_days: 30
+  allow_new_modules: true
+  allow_rank_increase: true
+  # Archiving a module changes what the system can do, so it is off by default.
+  allow_pruning: false
+  # Merging an adapter into the base rewrites the weights everything else is built on.
+  # Off, and approval-gated even when on.
+  allow_base_merge: false
+  require_approval: [merge_to_base, prune_module, new_module]
+
+optimisation:
+  # Section 10: it may change `tunable` values and nothing else, and only on a
+  # measurement. What it learns goes in var/tunable.yaml, underneath this file.
+  enabled: true
+  # Only settings the serving path actually reads. batch_size is not here: requests are
+  # served one at a time, so measuring it would be measuring noise.
+  settings: [prefix_cache, kv_cache_dtype, warm_cache_mb, speculative_decoding]
+  max_trials_per_run: 2
+  bench_tokens: 96
+  bench_repeats: 2
+  # A win has to be this much faster...
+  min_relative_gain: 0.05
+  # ...and may not cost more than this on the held-out suite.
+  max_quality_loss: 0.02

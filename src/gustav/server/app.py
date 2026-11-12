@@ -409,16 +409,45 @@ def create_app(daemon: "Daemon") -> FastAPI:
 
     @app.post("/approvals/{approval_id}", dependencies=guard)
     async def decide(approval_id: int, req: ApprovalDecision) -> dict[str, Any]:
+        row = daemon.db.query_one("SELECT kind FROM approvals WHERE id = ?", (approval_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"no approval #{approval_id}")
         try:
+            if row["kind"] == "expansion":
+                if not req.approve:
+                    return daemon.reject_expansion(approval_id, req.note or "")
+                # Guarded like everything else that changes weights (section 9).
+                return await daemon.approve_expansion(approval_id)
             if not req.approve:
                 return daemon.hw.reject_approval(approval_id, req.note)
-            # Guarded: a base change is a weight change (section 9).
             result = daemon.approve_base_change(approval_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return result
+
+    @app.get("/expansion", dependencies=guard)
+    async def expansion(limit: int = 20) -> dict[str, Any]:
+        return daemon.expansion_status(limit)
+
+    @app.post("/expansion/revert", dependencies=guard)
+    async def revert_expansion() -> dict[str, Any]:
+        try:
+            return await daemon.revert_expansion()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/optimisation", dependencies=guard)
+    async def optimisation(limit: int = 20) -> dict[str, Any]:
+        return daemon.optimisation_status(limit)
+
+    @app.post("/optimisation/revert", dependencies=guard)
+    async def revert_optimisation() -> dict[str, Any]:
+        try:
+            return await daemon.revert_optimisation()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/facts", dependencies=guard)
     async def facts(

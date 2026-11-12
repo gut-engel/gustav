@@ -457,13 +457,9 @@ class Planner:
         setting = getattr(self.config, "speculative_decoding", "auto")
         if setting == "off":
             return False, None, "speculative decoding is off in config"
-        drafts = [
-            d for d in self.ladder.draft_models()
-            if d.total_params * 5 < candidate.model.total_params
-        ]
-        if not drafts:
+        draft = self.ladder.draft_for(candidate.model)
+        if draft is None:
             return False, None, "no draft model small enough to help"
-        draft = drafts[0]
         quant = self.ladder.quant(
             "4bit-nf4" if "4bit-nf4" in draft.quantizations else draft.quantizations[0]
         )
@@ -477,14 +473,23 @@ class Planner:
             )
         if setting == "on":
             return True, draft.id, f"speculative decoding with {draft.label} (forced on)"
-        if self.config.balance <= 0.5:
-            return True, draft.id, (
-                f"speculative decoding with {draft.label}: balance {self.config.balance} "
-                f"favours speed, and it fits in the spare {headroom / 1024:.1f} GiB"
+        if self.config.balance > 0.5:
+            return False, draft.id, (
+                f"speculative decoding left off: balance {self.config.balance} favours "
+                f"capability, and the spare VRAM is better spent on adapters"
             )
-        return False, None, (
-            f"speculative decoding left off: balance {self.config.balance} favours capability, "
-            f"and the spare VRAM is better spent on adapters"
+        # Measured, not assumed. On this backend a decode step at batch 1 costs mostly
+        # per-layer launch and framework overhead rather than arithmetic, so a draft
+        # forward costs nearly as much as a target forward and speculation came out
+        # *slower* than not speculating (0.5x on a 4B target with a 0.6B draft). It is
+        # therefore off by default even when speed is what the balance asks for, and
+        # `ai optimize` measures it on *your* machine and keeps it only if it wins.
+        return False, draft.id, (
+            f"a {draft.label} draft model fits in the spare {headroom / 1024:.1f} GiB, "
+            f"but speculative decoding is left off until it is measured: on this "
+            f"backend a draft step costs nearly as much as a target step, so it can be "
+            f"slower than not speculating. 'ai optimize' tries it and keeps it if it "
+            f"helps here; hardware.speculative_decoding: on forces it"
         )
 
     # --- the plan -------------------------------------------------------

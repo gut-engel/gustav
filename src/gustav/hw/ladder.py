@@ -255,6 +255,25 @@ class Ladder:
     def draft_models(self) -> list[ModelSpec]:
         return [m for m in self.rungs() if m.draft]
 
+    #: A draft model has to be this many times smaller than the model it drafts for.
+    #: Below that it costs nearly as much as the model it is trying to save work for.
+    DRAFT_RATIO = 5
+
+    def draft_for(self, target: ModelSpec) -> ModelSpec | None:
+        """The largest draft model small enough to be worth proposing for ``target``.
+
+        The largest, not the smallest: the better the draft, the more of its proposals
+        survive verification, and acceptance is what decides whether speculation pays.
+        """
+        usable = [
+            m
+            for m in self.draft_models()
+            if m.id != target.id and m.total_params * self.DRAFT_RATIO < target.total_params
+        ]
+        if not usable:
+            return None
+        return max(usable, key=lambda m: m.total_params)
+
     def with_overrides(self, specs: list[ModelSpec]) -> "Ladder":
         merged = {m.id: m for m in self.models}
         for spec in specs:

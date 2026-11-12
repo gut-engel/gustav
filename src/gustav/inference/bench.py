@@ -62,6 +62,10 @@ class BenchResult:
     samples: list[Sample] = field(default_factory=list)
     duration_seconds: float = 0.0
     notes: list[str] = field(default_factory=list)
+    #: Share of speculative proposals the target model accepted, when a draft model was
+    #: in use. The number that says whether speculation is earning its VRAM.
+    speculation_acceptance: float | None = None
+    draft_model: str | None = None
 
     def _median(self, attribute: str) -> float:
         values = [getattr(s, attribute) for s in self.samples if getattr(s, attribute)]
@@ -146,6 +150,17 @@ async def run_benchmark(
         )
     result.duration_seconds = round(time.monotonic() - started, 2)
 
+    backend = getattr(harness, "backend", None)
+    stats = getattr(backend, "speculation_stats", None)
+    if stats and stats.get("proposed"):
+        result.speculation_acceptance = round(stats["accepted"] / stats["proposed"], 4)
+        spec = getattr(backend, "draft_spec", None)
+        result.draft_model = getattr(spec, "id", None)
+        result.notes.append(
+            f"speculative decoding accepted {result.speculation_acceptance:.0%} of "
+            f"{stats['proposed']} proposals from {result.draft_model}"
+        )
+
     if measurements is not None and result.samples:
         record(measurements, result)
     return result
@@ -157,6 +172,7 @@ def record(measurements: Measurements, result: BenchResult) -> None:
         (METRIC_TOKENS_PER_SECOND, result.tokens_per_second),
         (METRIC_TTFT_MS, result.time_to_first_token_ms),
         (METRIC_VRAM_PEAK_MB, result.vram_peak_mb),
+        ("speculation.acceptance", result.speculation_acceptance),
     ):
         if value:
             measurements.record(

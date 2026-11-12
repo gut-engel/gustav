@@ -51,6 +51,35 @@ async def harness(paths, db, events, hardware, backend, repo_root):
     return instance
 
 
+@pytest.fixture
+def harness_factory(paths, db, events, hardware, repo_root):
+    """A harness with a backend whose reply the test chooses, and a small window."""
+    import shutil
+
+    from gustav.inference.conversation import ContextBudget
+
+    paths.registry.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(repo_root / "modules" / "registry.yaml", paths.registry)
+
+    def build(*, reply: str = "ok", max_seq_len: int = 400):
+        fake = FakeBackend(base_model="qwen3-4b", reply=reply)
+        instance = Harness(
+            config=Config.model_validate({"logging": {"console": False}}),
+            paths=paths,
+            hardware=hardware,
+            events=events,
+            telemetry=Telemetry(db),
+            db=db,
+            backend=fake,
+        )
+        instance._budget = lambda: ContextBudget(
+            max_seq_len=max_seq_len, reserve_for_completion=64
+        )
+        return instance, fake
+
+    return build
+
+
 # --- loading --------------------------------------------------------------
 async def test_loading_brings_up_the_backend(harness, backend):
     await harness.load()
@@ -272,3 +301,52 @@ async def test_a_failed_load_is_unhealthy(harness):
     ok, message = harness.health()
     assert not ok and "no weights" in message
     assert any("failed" in note for note in harness.describe()["notes"])
+
+
+# --- summarising the turns that fall out of the window --------------------
+async def _long_history(turns: int = 30) -> list[dict]:
+    """A conversation too long for a small window."""
+    history: list[dict] = []
+    for index in range(turns):
+        history.append({"role": "user", "content": f"message number {index} " + "x" * 200})
+        history.append({"role": "assistant", "content": f"answer number {index} " + "y" * 200})
+    return history
+
+
+async def test_old_turns_are_summarised_rather_than_dropped(harness_factory):
+    harness, backend = harness_factory(reply="earlier: the deploy script is ops/deploy.sh")
+    await harness.load()
+    reply = await harness.respond(
+        session_id=1, message="and where was it again?", history=await _long_history()
+    )
+    assert reply.text
+    # The prompt the model finally saw carries a summary as a system message.
+    final_prompt = backend.prompts[-1]
+    systems = [m["content"] for m in final_prompt if m["role"] == "system"]
+    assert any(s.startswith("Earlier context:") for s in systems), systems
+    assert "ops/deploy.sh" in " ".join(systems)
+
+
+async def test_summaries_are_cached_per_conversation(harness_factory):
+    harness, backend = harness_factory(reply="a summary")
+    history = await _long_history()
+    await harness.load()
+
+    before = len(backend.prompts)
+    await harness.respond(session_id=7, message="first", history=history)
+    first_cost = len(backend.prompts) - before
+    before = len(backend.prompts)
+    await harness.respond(session_id=7, message="second", history=history)
+    second_cost = len(backend.prompts) - before
+
+    assert first_cost == 2, "one generation for the summary, one for the answer"
+    assert second_cost == 1, "the second turn reuses the summary"
+
+
+async def test_summarising_can_be_switched_off(harness_factory):
+    harness, backend = harness_factory(reply="a summary")
+    harness.config.wake.summarise_history = False
+    await harness.load()
+    await harness.respond(session_id=1, message="hello", history=await _long_history())
+    systems = [m["content"] for m in backend.prompts[-1] if m["role"] == "system"]
+    assert not any(s.startswith("Earlier context:") for s in systems)

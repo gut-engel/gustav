@@ -31,6 +31,7 @@ from typing import Any
 
 from gustav.inference.adapters import AdapterStore
 from gustav.learn.bench import BenchItem, BenchmarkStore, score_answer, seed_regression_suite
+from gustav.learn.semantic import matcher_for
 from gustav.sandbox import Sandbox
 from gustav.sleep.stages._backup import weight_guard
 from gustav.sleep.stages._base import StepEnv, sleep_step
@@ -74,6 +75,7 @@ def measure(
     candidate: tuple[str, str] | None,
     sandbox: Sandbox,
     max_tokens: int,
+    matcher: Any = None,
 ) -> tuple[float, list[dict[str, Any]]]:
     if not items:
         return 0.0, []
@@ -86,7 +88,7 @@ def measure(
     detail: list[dict[str, Any]] = []
     passed = 0
     for item, answer in zip(items, answers, strict=True):
-        ok, why = score_answer(item, answer, sandbox=sandbox)
+        ok, why = score_answer(item, answer, sandbox=sandbox, matcher=matcher)
         passed += int(ok)
         detail.append({"prompt": item.prompt[:120], "passed": ok, "why": why[:160]})
     return passed / len(items), detail
@@ -161,6 +163,21 @@ def run_step(env: StepEnv) -> dict[str, Any]:
     guard = weight_guard(env)
     promotions = 0
 
+    # The semantic comparison is built once: the same reference answers are scored for
+    # the baseline and for every candidate, so their vectors are cached across both.
+    matcher = (
+        matcher_for(model, threshold=cfg.embedding_match)
+        if cfg.scorer == "embedding"
+        else None
+    )
+    result["scorer"] = "embedding" if matcher is not None else "overlap"
+    if cfg.scorer == "embedding" and matcher is None:
+        env.log(
+            "this backend cannot produce embeddings, so free-text answers are scored "
+            "by word overlap instead",
+            level="warning",
+        )
+
     for _index, row in env.each(list(trained), label="candidate", checkpoint_key="candidate_index"):
         module, version = row["module"], row["version"]
         active = adapters.active(module)
@@ -210,29 +227,42 @@ def run_step(env: StepEnv) -> dict[str, Any]:
             continue
 
         base_held, base_held_detail = measure(
-            env, model, held, candidate=None, sandbox=sandbox, max_tokens=cfg.max_new_tokens
+            env, model, held, candidate=None, sandbox=sandbox,
+            max_tokens=cfg.max_new_tokens, matcher=matcher,
         )
         cand_held, cand_held_detail = measure(
             env, model, held, candidate=(module, version), sandbox=sandbox,
-            max_tokens=cfg.max_new_tokens,
+            max_tokens=cfg.max_new_tokens, matcher=matcher,
         )
         base_reg, _ = measure(
             env, model, regression, candidate=None, sandbox=sandbox,
-            max_tokens=cfg.max_new_tokens,
+            max_tokens=cfg.max_new_tokens, matcher=matcher,
         )
         cand_reg, cand_reg_detail = measure(
             env, model, regression, candidate=(module, version), sandbox=sandbox,
-            max_tokens=cfg.max_new_tokens,
+            max_tokens=cfg.max_new_tokens, matcher=matcher,
         )
 
         improvement = cand_held - base_held
         forgotten = base_reg - cand_reg
-        passed = improvement >= cfg.min_improvement and forgotten <= cfg.max_regression
+        # A tie is not an improvement. `min_improvement: 0.0` means "any improvement
+        # at all", not "no worse" — changing the weights that are being served needs a
+        # measurement that moved, or there was no reason to change them.
+        passed = (
+            improvement > 0
+            and improvement >= cfg.min_improvement
+            and forgotten <= cfg.max_regression
+        )
         verdict = "pass" if passed else "fail"
         reason = (
             f"held-out {base_held:.2f} -> {cand_held:.2f} "
-            f"({improvement:+.2f}, needs {cfg.min_improvement:+.2f}); "
-            f"retention {base_reg:.2f} -> {cand_reg:.2f} "
+            f"({improvement:+.2f}"
+            + (
+                ", and a tie is not an improvement"
+                if improvement == 0
+                else f", needs more than {cfg.min_improvement:+.2f}"
+            )
+            + f"); retention {base_reg:.2f} -> {cand_reg:.2f} "
             f"({-forgotten:+.2f}, allowed {-cfg.max_regression:+.2f})"
         )
 

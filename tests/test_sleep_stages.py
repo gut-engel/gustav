@@ -477,7 +477,14 @@ class TwoVersionModel(ScriptedModel):
         return [answer for _ in prompts]
 
 
-def prepare_candidate(env, *, module: str = "coding", version: str = "v002", items: int = 10):
+def prepare_candidate(
+    env,
+    *,
+    module: str = "coding",
+    version: str = "v002",
+    items: int = 10,
+    match: str = "contains",
+):
     """A trained-but-unpromoted version, an active one, and a held-out suite."""
     adapters = env.paths.adapters / module
     write_adapter(adapters / "v001", version="v001")
@@ -494,7 +501,7 @@ def prepare_candidate(env, *, module: str = "coding", version: str = "v002", ite
             BenchItem(
                 prompt=f"question {index}",
                 expected="the right answer",
-                verifier={"match": "contains"},
+                verifier={"match": match},
                 module=module,
                 suite="heldout",
             )
@@ -761,3 +768,94 @@ def test_a_solved_task_becomes_a_runnable_retention_item(env_for, db):
     item = BenchmarkStore(db).suite("regression")[0]
     assert item.kind == "python"
     assert item.verifier["tests"] == "assert add(1, 2) == 3"
+
+
+# --- how the gate scores free text --------------------------------------
+def test_the_gate_says_which_scorer_it_used(env_for, db):
+    model = TwoVersionModel(baseline="wrong", candidate="the right answer")
+    env = env_for("gate", model=model)
+    prepare_candidate(env)
+    assert body(gate)(env)["scorer"] == "overlap", "no embeddings available"
+    assert any("word overlap instead" in message for _level, message in env.ctx.logs)
+
+
+def test_a_paraphrase_is_recognised_when_the_model_can_embed(env_for, db, stage_config):
+    """The gate's weakest link: without embeddings this candidate looks like a failure."""
+    paraphrase = "answer right the is this"  # the same words, a different sentence
+
+    class Paraphrasing(ScriptedModel):
+        def __init__(self):
+            super().__init__(available=True)
+            self.embeds = True
+
+        def evaluate(self, prompts, *, candidate=None, system=None, **_overrides):
+            self.candidates.append(candidate)
+            answer = paraphrase if candidate else "completely unrelated text here"
+            return [answer for _ in prompts]
+
+    env = env_for("gate", model=Paraphrasing())
+    prepare_candidate(env, match="prose")
+    result = body(gate)(env)
+
+    assert result["scorer"] == "embedding"
+    assert result["promoted"] == ["coding"]
+    row = db.query_one("SELECT detail FROM gate_results WHERE suite = 'heldout'")
+    assert "semantic" in row["detail"]
+
+
+def test_the_embedding_scorer_can_be_switched_off(env_for, db, stage_config):
+    stage_config.gate.scorer = "overlap"
+
+    class Paraphrasing(ScriptedModel):
+        def __init__(self):
+            super().__init__(available=True)
+            self.embeds = True
+
+        def evaluate(self, prompts, *, candidate=None, system=None, **_overrides):
+            return ["the right answer" if candidate else "wrong" for _ in prompts]
+
+    env = env_for("gate", model=Paraphrasing())
+    prepare_candidate(env)
+    result = body(gate)(env)
+    assert result["scorer"] == "overlap"
+    assert result["promoted"] == ["coding"], "it still promotes a genuinely better one"
+
+
+def test_a_candidate_that_ties_is_not_promoted(env_for, db):
+    """Nothing measured improved, so there is no reason to change the weights."""
+    env = env_for("gate", model=TwoVersionModel(baseline="wrong", candidate="also wrong"))
+    prepare_candidate(env)
+    result = body(gate)(env)
+
+    assert result["rejected"] == ["coding"]
+    assert "a tie is not an improvement" in result["candidates"]["coding"]["reason"]
+    assert (env.paths.adapters / "coding" / "active").readlink().name == "v001"
+
+
+# --- the report, with stage 6's work in it -------------------------------
+def test_the_report_shows_what_it_changed_about_itself(env_for, db, journal):
+    from gustav.core.journal import StepSpec
+
+    run = journal.create_run(
+        trigger="manual", steps=[StepSpec("expansion"), StepSpec("speed")]
+    )
+    db.insert(
+        "expansion_log",
+        {"run_id": run.id, "kind": "new_module", "subject": "kubernetes",
+         "rationale": "nine requests nothing covered", "status": "applied",
+         "snapshot_id": "20261111T000000-expansion", "detail": "registered it"},
+    )
+    db.insert(
+        "optimisations",
+        {"run_id": run.id, "setting": "prefix_cache", "previous": "True",
+         "candidate": "False", "baseline": 40.0, "measured": 60.0, "delta": 0.5,
+         "status": "kept", "detail": "+50.0% faster"},
+    )
+    env = env_for("report", run_id=run.id)
+    body(report)(env)
+
+    html = (env.paths.reports / f"run-{run.id:06d}.html").read_text(encoding="utf-8")
+    assert "What it changed about itself" in html
+    assert "kubernetes" in html and "new_module" in html
+    assert "What it measured about itself" in html
+    assert "prefix_cache" in html and "+50.0%" in html

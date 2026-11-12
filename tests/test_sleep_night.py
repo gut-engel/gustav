@@ -21,7 +21,6 @@ from gustav.config.load import load_config
 from gustav.core.events import Events
 from gustav.core.journal import Journal, RunStatus, StepStatus
 from gustav.core.supervisor import Supervisor
-from gustav.paths import Paths
 from gustav.sleep.pipeline import PipelineRunner, default_pipeline
 from gustav.store.db import open_db
 

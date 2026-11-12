@@ -1,0 +1,249 @@
+# Gustav configuration. Every key has a default, so this file may be empty.
+# Only the `tunable` section may ever be changed by the daemon itself.
+
+instance:
+  name: gustav
+  data_dir: var
+  # The CLI talks to the daemon over this Unix socket (default: <data_dir>/gustav.sock).
+  # socket: var/gustav.sock
+  http_enabled: false
+  http_host: 127.0.0.1
+  http_port: 8713
+  # http_token: set this before exposing the TCP port to anything but localhost
+
+logging:
+  level: INFO
+  console: true
+  json_lines: false
+
+schedule:
+  enabled: true
+  # Local-time windows in which the daemon is allowed to sleep.
+  windows: ["00:00-06:00"]
+  # Sleep after this much user silence (inside a window, or when pending work is high).
+  idle_trigger_enabled: true
+  idle_minutes: 45
+  # Sleep once this much unprocessed experience has piled up.
+  pending_trigger_enabled: true
+  pending_threshold: 50
+  # Don't sleep at all with less than this much to do (0 = sleep anyway).
+  min_pending_items: 1
+  # Never interrupt a conversation: require this much silence first.
+  min_idle_seconds: 120
+  cooldown_minutes: 60
+  max_duration_minutes: 300
+  max_gpu_temp_c: 83
+  # Stay awake while something else is using the GPU — a game, another model, a render.
+  # Sleeping would mean fighting it for the card.
+  max_foreign_vram_mb: 2048
+  max_foreign_gpu_percent: 35
+  tick_seconds: 5.0
+
+hardware:
+  # "auto" runs the planner at startup and writes profiles/auto-generated.yaml.
+  # Any other name loads profiles/<name>.yaml and pins whatever it sets.
+  profile: auto
+  # The one knob: 0.0 = as fast as possible, 1.0 = as capable as possible.
+  # It works by raising the speed floor, which moves the choice along the model ladder.
+  balance: 0.5
+  # Chat speed we refuse to go below.
+  min_tokens_per_second: 15
+  # Left free on every GPU for other software (the measured usage of other processes
+  # counts against the same allowance rather than on top of it).
+  vram_reserve_fraction: 0.15
+  ram_reserve_mb: 8192
+  disk_reserve_mb: 10240
+  # Only choose a model that can also train here. Set false to serve a bigger model and
+  # train on another machine.
+  allow_training: true
+  require_training: true
+  # Empty = decide from the detected GPUs: with two or more cards one serves and the
+  # rest train, so chat stays up during sleep.
+  inference_gpus: []
+  training_gpus: []
+  # max_seq_len: 2048        # let the planner choose, or pin it
+  # train_seq_len: 1024
+  kv_cache_dtype: auto       # auto | fp16 | bf16 | int8 | fp8
+  speculative_decoding: auto # auto | on | off
+  # prefer_model: qwen3-4b   # pin a base model from the ladder
+  # deny_models: [qwen3-30b-a3b]
+  replan_on_hardware_change: true
+
+backup:
+  # Nothing that changes weights runs without a verified snapshot first (section 9).
+  enabled: true
+  # Ideally another disk, or a remote path. Default: <project>/backups
+  # location: /mnt/backup/gustav
+  # Keep the last N, plus one a day for M days and one a week for K weeks. The newest
+  # snapshot and any referenced by a pending approval are never deleted.
+  keep_last: 5
+  daily_days: 7
+  weekly_weeks: 4
+  # Refuse a snapshot that would leave less than this free; warn below warn_free_mb
+  # rather than deleting backups to make room.
+  min_free_mb: 5120
+  warn_free_mb: 20480
+
+inference:
+  # auto = the real harness when the ML extras are installed; echo = a placeholder
+  # responder that needs no GPU or weights (useful for development and tests).
+  responder: auto
+  max_tokens: 512
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 20
+  repetition_penalty: 1.05
+  # stop: ["\nUser:"]
+
+supervisor:
+  # A child that stops heart-beating for this long is killed and retried.
+  heartbeat_timeout_seconds: 60
+  step_timeout_seconds: 1800
+  memory_limit_mb: 16384
+  max_attempts: 3
+  retry_backoff_seconds: 10
+  retry_backoff_factor: 2.0
+
+sleep:
+  # disabled_steps: [dreaming]
+  # Steps that still run the simulated placeholder handler. Both belong to stage 6; the
+  # report says so rather than pretending they did something.
+  simulated_steps: [expansion, speed]
+  simulated_step_seconds: 0.5
+  # Share of every training mix drawn from what earlier nights already learned, so new
+  # data cannot quietly overwrite old skills.
+  replay_fraction: 0.30
+  # Share of new examples held back for the gate. Never trained on, and which side of
+  # the line an example lands on is derived from its content, not from a shuffle.
+  heldout_fraction: 0.15
+  # How many topics a night may study, and the pass rate below which one counts as weak.
+  max_topics_per_run: 5
+  weak_score_threshold: 0.6
+  lookback_hours: 72
+  max_facts_per_run: 200
+  max_examples_per_run: 2000
+  # Use the model for consolidation and study. Off = only the deterministic extractors
+  # run: much less data, but no GPU and no model errors in the dataset.
+  use_model: true
+  max_new_tokens: 384
+
+fetcher:
+  # The only component that touches the network. Off = study local_sources and whatever
+  # is already in var/doc_cache.
+  enabled: true
+  # Nothing outside this list is ever requested, and a redirect that leaves it is
+  # dropped rather than followed. docs/sources.yaml decides which pages, and records
+  # the licence of each source.
+  allowed_hosts:
+    - docs.python.org
+    - doc.rust-lang.org
+    - docs.rs
+    - developer.mozilla.org
+    - pkg.go.dev
+    - peps.python.org
+  # Local directories to study from. Relative paths are inside the project.
+  local_sources: []
+  max_documents_per_run: 12
+  cache_ttl_hours: 168
+  delay_seconds: 1.0        # be a polite client: one request per host per second
+
+sandbox:
+  # Where practice answers are run. Nothing here trusts the model's own opinion.
+  timeout_seconds: 10
+  memory_limit_mb: 1024
+  isolate_env: true
+  # python: /usr/bin/python3   # default: the interpreter running the daemon
+
+training:
+  enabled: true
+  # rank: 16                 # default: whatever the hardware plan chose
+  learning_rate: 0.0001
+  grad_accum: 8
+  epochs: 1.0
+  # Ceilings, not targets: whichever is hit first stops training.
+  max_steps: 200
+  max_seconds: 1800
+  min_examples: 16
+  # Train only on examples something other than the model agreed with. Strict: it drops
+  # cited study answers and self-consistent rewrites.
+  verified_only: false
+  checkpoint_every_steps: 25
+  # modules: [coding, rust]  # default: every module with enough new material
+
+gate:
+  enabled: true
+  # A candidate must improve the held-out score by at least this much...
+  min_improvement: 0.0
+  # ...and may not lose more than this on what it already knew.
+  max_regression: 0.02
+  # Below this many items there is no measurement, so the gate skips instead of
+  # promoting on three questions.
+  min_items: 8
+  max_items: 120
+  # One module per night: if something breaks tomorrow, the cause is unambiguous.
+  max_promotions_per_run: 1
+
+wake:
+  # Release the GPU after this long without a message, so the VRAM is free for whatever
+  # else you are doing. The next message reloads the model (a second or two).
+  # Set to 0 to keep the model resident.
+  idle_unload_minutes: 15
+  max_history_turns: 40
+
+maintenance:
+  health_check_minutes: 5
+  hardware_recheck_minutes: 60
+  backup_retention_minutes: 360
+  doc_cache_refresh_hours: 24
+
+# Self-optimisation may change these values and nothing else.
+tunable:
+  kv_cache_dtype: auto
+  batch_size: 1
+  speculative_decoding: false
+  router_threshold: 0.45
+  # Reuse the KV cache across turns of a conversation. Big speed win; the cost is that
+  # a greedy answer is no longer bit-identical to the same question asked cold.
+  prefix_cache: true
+  prefix_cache_mb: 512
+  warm_cache_mb: 8192
+
+expansion:
+  # Section 8: growing its own capacity, within a budget the hardware sets. The triggers
+  # are measurements it already takes — requests no module covered, a module that stopped
+  # improving, one nothing uses.
+  enabled: true
+  # One structural change per night, so tomorrow's "what broke" has one answer.
+  max_changes_per_run: 1
+  # A new module needs this many requests nothing covered, sharing enough vocabulary to
+  # be one subject rather than a pile of unrelated questions.
+  min_uncovered_requests: 8
+  min_cluster_share: 0.4
+  # "Saturated": this many gate results in a row that moved the score less than this.
+  saturation_runs: 3
+  saturation_delta: 0.01
+  rank_step: 8
+  unused_days: 30
+  allow_new_modules: true
+  allow_rank_increase: true
+  # Archiving a module changes what the system can do, so it is off by default.
+  allow_pruning: false
+  # Merging an adapter into the base rewrites the weights everything else is built on.
+  # Off, and approval-gated even when on.
+  allow_base_merge: false
+  require_approval: [merge_to_base, prune_module, new_module]
+
+optimisation:
+  # Section 10: it may change `tunable` values and nothing else, and only on a
+  # measurement. What it learns goes in var/tunable.yaml, underneath this file.
+  enabled: true
+  # Only settings the serving path actually reads. batch_size is not here: requests are
+  # served one at a time, so measuring it would be measuring noise.
+  settings: [prefix_cache, kv_cache_dtype, warm_cache_mb, speculative_decoding]
+  max_trials_per_run: 2
+  bench_tokens: 96
+  bench_repeats: 2
+  # A win has to be this much faster...
+  min_relative_gain: 0.05
+  # ...and may not cost more than this on the held-out suite.
+  max_quality_loss: 0.02

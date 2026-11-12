@@ -74,6 +74,14 @@ class ScriptedModel:
         self.candidates: list[tuple[str, str] | None] = []
         self.calls = 0
         self._index = 0
+        #: Speed and quality this model reports, for self-optimisation trials. Either a
+        #: number or a callable taking the tunable settings in force.
+        self.speeds: Any = None
+        self.qualities: Any = None
+        #: When True, the model offers embeddings, so the gate can score semantically.
+        self.embeds = False
+        self.settings: dict[str, Any] = {}
+        self.benchmarks = 0
 
     def _answer_for(self, prompt: str) -> str | None:
         self.calls += 1
@@ -116,6 +124,44 @@ class ScriptedModel:
     def ask_batch(self, prompts: Sequence[Any], **kwargs: Any) -> list[str | None]:
         return [self.ask(p, **kwargs) for p in prompts]
 
+    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        """A bag-of-words stand-in: same words, same vector."""
+        if not self.embeds:
+            raise NotImplementedError("this ScriptedModel does not embed")
+        import math
+        import zlib
+
+        dimensions = 128
+        out: list[list[float]] = []
+        for text in texts:
+            vector = [0.0] * dimensions
+            for word in str(text).lower().split():
+                # crc32, not hash(): Python's hash is randomised per process, which
+                # would make these vectors — and any test that compares them — depend
+                # on the interpreter's seed.
+                vector[zlib.crc32(word.encode("utf-8")) % dimensions] += 1.0
+            length = math.sqrt(sum(v * v for v in vector)) or 1.0
+            out.append([v / length for v in vector])
+        return out
+
+    # --- measuring, for the self-optimisation trials --------------------
+    def benchmark(self, *, max_tokens: int = 96, repeats: int = 1) -> dict[str, Any]:
+        if not self.available:
+            raise RuntimeError(self.error or "no model to benchmark")
+        if self.speeds is None:
+            raise RuntimeError("this ScriptedModel was not given any speeds to report")
+        self.benchmarks += 1
+        value = self.speeds(dict(self.settings)) if callable(self.speeds) else self.speeds
+        return {"tokens_per_second": float(value), "samples": 1}
+
+    def quality(self, items: Sequence[tuple[str, str]]) -> float | None:
+        if self.qualities is None:
+            return None
+        value = self.qualities(dict(self.settings)) if callable(self.qualities) else (
+            self.qualities
+        )
+        return float(value)
+
     def close(self) -> None:
         return None
 
@@ -145,9 +191,18 @@ def make_env(
         checkpoint=dict(checkpoint or {}),
         dry_run=dry_run,
     )
-    # Steps reach the model through env.model(); pre-setting it is how a test decides
-    # what the model says — or that there is not one.
-    env._model = model if model is not None else ScriptedModel(available=False)
+    # Steps reach the model through env.model() and env.new_model(); setting both is
+    # how a test decides what the model says — or that there is not one.
+    scripted = model if model is not None else ScriptedModel(available=False)
+
+    def factory(current: StepEnv) -> ScriptedModel:
+        # The tunable settings in force when the handle was asked for, so a test can
+        # make the reported speed depend on them the way a real model would.
+        scripted.settings = current.config.tunable.model_dump()
+        return scripted
+
+    env._model = scripted
+    env.model_factory = factory
     return env
 
 
@@ -191,6 +246,42 @@ def seed_feedback(
         "feedback",
         {"turn_id": turn_id, "kind": kind, "payload": payload, "source": "user", "reviewed": 1},
     )
+
+
+def store_plan(
+    db: Database,
+    *,
+    base_model: str = "qwen3-4b",
+    lora_rank: int = 16,
+    max_adapters: int = 6,
+    max_lora_rank: int = 32,
+    training_allowed: bool = True,
+    speculative_decoding: bool = False,
+) -> dict[str, Any]:
+    """A plausible hardware plan in the store, for steps that refuse without one."""
+    from gustav.hw.service import META_PLAN
+
+    plan = {
+        "base_model": base_model, "repo": f"Qwen/{base_model}", "quantization": "4bit-nf4",
+        "max_seq_len": 4096, "kv_cache_dtype": "fp16", "compute_dtype": "bfloat16",
+        "attention": "sdpa", "lora_rank": lora_rank, "train_seq_len": 1024,
+        "batch_size": 1, "grad_accum": 8, "gradient_checkpointing": True,
+        "optimizer": "paged_adamw_8bit", "speculative_decoding": speculative_decoding,
+        "draft_model": "qwen3-0.6b" if speculative_decoding else None,
+        "inference_gpus": [0], "training_gpus": [0],
+        "training_allowed": training_allowed, "training_strategy": "qlora",
+        "estimated_tokens_per_second": 36.0, "speed_measured": False,
+        "vram_inference_mb": 4500.0, "vram_training_mb": 5400.0, "ram_required_mb": 8000.0,
+        "expansion": {
+            "max_adapters": max_adapters, "max_lora_rank": max_lora_rank,
+            "max_total_adapter_params": 200_000_000, "max_adapter_vram_mb": 1024,
+            "warm_cache_mb": 8192, "cold_storage_mb": 65536,
+            "reserved_headroom_fraction": 0.1,
+        },
+        "balance": 0.5, "min_tokens_per_second": 15.0, "fingerprint": "test",
+    }
+    db.set_meta(META_PLAN, plan)
+    return plan
 
 
 def write_adapter(path: Path, *, base_model: str = "fake-model", version: str = "v001") -> Path:

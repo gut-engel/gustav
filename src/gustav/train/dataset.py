@@ -42,6 +42,13 @@ class Sample:
     module: str = "general"
     example_id: int | None = None
     replay: bool = False
+    #: The worse answer, when this example is a preference pair. Only a preference
+    #: objective uses it; plain SFT trains the preferred side and ignores it.
+    rejected: str | None = None
+
+    @property
+    def is_pair(self) -> bool:
+        return bool(self.rejected and self.rejected.strip())
 
     @classmethod
     def from_row(cls, row: dict[str, Any], *, replay: bool = False) -> "Sample":
@@ -53,6 +60,7 @@ class Sample:
             module=row.get("module") or "general",
             example_id=row.get("id"),
             replay=replay,
+            rejected=row.get("rejected"),
         )
 
 
@@ -75,6 +83,11 @@ class Mix:
     @property
     def replay(self) -> int:
         return len(self.replay_ids)
+
+    @property
+    def pairs(self) -> int:
+        """How many examples carry a rejected answer as well as a preferred one."""
+        return sum(1 for s in self.samples if s.is_pair)
 
     def describe(self) -> str:
         kinds = ", ".join(f"{n} {k}" for k, n in sorted(self.by_kind.items()))

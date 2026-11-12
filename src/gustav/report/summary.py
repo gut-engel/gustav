@@ -46,6 +46,37 @@ def step_summary(name: str, result: dict[str, Any] | None) -> str:
             bits.append(str(result["reason"]))
         return "; ".join(bits) or "nothing to gate"
 
+    if name == "expansion":
+        bits = []
+        for item in result.get("applied") or []:
+            bits.append(f"{item.get('kind')} {item.get('subject')}")
+        for item in result.get("pending") or []:
+            bits.append(f"{item.get('kind')} {item.get('subject')} needs approval")
+        if result.get("refused"):
+            bits.append(f"{len(result['refused'])} refused")
+        if not bits and result.get("reason"):
+            return str(result["reason"])
+        return "; ".join(bits) or "nothing to grow"
+
+    if name == "speed":
+        bits = []
+        router = result.get("router") or {}
+        if router.get("installed"):
+            bits.append("router refitted")
+        elif router.get("reason"):
+            bits.append(f"router kept ({router['reason']})")
+        optimisation = result.get("optimisation") or {}
+        if optimisation.get("kept"):
+            bits.append(
+                "kept " + ", ".join(f"{k}={v}" for k, v in optimisation["kept"].items())
+            )
+        elif optimisation.get("trials"):
+            bits.append(f"{len(optimisation['trials'])} trial(s), nothing kept")
+        draft = result.get("draft") or {}
+        if draft.get("acceptance") is not None:
+            bits.append(f"speculation accepted {draft['acceptance']:.0%}")
+        return "; ".join(bits) or str(result.get("reason") or "")
+
     if name == "reflect" and result.get("topics"):
         topics = ", ".join(
             f"{t.get('module')}/{t.get('topic')}" for t in result["topics"][:6]

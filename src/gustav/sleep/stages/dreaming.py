@@ -26,7 +26,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from gustav.learn.code import extract_python
 from gustav.learn.examples import Example
 from gustav.learn.tasks import Task, TaskStore
 from gustav.sleep.stages._base import StepEnv, sleep_step

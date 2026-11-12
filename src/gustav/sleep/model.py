@@ -183,6 +183,60 @@ class StepModel:
         self.calls += len(messages)
         return [(g.text or "").strip() if g is not None else None for g in generations]
 
+    # --- measuring ------------------------------------------------------
+    def benchmark(self, *, max_tokens: int = 96, repeats: int = 1) -> dict[str, Any]:
+        """Tokens per second on the fixed benchmark prompts.
+
+        Deliberately *not* recorded into ``Measurements``: a self-optimisation trial
+        may be running the system in a configuration it is about to throw away, and the
+        planner's speed measurement must come from the configuration actually in use.
+        """
+        from gustav.inference.bench import run_benchmark
+
+        if not self.available:
+            raise RuntimeError(self.error or "no model to benchmark")
+        result = self._run(
+            run_benchmark(
+                self._harness,
+                max_tokens=max_tokens,
+                repeats=repeats,
+                include_long_prompt=False,
+                measurements=None,
+            )
+        )
+        return {
+            "tokens_per_second": result.tokens_per_second,
+            "time_to_first_token_ms": result.time_to_first_token_ms,
+            "vram_peak_mb": result.vram_peak_mb,
+            "samples": len(result.samples),
+        }
+
+    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        """Embeddings for the gate's semantic comparison. Raises if unsupported."""
+        if not self.available:
+            raise RuntimeError(self.error or "no model to embed with")
+        return self._run(self._harness.backend.embed(list(texts)))
+
+    def quality(self, items: Sequence[tuple[str, str]]) -> float | None:
+        """Share of (prompt, expected) pairs the model answers acceptably.
+
+        The same blunt prose comparison the gate uses, on the same held-out material —
+        the point is not to grade the model but to notice a setting that makes the
+        answers worse.
+        """
+        from gustav.learn.bench import BenchItem, score_answer
+
+        if not items or not self.available:
+            return None
+        answers = self.evaluate([prompt for prompt, _ in items], temperature=0.0,
+                                max_tokens=128)
+        passed = 0
+        for (prompt, expected), answer in zip(items, answers, strict=True):
+            item = BenchItem(prompt=prompt, expected=expected, verifier={"match": "prose"})
+            ok, _why = score_answer(item, answer)
+            passed += int(ok)
+        return round(passed / len(items), 4)
+
     def ask_batch(
         self,
         prompts: Sequence[str | Sequence[Message]],

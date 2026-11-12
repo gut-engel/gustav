@@ -163,3 +163,23 @@ def test_overrides_keep_the_ladder_position(ladder, tmp_path):
     assert merged.model("qwen3-4b").verified
     assert merged.model("qwen3-4b").rung == original.rung       # position preserved
     assert merged.model("qwen3-4b").quantizations == original.quantizations
+
+
+# --- draft models ---------------------------------------------------------
+def test_a_draft_has_to_be_much_smaller_than_what_it_drafts_for(ladder):
+    """A draft that is nearly as big costs nearly as much, and saves nothing."""
+    assert ladder.draft_for(ladder.model("qwen3-0.6b")) is None
+    draft = ladder.draft_for(ladder.model("qwen3-4b"))
+    assert draft is not None
+    assert draft.total_params * ladder.DRAFT_RATIO < ladder.model("qwen3-4b").total_params
+
+
+def test_the_largest_usable_draft_is_chosen(ladder):
+    """Acceptance decides whether speculation pays, and a better draft is accepted more."""
+    draft = ladder.draft_for(ladder.model("qwen3-14b"))
+    smaller = [
+        m for m in ladder.draft_models()
+        if m.total_params * ladder.DRAFT_RATIO < ladder.model("qwen3-14b").total_params
+    ]
+    assert draft is not None
+    assert draft.total_params == max(m.total_params for m in smaller)

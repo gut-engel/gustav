@@ -380,8 +380,58 @@ MIGRATION_0003 = [
     "CREATE INDEX idx_gate_run ON gate_results (run_id, module)",
 ]
 
+MIGRATION_0004 = [
+    # Section 8: every structural change the system proposes about itself, whether it
+    # was applied, waved through, refused or reverted. The snapshot id is what makes
+    # `ai expansion --revert` possible, and the evidence is what makes the proposal
+    # reviewable instead of a thing that happened in the night.
+    """
+    CREATE TABLE expansion_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        decided_at  TEXT,
+        run_id      INTEGER,
+        kind        TEXT NOT NULL,
+                    -- new_module | raise_rank | prune_module | merge_to_base
+        subject     TEXT NOT NULL,
+        rationale   TEXT,
+        evidence    TEXT,
+        cost        TEXT,
+        payload     TEXT,
+        status      TEXT NOT NULL DEFAULT 'proposed',
+                    -- proposed | applied | pending | rejected | reverted | failed
+        approval_id INTEGER,
+        snapshot_id TEXT,
+        detail      TEXT
+    )
+    """,
+    "CREATE INDEX idx_expansion_status ON expansion_log (status, id DESC)",
+    # Section 10: self-optimisation is only allowed to touch `tunable`, and only on a
+    # measurement. One row per trial: what it changed, what it measured before and
+    # after, and whether the change was kept.
+    """
+    CREATE TABLE optimisations (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        run_id      INTEGER,
+        setting     TEXT NOT NULL,
+        previous    TEXT,
+        candidate   TEXT,
+        metric      TEXT NOT NULL DEFAULT 'tokens_per_second',
+        baseline    REAL,
+        measured    REAL,
+        delta       REAL,
+        status      TEXT NOT NULL DEFAULT 'trialled',
+                    -- trialled | kept | reverted | refused | failed
+        detail      TEXT
+    )
+    """,
+    "CREATE INDEX idx_optimisations_setting ON optimisations (setting, id DESC)",
+]
+
 MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (1, "initial_daemon_schema", MIGRATION_0001),
     (2, "weight_change_log", MIGRATION_0002),
     (3, "learning_store", MIGRATION_0003),
+    (4, "expansion_and_optimisation", MIGRATION_0004),
 ]

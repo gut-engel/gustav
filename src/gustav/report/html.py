@@ -316,6 +316,55 @@ def render_run(db: Database, run_id: int, *, instance: str = "gustav") -> str:
             )
         out.append("</table>")
 
+    # --- what it changed about itself -----------------------------------
+    expansion = db.query(
+        "SELECT * FROM expansion_log WHERE run_id = ? ORDER BY id", (run_id,)
+    )
+    if expansion:
+        out.append("<h2>What it changed about itself</h2><table><tr><th>change</th>"
+                   "<th>subject</th><th>status</th><th>why</th></tr>")
+        for row in expansion:
+            out.append(
+                f"<tr><td><code>{escape(row['kind'])}</code></td>"
+                f"<td>{escape(row['subject'])}</td>"
+                f"<td>{_pill(row['status'])}</td>"
+                f"<td>{escape(str(row['rationale'] or ''))}"
+                + (
+                    f"<br><span class=muted>{escape(str(row['detail'])[:200])}</span>"
+                    if row["detail"]
+                    else ""
+                )
+                + "</td></tr>"
+            )
+        out.append("</table>")
+
+    trials = db.query(
+        "SELECT * FROM optimisations WHERE run_id = ? ORDER BY id", (run_id,)
+    )
+    if trials:
+        out.append("<h2>What it measured about itself</h2><table><tr><th>setting</th>"
+                   "<th>tried</th><th class=num>before</th><th class=num>after</th>"
+                   "<th class=num>change</th><th>verdict</th></tr>")
+        for row in trials:
+            delta = row["delta"]
+            cls = "good" if (delta or 0) > 0 else ("bad" if (delta or 0) < 0 else "muted")
+            change = f"{delta:+.1%}" if delta is not None else "—"
+            out.append(
+                f"<tr><td><code>{escape(row['setting'])}</code></td>"
+                f"<td><code>{escape(str(row['candidate']))}</code></td>"
+                f"<td class=num>{_fmt(row['baseline'])}</td>"
+                f"<td class=num>{_fmt(row['measured'])}</td>"
+                f"<td class='num {cls}'>{escape(change)}</td>"
+                f"<td>{_pill(row['status'])}"
+                + (
+                    f"<br><span class=muted>{escape(str(row['detail'])[:160])}</span>"
+                    if row["detail"]
+                    else ""
+                )
+                + "</td></tr>"
+            )
+        out.append("</table>")
+
     gaps = results.get("reflect", {}).get("gaps") or []
     if gaps:
         out.append(

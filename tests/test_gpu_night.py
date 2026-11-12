@@ -56,8 +56,8 @@ inference:
   responder: auto
   max_tokens: 128
 sleep:
-  simulated_steps: [expansion, speed]
-  heldout_fraction: 0.5      # a tiny night still needs something to measure with
+  simulated_steps: []         # every step, for real
+  heldout_fraction: 0.5       # a tiny night still needs something to measure with
   max_new_tokens: 128
 supervisor:
   heartbeat_timeout_seconds: 120
@@ -79,6 +79,15 @@ gate:
   min_items: 2
   max_items: 6
   max_new_tokens: 64
+expansion:
+  min_uncovered_requests: 3
+optimisation:
+  # One trial, short: the point is that the loop runs and records a verdict, not to
+  # tune this machine from a test.
+  max_trials_per_run: 1
+  bench_tokens: 24
+  bench_repeats: 1
+  settings: [prefix_cache]
 backup:
   location: backups
   min_free_mb: 1
@@ -264,6 +273,20 @@ async def test_a_real_night_end_to_end(night):
             if key not in ("step", "by_topic", "candidates", "documents", "skills", "topics")
         }
         print(f"{step.name:14} {str(step.status):10} {summary}")
+
+    # Stage 6's two steps ran for real.
+    expansion = results["expansion"]
+    assert "reason" in expansion or expansion["triggers"] is not None
+    speed = results["speed"]
+    assert "router" in speed and "optimisation" in speed
+    # Nothing on the ladder is small enough to draft for a 0.6B model, and saying so is
+    # the right answer rather than naming one that would cost more than it saves.
+    assert speed["draft"]["draft_model"] is None
+    assert "small enough" in speed["draft"]["reason"]
+    trials = db.query("SELECT * FROM optimisations WHERE run_id = ?", (run.id,))
+    for row in trials:
+        assert row["status"] in ("kept", "reverted", "refused", "failed")
+        assert row["setting"] == "prefix_cache"
 
     # And the night wrote its report.
     report = paths.reports / f"run-{run.id:06d}.html"

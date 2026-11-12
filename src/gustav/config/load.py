@@ -15,6 +15,11 @@ from gustav.paths import Paths
 ENV_CONFIG = "GUSTAV_CONFIG"
 ENV_DATA_DIR = "GUSTAV_DATA_DIR"
 
+#: Where self-optimisation writes what it has learned. It is a separate file from
+#: config.yaml on purpose: the daemon may only ever change `tunable`, and a file it owns
+#: cannot be confused with the one you own — or clobber your comments.
+LEARNED_TUNABLE = "tunable.yaml"
+
 
 class ConfigError(RuntimeError):
     """Raised with a human-readable explanation of what is wrong in config.yaml."""
@@ -88,6 +93,17 @@ def load_config(
             )
         data = deep_merge(data, {"hardware": _read_yaml(profile_file)})
 
+    # What self-optimisation has learned, *under* config.yaml: anything you pin in
+    # your own file wins, which is the same rule the hardware profile follows. The
+    # daemon can only ever propose values for keys you have left alone.
+    data_dir = os.environ.get(ENV_DATA_DIR) or (data.get("instance") or {}).get(
+        "data_dir", "var"
+    )
+    learned_file = _resolve_data_dir(project_root, data_dir) / LEARNED_TUNABLE
+    learned = _read_yaml(learned_file)
+    if learned:
+        data = deep_merge({"tunable": learned}, data)
+
     if overrides:
         data = deep_merge(data, overrides)
 
@@ -102,6 +118,40 @@ def load_config(
 
     paths = Paths.create(project_root, config.instance.data_dir)
     return config, paths
+
+
+def _resolve_data_dir(root: Path, data_dir: Path | str) -> Path:
+    path = Path(data_dir).expanduser()
+    return path if path.is_absolute() else root / path
+
+
+def pinned_tunables(config_path: Path | str) -> set[str]:
+    """Which `tunable` keys *you* set, and self-optimisation therefore may not touch."""
+    data = _read_yaml(Path(config_path))
+    section = data.get("tunable")
+    return set(section) if isinstance(section, dict) else set()
+
+
+def read_learned_tunable(data_dir: Path | str) -> dict[str, Any]:
+    return _read_yaml(Path(data_dir) / LEARNED_TUNABLE)
+
+
+def write_learned_tunable(data_dir: Path | str, values: dict[str, Any]) -> Path:
+    """Record what self-optimisation decided. Written atomically; comments are ours."""
+    directory = Path(data_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / LEARNED_TUNABLE
+    header = (
+        "# Written by gustav's self-optimisation (section 10). It may only ever change\n"
+        "# values in this file, and anything you set in config.yaml wins over it.\n"
+        "# Delete this file to go back to the defaults; `ai optimize --revert` undoes\n"
+        "# the last change it made.\n"
+    )
+    body = yaml.safe_dump(dict(sorted(values.items())), sort_keys=False) if values else ""
+    temporary = path.with_name(f".{path.name}.part")
+    temporary.write_text(header + body, encoding="utf-8")
+    temporary.replace(path)
+    return path
 
 
 def _explain(exc: ValidationError) -> str:

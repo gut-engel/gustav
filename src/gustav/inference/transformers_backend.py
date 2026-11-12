@@ -157,6 +157,10 @@ class TransformersBackend(InferenceBackend):
         reserve_fraction: float = 0.15,
         prefix_cache: bool = True,
         thinking: bool = False,
+        speculative: bool = False,
+        draft: ModelSpec | None = None,
+        draft_quant: QuantSpec | None = None,
+        speculative_lookahead: int = 4,
         logger=None,
     ):
         from gustav.core.logs import get_logger
@@ -191,6 +195,21 @@ class TransformersBackend(InferenceBackend):
         #: it, prefilling a 3000-token prompt materialises 3000 x vocab logits — about a
         #: gigabyte of VRAM for nothing, since only the last row is ever sampled.
         self._logits_kwarg: str | None = None
+        #: Speculative decoding: a small model proposes, this one verifies. Exact for
+        #: greedy decoding — the accepted tokens are the ones this model would have
+        #: produced anyway — so it is a pure speed trade and nothing else.
+        self.speculative = speculative
+        self.draft_spec = draft
+        #: The draft's own quantisation. It matters more than it looks: at batch 1 a
+        #: decode step costs roughly what it costs to stream the weights through the
+        #: memory bus, so an unquantised 0.6B draft costs *half* a 4-bit 4B target step
+        #: and speculation ends up slower than not speculating.
+        self.draft_quant = draft_quant
+        self.speculative_lookahead = max(int(speculative_lookahead), 1)
+        self._draft_model: Any = None
+        self._speculative_notes: list[str] = []
+        #: Accepted / proposed, for the report and `ai bench`.
+        self.speculation_stats = {"proposed": 0, "accepted": 0, "rounds": 0}
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -212,12 +231,21 @@ class TransformersBackend(InferenceBackend):
             )
         index = self.plan.inference_gpus[0] if self.plan.inference_gpus else 0
         gpu = self.hardware.gpu(index)
+        # The draft model is part of the footprint when speculation is on: the whole
+        # point of the pre-flight is to refuse before CUDA does, and a draft model is
+        # most of a gigabyte.
+        draft = (
+            (self.draft_spec, self.draft_quant or self.quant)
+            if self.speculative and self.draft_spec is not None
+            else None
+        )
         estimate = inference_estimate(
             self.spec,
             self.quant,
             seq_len=self.plan.max_seq_len,
             kv_dtype=self.plan.kv_cache_dtype,
             adapter_count=max(len(self._adapters), 1),
+            draft=draft,
         )
         result = check_vram(
             estimate,
@@ -297,6 +325,11 @@ class TransformersBackend(InferenceBackend):
             )
         if self.prefix_cache_enabled:
             self._prefix = _PrefixCache(logger=self.log)
+        if self.speculative and self.draft_spec is not None:
+            # Same attention kernel as the target: different kernels disagree about
+            # near-ties, which costs accepted proposals for no reason.
+            self._load_draft_blocking(dtype, attention=attention)
+            notes.extend(self._speculative_notes)
 
         vram = torch.cuda.memory_allocated(index) / MIB
         self._load_report = LoadReport(
@@ -314,6 +347,82 @@ class TransformersBackend(InferenceBackend):
             self.spec.label, path, self._load_report.load_seconds, self.quant.id,
             attention, vram,
         )
+
+    # --- the draft model, for speculative decoding ----------------------
+    def _load_draft_blocking(self, dtype: Any, *, attention: str = "sdpa") -> None:
+        """Load the draft model, or explain in the notes why speculation is off.
+
+        It must share the target's tokenizer exactly: speculative decoding compares
+        *token ids*, so two models that tokenise "hello" differently would reject every
+        proposal and quietly make generation slower rather than faster.
+        """
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        assert self.draft_spec is not None
+        try:
+            path = resolve_model_path(self.models_dir, self.draft_spec)
+        except BackendError as exc:
+            self._speculative_notes.append(f"no draft model, so no speculation: {exc}")
+            return
+
+        probe = "Speculative decoding needs identical tokenisation: 1.2.3 — ✅ héllo"
+        try:
+            draft_tokenizer = AutoTokenizer.from_pretrained(str(path), local_files_only=True)
+            if draft_tokenizer(probe)["input_ids"] != self._tokenizer(probe)["input_ids"]:
+                self._speculative_notes.append(
+                    f"{self.draft_spec.id} does not tokenise identically to "
+                    f"{self.spec.id}, so it cannot be a draft model"
+                )
+                return
+            kwargs: dict[str, Any] = {
+                "local_files_only": True,
+                "trust_remote_code": False,
+                "device_map": {"": self._device_index},
+            }
+            quant_config = (
+                quantization_config(self.draft_quant, dtype)
+                if self.draft_quant is not None
+                else None
+            )
+            if quant_config is not None:
+                kwargs["quantization_config"] = quant_config
+            else:
+                kwargs["dtype"] = dtype
+
+            self._draft_model = None
+            for attempt in (attention, "sdpa", "eager"):
+                try:
+                    self._draft_model = AutoModelForCausalLM.from_pretrained(
+                        str(path), attn_implementation=attempt, **kwargs
+                    )
+                    break
+                except (ImportError, ValueError, RuntimeError):
+                    if attempt == "eager":
+                        raise
+            self._draft_model.eval()
+            self._draft_model.generation_config.use_cache = True
+        except Exception as exc:  # noqa: BLE001 - serving without speculation is fine
+            self._draft_model = None
+            self._speculative_notes.append(
+                f"the draft model {self.draft_spec.id} would not load, so speculation "
+                f"is off: {type(exc).__name__}: {exc}"
+            )
+            return
+        self._speculative_notes.append(
+            f"speculative decoding on, with {self.draft_spec.id}"
+            + (f" @ {self.draft_quant.id}" if self.draft_quant else "")
+            + f" proposing {self.speculative_lookahead} tokens at a time"
+        )
+
+    @property
+    def speculating(self) -> bool:
+        return self._draft_model is not None
+
+    def _forward_logits_kwargs(self, count: int) -> dict[str, Any]:
+        """Ask for the last ``count`` positions' logits, when the model can slice."""
+        if self._logits_kwarg is None:
+            return {}
+        return {self._logits_kwarg: max(int(count), 1)}
 
     def _detect_logits_kwarg(self) -> str | None:
         import inspect
@@ -348,6 +457,7 @@ class TransformersBackend(InferenceBackend):
 
         self._prefix = None
         self._model = None
+        self._draft_model = None
         self._tokenizer = None
         self._adapters.clear()
         self._active = ()
@@ -390,6 +500,41 @@ class TransformersBackend(InferenceBackend):
                 template = str(template)
             self._template_supports_thinking = "enable_thinking" in template
         return self._template_supports_thinking
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """Mean-pooled last hidden state per text, L2-normalised.
+
+        Uses the model already in VRAM, so the gate gets a semantic comparison without
+        a second checkpoint to download, load or keep in step with the base. Pooling is
+        masked, so padding does not drag a short answer towards the mean.
+        """
+        if not self.loaded:
+            raise BackendNotLoaded()
+        if not texts:
+            return []
+        return await asyncio.to_thread(self._embed_blocking, list(texts))
+
+    def _embed_blocking(self, texts: list[str]) -> list[list[float]]:
+        import torch
+
+        tokenizer = self._tokenizer
+        batch = tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=min(512, self.plan.max_seq_len),
+        )
+        batch = {k: v.to(self._device) for k, v in batch.items()}
+        with torch.no_grad():
+            output = self._model(
+                **batch, output_hidden_states=True, use_cache=False
+            )
+        hidden = output.hidden_states[-1]
+        mask = batch["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        pooled = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)
+        return [row.tolist() for row in pooled.cpu()]
 
     def count_tokens(self, text: str) -> int:
         if self._tokenizer is None:
@@ -456,13 +601,46 @@ class TransformersBackend(InferenceBackend):
             finish_reason = "length"
             decoded_so_far = ""
 
+            def push(token_id: int) -> str | None:
+                """Accept one token. Returns a finish reason, or None to keep going.
+
+                Shared by both decode paths so that streaming, stop sequences and the
+                end-of-text handling cannot drift apart between them.
+                """
+                nonlocal index, decoded_so_far, first_token_at
+                if token_id in eos_ids:
+                    return "stop"
+                produced.append(token_id)
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
+                text = self._tokenizer.decode(produced, skip_special_tokens=True)
+                piece = text[len(decoded_so_far) :]
+                decoded_so_far = text
+                result = matcher.feed(piece)
+                if result.emit:
+                    emit(Chunk(text=result.emit, index=index))
+                    index += 1
+                if result.stopped:
+                    return "stop_sequence"
+                if len(produced) >= params.max_tokens:
+                    return "length"
+                return None
+
             with torch.inference_mode():
                 past, cached_tokens = self._prime(input_ids)
                 logits = past.pop("logits")
                 cache = past.pop("past_key_values")
                 next_input = None
+                # Speculation is only exact for greedy decoding, so sampling takes the
+                # plain path. Nothing is lost: everything that is measured — the gate,
+                # practice, the benchmark — is greedy.
+                speculate = self.speculating and params.greedy
+                draft_cache = None
 
-                while len(produced) < params.max_tokens:
+                if params.max_tokens <= 0:
+                    finish_reason = "length"
+
+                while params.max_tokens > 0:
                     if next_input is not None:
                         outputs = self._model(
                             input_ids=next_input,
@@ -473,37 +651,87 @@ class TransformersBackend(InferenceBackend):
                         logits = outputs.logits
                         cache = outputs.past_key_values
 
-                    from gustav.inference.sampling import sample_next
+                    if not speculate:
+                        from gustav.inference.sampling import sample_next
 
-                    token = sample_next(
-                        logits[:, -1, :].float(),
-                        params,
-                        generated=produced,
-                        generator=generator,
+                        token = sample_next(
+                            logits[:, -1, :].float(),
+                            params,
+                            generated=produced,
+                            generator=generator,
+                        )
+                        stop = push(int(token.item()))
+                        next_input = token.view(1, 1)
+                        if stop:
+                            finish_reason = stop
+                            break
+                        continue
+
+                    # --- speculative round ------------------------------
+                    context = input_ids if not produced else torch.cat(
+                        [input_ids, torch.tensor([produced], device=self._device)], dim=-1
                     )
-                    token_id = int(token.item())
-                    if token_id in eos_ids:
-                        finish_reason = "stop"
+                    draft_cache, proposals = self._propose(
+                        context, draft_cache, self.speculative_lookahead, torch
+                    )
+                    if not proposals:
+                        speculate = False
+                        continue
+
+                    verify = torch.tensor([proposals], device=self._device)
+                    outputs = self._model(
+                        input_ids=verify,
+                        past_key_values=cache,
+                        use_cache=True,
+                        **self._forward_logits_kwargs(len(proposals)),
+                    )
+                    cache = outputs.past_key_values
+                    # L0 (from before the proposals) plus one row per proposal.
+                    all_logits = torch.cat(
+                        [logits[:, -1:, :].float(), outputs.logits.float()], dim=1
+                    )
+
+                    accepted = 0
+                    corrected = int(all_logits[0, 0, :].argmax().item())
+                    for position, proposed in enumerate(proposals):
+                        best = int(all_logits[0, position, :].argmax().item())
+                        if best != proposed:
+                            corrected = best
+                            break
+                        accepted += 1
+                        corrected = int(all_logits[0, position + 1, :].argmax().item())
+
+                    self.speculation_stats["rounds"] += 1
+                    self.speculation_stats["proposed"] += len(proposals)
+                    self.speculation_stats["accepted"] += accepted
+
+                    stop = None
+                    for token_id in proposals[:accepted]:
+                        stop = push(token_id)
+                        if stop:
+                            break
+                    if stop is None:
+                        stop = push(corrected)
+
+                    # The verification forward put every proposal in the cache. Only
+                    # the accepted ones belong there; the corrected token is the next
+                    # input, not history.
+                    rejected = len(proposals) - accepted
+                    if rejected:
+                        self._trim(cache, rejected)
+                        self._trim(draft_cache, rejected)
+                    next_input = torch.tensor([[corrected]], device=self._device)
+                    if stop:
+                        finish_reason = stop
                         break
-
-                    produced.append(token_id)
-                    if first_token_at is None:
-                        first_token_at = time.monotonic()
-
-                    text = self._tokenizer.decode(produced, skip_special_tokens=True)
-                    piece = text[len(decoded_so_far) :]
-                    decoded_so_far = text
-                    result = matcher.feed(piece)
-                    if result.emit:
-                        emit(Chunk(text=result.emit, index=index))
-                        index += 1
-                    if result.stopped:
-                        finish_reason = "stop_sequence"
-                        break
-                    next_input = token.view(1, 1)
-
                 else:
                     finish_reason = "length"
+
+                if speculate:
+                    # Whatever we stopped for, the cache must describe exactly
+                    # prompt + produced, or the prefix cache would hand the next turn a
+                    # history that was never generated.
+                    self._align(cache, prompt_length + len(produced))
 
             if self._prefix is not None:
                 # The cache now holds prompt + completion, so record that: the next turn
@@ -542,6 +770,68 @@ class TransformersBackend(InferenceBackend):
             emit(exc)
         finally:
             emit(None)
+
+    def _propose(self, context: Any, draft_cache: Any, count: int, torch: Any):
+        """Greedy proposals from the draft model, with its own KV cache."""
+        if draft_cache is None:
+            outputs = self._draft_model(input_ids=context, use_cache=True)
+        else:
+            held = self._cache_length(draft_cache)
+            fresh = context[:, held:]
+            if fresh.shape[-1] == 0:  # nothing new to tell it about
+                fresh = context[:, -1:]
+                self._trim(draft_cache, 1)
+            outputs = self._draft_model(
+                input_ids=fresh, past_key_values=draft_cache, use_cache=True
+            )
+        cache = outputs.past_key_values
+        logits = outputs.logits
+        proposals: list[int] = []
+        for _ in range(count):
+            token = int(logits[0, -1, :].argmax().item())
+            proposals.append(token)
+            outputs = self._draft_model(
+                input_ids=torch.tensor([[token]], device=self._device),
+                past_key_values=cache,
+                use_cache=True,
+            )
+            cache = outputs.past_key_values
+            logits = outputs.logits
+        # The draft's cache now holds context + proposals, which is the same shape the
+        # target's does after verification — so one rollback length fits both.
+        return cache, proposals
+
+    @staticmethod
+    def _cache_length(cache: Any) -> int:
+        try:
+            return int(cache.get_seq_length())
+        except Exception:  # noqa: BLE001 - an unknown cache type is not fatal
+            return 0
+
+    def _trim(self, cache: Any, tokens: int) -> None:
+        """Roll a KV cache back by ``tokens`` positions.
+
+        ``Cache.crop`` takes a *negative* number to mean "remove this many"; a positive
+        value is the old "truncate to this absolute length" convention, which current
+        transformers refuses outright. Both are tried, so this keeps working either way.
+        """
+        if cache is None or tokens <= 0:
+            return
+        if getattr(cache, "is_croppable", True) is False:
+            raise BackendError(
+                "this model's KV cache cannot be rolled back, so speculative decoding "
+                "cannot be used with it"
+            )
+        try:
+            cache.crop(-tokens)
+        except (ValueError, TypeError):
+            cache.crop(max(self._cache_length(cache) - tokens, 0))
+
+    def _align(self, cache: Any, length: int) -> None:
+        """Make the cache describe exactly ``length`` tokens."""
+        held = self._cache_length(cache)
+        if held > length:
+            self._trim(cache, held - length)
 
     def _prime(self, input_ids: Any) -> tuple[dict[str, Any], int]:
         """Run the prompt through the model, reusing a cached prefix when possible."""
