@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import json
 import time
 import uuid
+from pathlib import Path
 
 import secrets
 
@@ -36,6 +37,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from gustav.server.auth import COOKIE, Accounts, AuthError, Identity, RateLimiter
+from gustav.server.chats import Chats
 
 if TYPE_CHECKING:
     from gustav.daemon import Daemon
@@ -137,6 +139,20 @@ class UserUpdate(BaseModel):
     disabled: bool | None = None
     #: Issue a token for this account and return it, once.
     token: str | None = None
+
+
+class ChatMessage(BaseModel):
+    message: str = Field(min_length=1)
+    stream: bool = True
+
+
+class ChatFeedback(BaseModel):
+    kind: str = Field(pattern="^(good|bad|correct|forget)$")
+    text: str = ""
+
+
+class NewChat(BaseModel):
+    title: str = ""
 
 
 class Credentials(BaseModel):
@@ -357,6 +373,85 @@ def create_app(daemon: "Daemon") -> FastAPI:
             "auth.user_deleted", f"the account {name!r} was deleted", level="warning"
         )
         return {"deleted": name}
+
+    # ------------------------------------------------------------------
+    # chats — what the web interface and a signed-in CLI use
+    # ------------------------------------------------------------------
+    def chats_for(request: Request) -> tuple[Chats, Identity]:
+        identity = identify(request)
+        return Chats(daemon.db), identity
+
+    @app.get("/chats", dependencies=account)
+    async def list_chats(request: Request, limit: int = 50) -> dict[str, Any]:
+        chats, identity = chats_for(request)
+        return {
+            "chats": [chat.to_dict() for chat in chats.all(user_id=identity.user_id, limit=limit)],
+            "you": identity.to_dict(),
+        }
+
+    @app.post("/chats", dependencies=account)
+    async def new_chat(req: NewChat, request: Request) -> dict[str, Any]:
+        chats, identity = chats_for(request)
+        return chats.create(user_id=identity.user_id, title=req.title).to_dict()
+
+    @app.get("/chats/{chat_id}/messages", dependencies=account)
+    async def chat_messages(chat_id: int, request: Request) -> dict[str, Any]:
+        chats, identity = chats_for(request)
+        try:
+            return {
+                "chat": chats.get(chat_id, user_id=identity.user_id).to_dict(),
+                "messages": chats.messages(chat_id, user_id=identity.user_id),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/chats/{chat_id}/messages", dependencies=account)
+    async def send_message(chat_id: int, req: ChatMessage, request: Request):
+        chats, identity = chats_for(request)
+        try:
+            key = chats.key(chat_id, user_id=identity.user_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        chats.title_if_unset(chat_id, req.message)
+
+        if not req.stream:
+            try:
+                result = await daemon.chat(req.message, session=key)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            chats.touch(chat_id)
+            return result
+
+        async def events():
+            async for event in daemon.chat_stream(req.message, session=key):
+                yield sse(event)
+            chats.touch(chat_id)
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.post("/chats/{chat_id}/feedback", dependencies=account)
+    async def chat_feedback(chat_id: int, req: ChatFeedback, request: Request) -> dict[str, Any]:
+        """`/good`, `/bad`, `/correct …` — the same commands the terminal has."""
+        chats, identity = chats_for(request)
+        try:
+            chats.get(chat_id, user_id=identity.user_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        command = f"/{req.kind}" + (f" {req.text}" if req.text else "")
+        result = daemon.commands.handle(chat_id, command)
+        if result is None:
+            raise HTTPException(status_code=400, detail=f"{command} is not a command")
+        return {"reply": result.reply, "action": result.action}
+
+    @app.delete("/chats/{chat_id}", dependencies=account)
+    async def archive_chat(chat_id: int, request: Request) -> dict[str, Any]:
+        chats, identity = chats_for(request)
+        try:
+            chats.archive(chat_id, user_id=identity.user_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"archived": chat_id}
 
     @app.get("/status", dependencies=guard)
     async def status() -> dict[str, Any]:
@@ -765,5 +860,40 @@ def create_app(daemon: "Daemon") -> FastAPI:
             return daemon.write_report(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # the web interface
+    # ------------------------------------------------------------------
+    @app.get("/web/config")
+    async def web_config() -> dict[str, Any]:
+        """What the page needs before anyone has signed in.
+
+        Deliberately unauthenticated and deliberately boring: a title, whether accounts
+        exist, and whether the owner's panels are on. Nothing here tells you anything
+        you could not learn by looking at the login form.
+        """
+        return {
+            "title": daemon.config.web.title,
+            "enabled": daemon.config.web.enabled,
+            "accounts": daemon.config.api.accounts,
+            "owner_panels": daemon.config.web.owner_panels,
+            "instance": daemon.config.instance.name,
+        }
+
+    if daemon.config.web.enabled:
+        # Registered last, so every API route above wins over the static files. The
+        # three files are served as they are; everything they show comes from the same
+        # endpoints the CLI calls, under the same identity rules.
+        from fastapi.staticfiles import StaticFiles
+
+        root = Path(__file__).resolve().parent.parent / "web"
+        if root.is_dir():
+            app.mount("/", StaticFiles(directory=str(root), html=True), name="web")
+        else:  # pragma: no cover - only if the package was installed without its data
+            daemon.events.emit(
+                "web.missing",
+                f"web.enabled is set but {root} is not in this install",
+                level="warning",
+            )
 
     return app

@@ -20,12 +20,13 @@ ai sleep now
 
 ## Status
 
-Built in reviewable stages, and all seven are done. It loads real weights and answers;
+Built in reviewable stages, and all eight are done. It loads real weights and answers;
 it learns from the day, studies, practises under a verifier, trains LoRA adapters and
 promotes them only if a regression gate says they are better; it grows and tunes itself
 within budgets the hardware sets, asking first for anything it cannot take back; and it
 writes its own tools, which run sandboxed on the server and do nothing at all until you
-have read the source.
+have read the source. You reach it from a terminal anywhere (`ai`), or from a browser —
+both off by default, both the same daemon and the same API.
 
 | Stage | What it is | State |
 |---|---|---|
@@ -36,6 +37,7 @@ have read the source.
 | 5 | Sleep phase: consolidation, study, practice, training, the gate, the report | **done** |
 | 6 | Self-expansion, self-optimisation, router training, packaging | **done** |
 | 7 | Tools it writes for itself: sandbox, admission checks, review | **done** |
+| 8 | The remote CLI, accounts, and the web interface — both switched off until you turn them on | **done** |
 
 Measured on the development machine (RTX 4070 SUPER, 12 GB) with Qwen3-4B in 4-bit NF4:
 **54 tok/s**, 25 ms to first token, 4.3 GiB peak VRAM. It hands the GPU over for real:
@@ -180,6 +182,57 @@ code run on your machine, which is not something to hand out with a chat account
 
 Put it behind TLS if it leaves your own network. There is no certificate handling here
 on purpose — a reverse proxy does that job better than anything this would grow.
+
+### The web interface
+
+Also off by default, and served by the same daemon on the same port — there is no
+second process and no build step:
+
+```yaml
+api:
+  enabled: true
+  accounts: true
+web:
+  enabled: true
+  title: gustav       # what the tab says
+  owner_panels: true  # show the owner's panels in the browser at all
+```
+
+Restart, open `http://your-server:8713/`, and sign in with an account you made with
+`ai user add`. What you get:
+
+* **chats** down the left, each named after the first thing you said in it. New chat,
+  archive (which hides it — the turns stay, because they are what the night learns
+  from), and the whole thread when you come back to it;
+* **the answer as it is written**, streamed over the same SSE the terminal uses. The
+  footer of each answer carries tokens/s, latency and which adapter version produced it;
+* **👍 👎 correct…** under the latest answer. They are the same `/good`, `/bad`,
+  `/correct` commands the terminal has, applied to the most recent exchange exactly as
+  typing them at a prompt would, and they land in the same table — so a thumb in the
+  browser is studied that night like any other. Older answers keep whatever you already
+  said about them. Slash commands work in the message box too;
+* **facts and skills** — what it believes about you and where it is measurably weak;
+* **tools** — the list, the status, and *the source*, so the thing you are approving is
+  the thing you read. Approve and reject are right there, and you can ask for a new tool
+  in a sentence;
+* **system** — state, model, uptime, sleep/wake, pause learning, release the GPU, and
+  whatever is waiting for a decision.
+
+The last three are owner-only and hidden entirely from a plain account's browser —
+`owner_panels: false` hides them from everyone, for a machine where the browser is only
+ever meant to be a chat window.
+
+Three things worth knowing about how it is built:
+
+* **nothing is ever inserted as HTML.** Model output, stored turns and other accounts'
+  text all go through `textContent`, so a conversation cannot script the page;
+* **nothing is fetched from anyone else.** No CDN, no framework, no fonts — an assistant
+  that is meant to work with the network unplugged should not need someone else's server
+  to render its own interface;
+* **the page has no privileges of its own.** It calls the endpoints the CLI calls, under
+  the same identity rules, and the browser's session cookie is `httpOnly` — the
+  JavaScript never sees a token. The static files are mounted *last*, so a file in the
+  web directory can never shadow an API route.
 
 ## How the daemon schedules itself
 
@@ -1045,7 +1098,7 @@ The sections the night reads, with the defaults worth knowing:
 | `expansion` | `max_changes_per_run` (1), `min_uncovered_requests` (8), `saturation_runs` (3), `rank_step` (8), `allow_pruning` (off), `allow_base_merge` (off), `require_approval` |
 | `optimisation` | `settings` (the knobs it may measure), `max_trials_per_run` (2), `min_relative_gain` (0.05), `max_quality_loss` (0.02) |
 | `api` | `enabled` (off), `host`, `port`, `accounts`, `session_days` (30), `rate_limit_per_minute` (120) |
-| `web` | `enabled` (off), `title` |
+| `web` | `enabled` (off), `title`, `owner_panels` |
 | `tools` | `enabled`, `allow_authoring`, `require_approval` (on), `max_calls_per_turn` (4), `timeout_seconds` (10), `allow_capabilities` (`pure`, `write_workspace`), `readable_paths` (empty), `allowed_hosts` (empty), `allowed_modules` |
 
 `docs/sources.yaml` maps topics to documentation URLs and records the licence of each
@@ -1098,6 +1151,7 @@ src/gustav/
 packaging/             the systemd user unit
   wake/                the chat side
   server/ cli.py       control plane and its client
+  web/                 the web interface: three files, no build step
   store/               SQLite schema and migrations
 tools/                 tools it wrote, one directory per tool, source you can read
 var/                   databases, logs, run checkpoints, doc cache, reports, socket, lock
@@ -1113,7 +1167,7 @@ var/                   databases, logs, run checkpoints, doc cache, reports, soc
 
 Three sets, with different jobs.
 
-**The fast set** (around 940 tests) runs on any machine with no GPU and no weights. Most
+**The fast set** (around 1030 tests) runs on any machine with no GPU and no weights. Most
 of the sleep tests call a step's body directly with a *scripted* model, which is what
 makes the interesting cases cheap to pin down: an ungrounded fact, an exercise whose tests
 pass without a solution, a candidate adapter that is better on new material and worse on
@@ -1121,7 +1175,11 @@ old, a replacement answer that just restates the one you rejected, an expansion 
 the hardware budget cannot afford, a tunable change that bought speed with quality.
 The tool sandbox gets a test per refusal — imports, files, directory listings,
 subprocesses, resource limits, a tool trying to raise its own limits — because a sandbox
-nobody tested is a sandbox nobody has.
+nobody tested is a sandbox nobody has. The web interface is tested through its API rather
+than through a browser: the chat round trip, the stream the page reads, the thumbs
+landing in the same table the terminal's do, the static mount not shadowing an endpoint,
+and one account being unable to see another's chats — plus a contract test that the
+owner's panels are reading field names the daemon actually returns.
 
 **The slow set** starts the real daemon as a subprocess and `kill -9`s it while **each**
 step of the night is running, then restarts it and checks that finished steps were not

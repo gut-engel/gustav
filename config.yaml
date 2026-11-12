@@ -265,9 +265,15 @@ api:
   rate_limit_per_minute: 120
 
 web:
-  # The web interface, served by the daemon. Off by default, and needs api.enabled.
+  # The web interface, served by the daemon from the package — no second process and no
+  # build step. Off by default; needs api.enabled to be reachable from a browser on
+  # another machine, and api.accounts so there is something to sign in as.
   enabled: false
+  # What the tab, the sign-in box and the top of the sidebar say.
   title: gustav
+  # Show the owner's panels (facts, skills, tool review, system) in the browser. They
+  # are owner-only either way; false hides them from everyone, for a machine where the
+  # browser is only ever meant to be a chat window.
   owner_panels: true
 
 tools:

@@ -70,7 +70,18 @@ class Chats:
             "sessions",
             {"source": source, "label": title or "new chat", "user_id": user_id},
         )
+        # The wake phase finds a conversation by its external id, so give the chat one
+        # that cannot collide with a CLI session or another account's.
+        self.db.execute(
+            "UPDATE sessions SET external_id = ? WHERE id = ?", (f"{source}-{chat_id}", chat_id)
+        )
         return self.get(chat_id, user_id=user_id)
+
+    def key(self, chat_id: int, *, user_id: int | None) -> str:
+        """The session key the daemon's chat path expects, if this chat is yours."""
+        self.get(chat_id, user_id=user_id)
+        row = self.db.query_one("SELECT external_id FROM sessions WHERE id = ?", (chat_id,))
+        return (row["external_id"] if row else None) or f"web-{chat_id}"
 
     def get(self, chat_id: int, *, user_id: int | None) -> Chat:
         scope, params = self._scope(user_id)
@@ -144,8 +155,15 @@ class Chats:
         self.db.execute("UPDATE sessions SET archived = 1 WHERE id = ?", (chat_id,))
 
     def touch(self, chat_id: int) -> None:
+        """Mark a chat as the one you were just in.
+
+        Sub-second, because the column's own default is only second-accurate and two
+        chats made in the same second would otherwise never reorder. The formats still
+        compare correctly as text: ``…:07.123`` sorts after ``…:07``.
+        """
         self.db.execute(
-            "UPDATE sessions SET last_activity_at = datetime('now') WHERE id = ?",
+            "UPDATE sessions SET last_activity_at = strftime('%Y-%m-%d %H:%M:%f', 'now')"
+            " WHERE id = ?",
             (chat_id,),
         )
 

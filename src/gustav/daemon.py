@@ -391,6 +391,16 @@ class Daemon:
             )
             self._servers.append(tcp_server)
             self._tasks.append(asyncio.create_task(tcp_server.serve(), name="tcp-server"))
+            if self.config.web.enabled:
+                shown = "localhost" if host in ("0.0.0.0", "::") else host
+                self.log.info("the web interface is at http://%s:%s/", shown, port)
+        elif self.config.web.enabled:
+            # Worth saying out loud: the socket cannot be browsed, so the interface is
+            # switched on and reachable by nobody.
+            self.log.warning(
+                "web.enabled is set but the API port is not open (api.enabled): "
+                "a browser has no way to reach the interface"
+            )
 
         # Wait until the socket is actually accepting connections.
         for _ in range(200):

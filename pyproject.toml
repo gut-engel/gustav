@@ -55,7 +55,8 @@ packages = ["src/gustav"]
 # The model ladder, the default module registry, the documentation source map and the
 # default config travel with the package: an installed wheel starting in an empty
 # directory has to be able to write a working project.
-artifacts = ["src/gustav/data/*.yaml", "src/gustav/hw/*.yaml"]
+artifacts = ["src/gustav/data/*.yaml", "src/gustav/hw/*.yaml",
+             "src/gustav/web/*.html", "src/gustav/web/*.css", "src/gustav/web/*.js"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "tests", "docs", "modules", "profiles", "packaging", "README.md",

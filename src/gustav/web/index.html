@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gustav</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9679;</text></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- the sign-in screen; shown when /auth/me says we are nobody -->
+<div id="login" class="hidden">
+  <form id="login-form" autocomplete="on">
+    <h1 id="login-title">gustav</h1>
+    <p class="faint" style="margin:0 0 .4rem">Sign in to this daemon.</p>
+    <label>Name <input name="name" autocomplete="username" required autofocus></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <p class="error" id="login-error"></p>
+    <button class="btn primary" type="submit">Sign in</button>
+    <p class="faint" style="margin:.2rem 0 0;font-size:.78rem">
+      The owner signs in over the Unix socket without a password; accounts are for the
+      network listener.
+    </p>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <aside id="sidebar">
+    <div class="brand">
+      <b id="brand-name">gustav</b>
+      <span id="brand-state">…</span>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-view="chat" aria-current="true">Chats</button>
+      <button data-view="facts" class="owner-only">Facts</button>
+      <button data-view="skills" class="owner-only">Skills</button>
+      <button data-view="tools" class="owner-only">Tools</button>
+      <button data-view="system" class="owner-only">System</button>
+    </nav>
+    <div class="chats" id="chat-list"></div>
+    <div class="side-foot">
+      <span id="who" class="muted">…</span>
+      <button id="new-chat" title="New chat">+ New</button>
+      <button id="logout" class="hidden">Sign out</button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <!-- chat -->
+    <section id="view-chat" class="view" style="display:flex;flex-direction:column;min-height:0;flex:1">
+      <div class="scroll" id="thread-scroll">
+        <div class="thread" id="thread"></div>
+      </div>
+      <div class="composer">
+        <div class="composer-inner">
+          <button class="btn menu-toggle" id="menu" title="Chats" aria-label="Chats">☰</button>
+          <textarea id="input" rows="1" placeholder="Say something, or /help for commands"></textarea>
+          <button class="btn primary" id="send">Send</button>
+        </div>
+        <p class="hint" id="hint">Enter sends · Shift+Enter is a newline · /good /bad /correct … teach it overnight</p>
+      </div>
+    </section>
+
+    <!-- panels -->
+    <section id="view-facts" class="view scroll hidden"><div class="panel" id="facts-panel"></div></section>
+    <section id="view-skills" class="view scroll hidden"><div class="panel" id="skills-panel"></div></section>
+    <section id="view-tools" class="view scroll hidden"><div class="panel" id="tools-panel"></div></section>
+    <section id="view-system" class="view scroll hidden"><div class="panel" id="system-panel"></div></section>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
