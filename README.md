@@ -66,84 +66,24 @@ useful kind of result:
 
 ## Install
 
-**CLI client one‑liner:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client
-```
+Needs Python 3.12+ (3.14 is fine; torch 2.15 ships `cp314` wheels) and an NVIDIA GPU.
 
-**Server one‑liner:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --service
-```
-
-You can install the CLI client with a one‑liner:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client
-```
-
-You can install the systemd service (server) with a one‑liner:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --service
-```
-
-You can also uninstall everything with a one‑liner:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/uninstall.sh | sudo bash -s --
-```
-
----
-
-
-
-The project can be installed in several ways:
-
-### 1️⃣ Python package (editable)
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e "[ml,dev]"
+.venv/bin/pip install -e ".[ml,dev]"   # ~4 GB of CUDA wheels
+.venv/bin/python daemon.py             # plans, then loads the model it chose
 ```
 
-### 2️⃣ System-wide installation via the **pure‑bash installer**
-A full shell installer is provided in `scripts/install.sh`. It can install the CLI client, the systemd service, or both, and lets you configure:
-- Installation directory
-- Git reference or local source
-- Web UI enablement
-- Default per‑user usage limit
-- First admin account creation
-- Non‑interactive mode (`--no-prompt`)
+Installed rather than cloned, start with an empty directory:
 
-#### Basic usage
-```bash
-# Install both CLI and service (interactive)
-./scripts/install.sh --dir /opt/gustav
-
-# Install only the CLI client, no prompts
-./scripts/install.sh --client --no-prompt --dir /opt/gustav
-
-# Install only the systemd service with a custom port and usage limit
-./scripts/install.sh --service --port 8080 --no-prompt
-```
-
-The installer creates a systemd unit at `/etc/systemd/system/gustav.service` and starts it automatically. After installation you can manage it with `systemctl`:
-```bash
-sudo systemctl status gustav
-sudo systemctl restart gustav
-```
-
-### 3️⃣ Direct pip install (no repo checkout)
 ```bash
 pip install gustav[ml]
 mkdir ~/gustav && cd ~/gustav
-ai init
+ai init                    # writes config.yaml, modules/registry.yaml, docs/sources.yaml
+ai plan-hardware -v        # what it would run here, and why
+ai model pull qwen3-4b
+ai service install         # a systemd *user* unit, so it runs as you
 ```
-
----
-
-*`ai service install`* from the CLI is still available for a per‑user systemd unit, but the new `install.sh` offers a full‑system installer for administrators.
-
 
 `ai init` never overwrites a file you already have, and the daemon writes the default
 registry and source map by itself if they are missing — a project with neither is not a

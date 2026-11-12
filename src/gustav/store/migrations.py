@@ -559,10 +559,6 @@ MIGRATION_0006 = [
     "CREATE INDEX idx_sessions_user ON sessions (user_id, last_activity_at DESC)",
 ]
 
-MIGRATION_0007 = [
-    "ALTER TABLE users ADD COLUMN usage_limit INTEGER NOT NULL DEFAULT 0;"
-]
-
 MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (1, "initial_daemon_schema", MIGRATION_0001),
     (2, "weight_change_log", MIGRATION_0002),
@@ -570,5 +566,4 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (4, "expansion_and_optimisation", MIGRATION_0004),
     (5, "tools", MIGRATION_0005),
     (6, "accounts", MIGRATION_0006),
-    (7, "add_usage_limit", MIGRATION_0007),
 ]

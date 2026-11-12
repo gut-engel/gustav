@@ -93,7 +93,6 @@ class User:
     created_at: str = ""
     last_seen_at: str | None = None
     note: str | None = None
-    usage_limit: int = 0
 
     @property
     def is_owner(self) -> bool:
@@ -107,7 +106,6 @@ class User:
             "disabled": self.disabled,
             "created_at": self.created_at,
             "last_seen_at": self.last_seen_at,
-            "usage_limit": self.usage_limit,
         }
 
 
@@ -150,10 +148,6 @@ class Accounts:
     def __init__(self, db: Database, *, session_days: int = 30):
         self.db = db
         self.session_days = session_days
-        # Cache User objects by id to keep references (e.g., Identity.user) in sync after updates
-        self._user_cache: dict[int, User] = {}
-+        # Cache User objects by id to keep references (e.g., Identity.user) in sync after updates
-+        self._user_cache: dict[int, User] = {}
 
     # --- users ----------------------------------------------------------
     def create(
@@ -217,22 +211,6 @@ class Accounts:
         self.db.execute("UPDATE users SET role = ? WHERE id = ?", (role, user.id))
         return self.get(user.id)
 
-    def set_usage_limit(self, name: str, limit: int) -> User:
-        """Set per‑user usage limit. 0 means unlimited."""
-        if limit < 0:
-            raise AuthError("usage limit must be non‑negative")
-        user = self._require(name)
-        self.db.execute(
-            "UPDATE users SET usage_limit = ? WHERE id = ?",
-            (limit, user.id),
-        )
-        # Update the in‑memory User object so callers holding a reference (e.g., Identity) see the new limit
-        user.usage_limit = limit
-        # Also update any cached instance
-        if hasattr(self, "_user_cache"):
-            self._user_cache[user.id] = user
-        return self.get(user.id)
-
     def disable(self, name: str, *, disabled: bool = True) -> User:
         user = self._require(name)
         self.db.execute(
@@ -240,22 +218,6 @@ class Accounts:
         )
         if disabled:
             self.revoke_all(user.id)
-        return self.get(user.id)
-
-    def set_usage_limit(self, name: str, limit: int) -> User:
-        """Set per‑user usage limit. 0 means unlimited."""
-        if limit < 0:
-            raise AuthError("usage limit must be non‑negative")
-        user = self._require(name)
-        self.db.execute(
-            "UPDATE users SET usage_limit = ? WHERE id = ?",
-            (limit, user.id),
-        )
-        # Update the in‑memory User object so callers holding a reference (e.g., Identity) see the new limit
-        user.usage_limit = limit
-        # Also update any cached instance
-        if hasattr(self, "_user_cache"):
-            self._user_cache[user.id] = user
         return self.get(user.id)
 
     def delete(self, name: str) -> None:
@@ -288,33 +250,17 @@ class Accounts:
             raise AuthError(f"there is no account called {name!r}")
         return user
 
-    def _to_user(self, row: Any) -> User:
-        # Reuse cached User instances to keep references (e.g., Identity.user) in sync
-        uid = int(row["id"])
-        if uid in self._user_cache:
-            user = self._user_cache[uid]
-            # Update mutable fields
-            user.name = row["name"]
-            user.role = row["role"]
-            user.disabled = bool(row["disabled"])
-            user.created_at = row["created_at"]
-            user.last_seen_at = row["last_seen_at"]
-            user.note = row["note"]
-            user.usage_limit = row["usage_limit"]
-            return user
-        # Not cached, create and store
-        user = User(
-            id=uid,
+    @staticmethod
+    def _to_user(row: Any) -> User:
+        return User(
+            id=int(row["id"]),
             name=row["name"],
             role=row["role"],
             disabled=bool(row["disabled"]),
             created_at=row["created_at"],
             last_seen_at=row["last_seen_at"],
             note=row["note"],
-            usage_limit=row["usage_limit"],
         )
-        self._user_cache[uid] = user
-        return user
 
     # --- API tokens -----------------------------------------------------
     def issue_token(self, name: str, *, label: str = "cli", days: int | None = None) -> str:
@@ -447,9 +393,8 @@ class RateLimiter:
     def __init__(self, per_minute: int = 120):
         self.per_minute = per_minute
         self._windows: dict[str, tuple[int, int]] = {}
-        self._user_counts: dict[int, int] = {}
 
-    def check(self, request: Any, identity: "Identity" | None = None) -> None:
+    def check(self, request: Any) -> None:
         if self.per_minute <= 0:
             return
         from fastapi import HTTPException
@@ -468,16 +413,3 @@ class RateLimiter:
                 detail=f"more than {self.per_minute} requests in a minute; slow down",
                 headers={"Retry-After": "60"},
             )
-        # Per-user usage limit
-        if identity and identity.user:
-            uid = identity.user.id
-            used = self._user_counts.get(uid, 0)
-            limit = identity.user.usage_limit
-            if limit > 0 and used >= limit:
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"usage limit of {limit} exceeded for user {identity.user.name}",
-                    headers={"Retry-After": "60"},
-                )
-            self._user_counts[uid] = used + 1
-

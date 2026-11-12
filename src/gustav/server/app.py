@@ -151,9 +151,7 @@ def create_app(daemon: "Daemon") -> FastAPI:
         header = request.headers.get("authorization", "")
         presented = header.removeprefix("Bearer ").strip()
         if service and presented and secrets.compare_digest(presented, service):
-            identity = Identity(kind="service")
-            limiter.check(request, identity)
-            return identity
+            return Identity(kind="service")
 
         if daemon.config.api.accounts:
             if presented:
@@ -200,22 +198,15 @@ def create_app(daemon: "Daemon") -> FastAPI:
             "state": str(daemon.state.state),
             "pid": daemon.status()["pid"],
         }
-        
 
-    # Register API routes (auth, chats, etc.)
-    from gustav.server.routes import router as api_router
-    app.include_router(api_router)
-
-    # Serve the vanilla Web UI (static files)
-    from fastapi.staticfiles import StaticFiles
-    from pathlib import Path
-    static_dir = Path(__file__).resolve().parent.parent / "static"
-    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+    @app.get("/status", dependencies=guard)
+    async def status() -> dict[str, Any]:
+        return daemon.status()
 
     def sse(payload: dict[str, Any]) -> str:
         return f"data: {json.dumps(payload)}\n\n"
 
-    @app.post("/chat", dependencies=account)
+    @app.post("/chat", dependencies=guard)
     async def chat(req: ChatRequest):
         if not req.stream:
             try:
@@ -264,17 +255,14 @@ def create_app(daemon: "Daemon") -> FastAPI:
                         "message": {"role": "assistant", "content": result["reply"]},
                         "finish_reason": meta.get("finish_reason", "stop"),
                     }
-        
                 ],
                 "usage": {
                     "prompt_tokens": meta.get("prompt_tokens", 0),
                     "completion_tokens": meta.get("completion_tokens", 0),
                     "total_tokens": meta.get("prompt_tokens", 0)
                     + meta.get("completion_tokens", 0),
-                }
-        ,
+                },
             }
-        
 
         async def events():
             def frame(delta: dict[str, Any], finish: str | None = None) -> str:
@@ -286,7 +274,6 @@ def create_app(daemon: "Daemon") -> FastAPI:
                         "model": model_name,
                         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
                     }
-        
                 )
 
             yield frame({"role": "assistant", "content": ""})
@@ -386,11 +373,9 @@ def create_app(daemon: "Daemon") -> FastAPI:
                     "started_at": s.started_at,
                     "finished_at": s.finished_at,
                 }
-        
                 for s in record.steps
             ],
         }
-        
 
     @app.get("/backups", dependencies=guard)
     async def backups() -> dict[str, Any]:
@@ -471,7 +456,6 @@ def create_app(daemon: "Daemon") -> FastAPI:
                     "explanation": outcome.plan.explanation,
                     "rejected": outcome.plan.rejected,
                 }
-        
             plan = daemon.hw.compute_plan(balance=req.balance, overrides=req.overrides or None)
         except PlannerError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -492,7 +476,6 @@ def create_app(daemon: "Daemon") -> FastAPI:
             "explanation": plan.explanation,
             "rejected": plan.rejected,
         }
-        
 
     @app.get("/approvals", dependencies=guard)
     async def approvals(status: str = "pending", limit: int = 50) -> dict[str, Any]:
