@@ -3,6 +3,22 @@
 One FastAPI app, served on a Unix socket (always) and optionally on TCP. The CLI is a
 thin client over this, so there is exactly one way to talk to the daemon and no way to
 act on the system behind its back.
+
+**Who is allowed to ask what** is decided in one place, ``identify``:
+
+* a caller on the **Unix socket** is the owner. The filesystem already decided that —
+  anyone who can open the socket can read the database beside it — so asking for a
+  password there would be ceremony rather than security;
+* a caller over **TCP** is whoever their token or session cookie says, and nobody
+  without one. The TCP listener is off by default (`api.enabled`), so this only matters
+  once you have deliberately opened a port;
+* `instance.http_token` still works as a single shared service token for the
+  simple one-user case, and it grants owner rights because that is what it always did.
+
+Owner-only endpoints are the ones that change what the system *is*: reviewing a tool
+(which is letting generated code run on this machine), approving an expansion, taking
+backups, restoring, sleeping, stopping. A plain account can chat and read its own chats,
+and nothing else.
 """
 
 from __future__ import annotations
@@ -13,9 +29,13 @@ import json
 import time
 import uuid
 
+import secrets
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+from gustav.server.auth import COOKIE, Accounts, Identity, RateLimiter
 
 if TYPE_CHECKING:
     from gustav.daemon import Daemon
@@ -113,17 +133,61 @@ def create_app(daemon: "Daemon") -> FastAPI:
     )
     app.state.daemon = daemon
 
-    def authorize(request: Request) -> None:
-        """Socket callers are trusted by filesystem permissions; TCP callers are not."""
-        token = daemon.config.instance.http_token
-        if not token or request.client is None:
-            return
+    accounts = Accounts(daemon.db, session_days=daemon.config.api.session_days)
+    app.state.accounts = accounts
+    limiter = RateLimiter(daemon.config.api.rate_limit_per_minute)
+
+    def over_socket(request: Request) -> bool:
+        """Unix-socket requests have no client address; TCP ones do."""
+        return request.client is None
+
+    def identify(request: Request) -> Identity:
+        """Who is asking. Raises 401 rather than guessing."""
+        if over_socket(request):
+            return Identity(kind="socket")
+
+        limiter.check(request)
+        service = daemon.config.instance.http_token
         header = request.headers.get("authorization", "")
         presented = header.removeprefix("Bearer ").strip()
-        if presented != token:
-            raise HTTPException(status_code=401, detail="invalid or missing token")
+        if service and presented and secrets.compare_digest(presented, service):
+            return Identity(kind="service")
 
-    guard = [Depends(authorize)]
+        if daemon.config.api.accounts:
+            if presented:
+                identity = accounts.identify_token(presented)
+                if identity is not None:
+                    return identity
+            cookie = request.cookies.get(COOKIE)
+            if cookie:
+                identity = accounts.identify_session(cookie)
+                if identity is not None:
+                    return identity
+
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "this endpoint needs an account: sign in, or pass a token with "
+                "'Authorization: Bearer ...'"
+            ),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    def require_owner(request: Request) -> Identity:
+        identity = identify(request)
+        if not identity.is_owner:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "that needs the owner account: it changes what the system is, not "
+                    "just what it says"
+                ),
+            )
+        return identity
+
+    guard = [Depends(require_owner)]
+    #: Anything an ordinary account may use.
+    account = [Depends(identify)]
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

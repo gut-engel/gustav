@@ -206,6 +206,44 @@ class TunableConfig(Strict):
     warm_cache_mb: int = 8192
 
 
+class ApiConfig(Strict):
+    """The TCP API: what the remote CLI and the web interface talk to.
+
+    **Off by default, and that is the point.** Everything the daemon can do is already
+    reachable over the Unix socket, where the filesystem decides who may ask. Opening a
+    port means the network may ask, so it is a deliberate act — and once it is open,
+    every request has to say who it is from.
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8713
+    #: Accounts with passwords, tokens and sessions. With this off, the only way in is
+    #: `instance.http_token`, which is one shared secret and has no idea who used it.
+    accounts: bool = True
+    #: Let anyone with the address create an account. Off: you make the accounts.
+    allow_registration: bool = False
+    #: How long a browser stays signed in.
+    session_days: int = 30
+    #: Browsers served from another origin. Empty means same-origin only, which is what
+    #: you want when the web interface is served by this daemon.
+    cors_origins: list[str] = []
+    #: Requests per minute per caller, before they are refused. A local assistant has no
+    #: business serving a crowd, and a loop in someone's script should not be able to
+    #: hold the GPU.
+    rate_limit_per_minute: int = 120
+
+
+class WebConfig(Strict):
+    """The web interface, served by the daemon from the package. Off by default."""
+
+    enabled: bool = False
+    title: str = "gustav"
+    #: Show the owner's panels (status, tools review, approvals) in the browser. Owner
+    #: accounts only either way; this hides them entirely.
+    owner_panels: bool = True
+
+
 class ToolsConfig(Strict):
     """Section 11: tools the system writes for itself.
 
@@ -501,6 +539,8 @@ class Config(Strict):
     #: file still loads under this build.
     backup: BackupConfig = BackupConfig()
     inference: dict[str, Any] = {}
+    api: ApiConfig = ApiConfig()
+    web: WebConfig = WebConfig()
     tools: ToolsConfig = ToolsConfig()
     expansion: ExpansionConfig = ExpansionConfig()
     optimisation: OptimisationConfig = OptimisationConfig()

@@ -508,10 +508,62 @@ MIGRATION_0005 = [
     "CREATE INDEX idx_tool_requests_open ON tool_requests (status, id)",
 ]
 
+MIGRATION_0006 = [
+    # Section 12: accounts, for when the TCP API is switched on. A caller on the Unix
+    # socket is the owner — the filesystem already decided that — so these tables only
+    # matter once the network can ask.
+    """
+    CREATE TABLE users (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT NOT NULL UNIQUE,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        password_hash TEXT NOT NULL,
+        role          TEXT NOT NULL DEFAULT 'user',   -- owner | user
+        disabled      INTEGER NOT NULL DEFAULT 0,
+        last_seen_at  TEXT,
+        note          TEXT
+    )
+    """,
+    # Tokens for the CLI. Only the hash is stored: a token is shown once, when it is
+    # created, and cannot be recovered afterwards — only replaced.
+    """
+    CREATE TABLE api_tokens (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        name         TEXT NOT NULL DEFAULT 'cli',
+        token_hash   TEXT NOT NULL UNIQUE,
+        last_used_at TEXT,
+        expires_at   TEXT,
+        revoked      INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX idx_api_tokens_user ON api_tokens (user_id, revoked)",
+    # Browser sessions for the web interface. Same thing with an expiry.
+    """
+    CREATE TABLE web_sessions (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        token_hash   TEXT NOT NULL UNIQUE,
+        last_seen_at TEXT,
+        expires_at   TEXT,
+        user_agent   TEXT
+    )
+    """,
+    "CREATE INDEX idx_web_sessions_user ON web_sessions (user_id)",
+    # A chat belongs to an account once there are accounts. NULL means "the owner, over
+    # the socket", which is every chat that existed before this migration.
+    "ALTER TABLE sessions ADD COLUMN user_id INTEGER REFERENCES users(id)",
+    "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX idx_sessions_user ON sessions (user_id, last_activity_at DESC)",
+]
+
 MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (1, "initial_daemon_schema", MIGRATION_0001),
     (2, "weight_change_log", MIGRATION_0002),
     (3, "learning_store", MIGRATION_0003),
     (4, "expansion_and_optimisation", MIGRATION_0004),
     (5, "tools", MIGRATION_0005),
+    (6, "accounts", MIGRATION_0006),
 ]
