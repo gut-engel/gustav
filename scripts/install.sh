@@ -2,6 +2,12 @@
 
 set -euo pipefail
 
+# If not running as root, re-execute with sudo to gain privileges for system directories
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Re-running script with sudo..."
+  exec sudo "$0" "$@"
+fi
+
 # Default values
 INSTALL_DIR="/opt/gustav"
 SERVICE_USER=""
@@ -26,6 +32,7 @@ Options:
   --source <path>         Use a local source directory instead of cloning.
   --port <port>           Port for the web server (default: $PORT).
   --no-prompt             Run without interactive prompts, using defaults.
+  --one-liner             Print a one‑liner curl command for quick install.
   --help                  Show this help message.
 EOF
   exit 1
@@ -41,8 +48,10 @@ while [[ $# -gt 0 ]]; do
     --source) SOURCE="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --no-prompt) NO_PROMPT=true; shift ;;
+    --one-liner) echo "curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- ${*:2}"; exit 0 ;;
     --help) usage ;;
-    *) echo "Unknown option: $1"; usage ;;
+    --*) echo "Unknown option: $1"; usage ;;
+    *) echo "Unexpected argument: $1"; usage ;;
   esac
 done
 
@@ -105,18 +114,20 @@ else
   fi
 fi
 
-# Ensure install directory exists
-mkdir -p "$INSTALL_DIR"
+# Ensure install directory exists (needs root)
+sudo mkdir -p "$INSTALL_DIR"
 
 # Install CLI client
 if [ "$CLIENT_ONLY" = true ]; then
   echo "Installing CLI client..."
   if [ -n "$SOURCE" ]; then
-    cp -r "$SOURCE" "$INSTALL_DIR"
-    (cd "$INSTALL_DIR" && pip install .)
+    sudo cp -r "$SOURCE" "$INSTALL_DIR"
+    PYEXE=$(command -v python3 || command -v python || echo "python")
+    sudo "$PYEXE" -m pip install "$INSTALL_DIR"
   else
-    git clone --depth 1 --branch "$REF" https://github.com/gut-engel/gustav.git "$INSTALL_DIR"
-    (cd "$INSTALL_DIR" && pip install .)
+    sudo git clone --depth 1 --branch "$REF" https://github.com/gut-engel/gustav.git "$INSTALL_DIR"
+    PYEXE=$(command -v python3 || command -v python || echo "python")
+    sudo "$PYEXE" -m pip install "$INSTALL_DIR"
   fi
   echo "CLI installed. Add \"$INSTALL_DIR/.local/bin\" to your PATH if needed."
 fi
@@ -153,7 +164,6 @@ EOT
   # Create first admin if requested
   if [ "$CREATE_ADMIN" = true ]; then
     echo "Creating admin account..."
-    # Use the installed CLI to create admin
     ai user add --name "$admin_name" --role owner --password "$admin_pass"
     echo "Admin account '$admin_name' created."
   fi
