@@ -248,6 +248,28 @@ optimisation:
   # ...and may not cost more than this on the held-out suite.
   max_quality_loss: 0.02
 
+api:
+  # The TCP API: what a remote `ai` and the web interface talk to. Off by default —
+  # everything is already reachable over the Unix socket, where the filesystem decides
+  # who may ask. Opening a port means the network may ask, so it is a deliberate act.
+  enabled: false
+  host: 127.0.0.1          # 0.0.0.0, or a tailscale/wireguard address
+  port: 8713
+  # Accounts with passwords, tokens and sessions. With this off the only way in is
+  # instance.http_token, which is one shared secret and has no idea who used it.
+  accounts: true
+  allow_registration: false
+  session_days: 30
+  cors_origins: []
+  # Requests per minute per caller before they are refused.
+  rate_limit_per_minute: 120
+
+web:
+  # The web interface, served by the daemon. Off by default, and needs api.enabled.
+  enabled: false
+  title: gustav
+  owner_panels: true
+
 tools:
   # Section 11: tools the system writes for itself. A tool is source code that runs on
   # this machine, which makes it the most dangerous thing here — so nothing is callable

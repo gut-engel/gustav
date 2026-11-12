@@ -32,6 +32,7 @@ class DaemonUnreachable(RuntimeError):
 class Client:
     def __init__(self, socket: Path, *, base_url: str | None = None, token: str | None = None):
         self.socket = socket
+        self._token = token
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         if base_url:
             self._client = httpx.Client(base_url=base_url, timeout=TIMEOUT, headers=headers)
@@ -57,6 +58,25 @@ class Client:
                 detail = response.text
             raise RuntimeError(f"daemon returned {response.status_code}: {detail}")
         return response.json()
+
+    @property
+    def token(self) -> str | None:
+        return self._token
+
+    @token.setter
+    def token(self, value: str | None) -> None:
+        """Used by `ai login`, which gets its token mid-conversation."""
+        self._token = value
+        if value:
+            self._client.headers["Authorization"] = f"Bearer {value}"
+        else:
+            self._client.headers.pop("Authorization", None)
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def get(self, path: str, **kwargs: Any) -> Any:
         return self.request("GET", path, **kwargs)
@@ -1099,7 +1119,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket", help="control socket path")
     parser.add_argument("--url", help="talk to a remote daemon over HTTP instead")
     parser.add_argument("--token", help="bearer token for a remote daemon")
-    sub = parser.add_subparsers(dest="command", required=True)
+    # Not required: bare `ai` opens a chat, the way you would expect from something
+    # you installed to talk to.
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("login", help="point this machine at a server, once")
+    p.add_argument("url", nargs="?", help="e.g. https://box.example:8713")
+    p.add_argument("--user", help="account name (asked for if omitted)")
+    p.add_argument("--token", help="use a token instead of a password")
+    p.add_argument("--label", default="cli", help="what this token is for")
+    p.set_defaults(local=True)
+
+    sub.add_parser("logout", help="forget the saved server").set_defaults(local=True)
+    sub.add_parser("whoami", help="which server and account this machine uses")
+
+    p = sub.add_parser("user", help="accounts for the API and the web interface")
+    p.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=("list", "add", "passwd", "role", "token", "disable", "enable", "delete"),
+    )
+    p.add_argument("name", nargs="?")
+    p.add_argument("password", nargs="?", help="or the new role, for 'role'")
+    p.add_argument("--owner", action="store_true", help="make them an owner")
+    p.add_argument("--label", help="what a new token is for")
 
     p = sub.add_parser("start", help="run the daemon in the foreground")
     p.set_defaults(local=True)
@@ -1261,6 +1305,177 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cmd_login(args: argparse.Namespace) -> int:
+    """Point this machine at a server, once."""
+    import getpass
+
+    from gustav import client as client_config
+
+    url = (args.url or "").strip()
+    if not url and not args.token:
+        print("ai login <url>   (e.g. ai login https://box.example:8713)", file=sys.stderr)
+        return 2
+    if url and "://" not in url:
+        url = f"https://{url}"
+    url = url.rstrip("/")
+
+    token = args.token
+    account = args.user
+    with Client(Path("/nonexistent.sock"), base_url=url, token=token) as probe:
+        if token is None:
+            account = account or input("account: ").strip()
+            password = getpass.getpass("password: ")
+            try:
+                payload = probe.post(
+                    "/auth/token",
+                    json={"name": account, "password": password, "label": args.label},
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            token = payload["token"]
+            account = payload["user"]["name"]
+        probe.token = token
+        try:
+            me = probe.get("/auth/me")
+        except RuntimeError as exc:
+            print(f"the server would not accept that: {exc}", file=sys.stderr)
+            return 1
+
+    account = account or me.get("name")
+    path = client_config.save(url, token, account=account)
+    print(f"signed in to {url} as {account} ({me.get('role', 'user')})")
+    print(f"  saved to {path}")
+    print("  ai            # chat")
+    return 0
+
+
+def cmd_logout(args: argparse.Namespace) -> int:
+    from gustav import client as client_config
+
+    endpoint = client_config.load()
+    if client_config.forget():
+        print(f"forgot {endpoint.url}")
+    else:
+        print("this machine was not signed in to anything")
+    return 0
+
+
+def cmd_whoami(args: argparse.Namespace, client: Client) -> int:
+    from gustav import client as client_config
+
+    endpoint = client_config.resolve(url=args.url, token=args.token)
+    try:
+        me = client.get("/auth/me")
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"server    {endpoint.describe()}")
+    print(f"account   {me['name']} ({me['role']}, via {me['via']})")
+    print(f"instance  {me.get('instance', '?')} {me.get('version', '')}")
+    if not me.get("accounts", True):
+        print("          accounts are switched off on this daemon")
+    return 0
+
+
+def cmd_user(args: argparse.Namespace, client: Client) -> int:
+    import getpass
+
+    action = args.action or "list"
+    if action == "list":
+        payload = client.get("/users")
+        if not payload["users"]:
+            print("no accounts yet. 'ai user add <name> --owner' makes the first one.")
+            return 0
+        print(f"  {'account':<20} {'role':<7} {'state':<9} last seen")
+        for user in payload["users"]:
+            state = "disabled" if user["disabled"] else "ok"
+            print(
+                f"  {user['name']:<20} {user['role']:<7} {state:<9} "
+                f"{user['last_seen_at'] or 'never'}"
+            )
+        live = [t for t in payload["tokens"] if not t["revoked"]]
+        if live:
+            print()
+            print(f"  {len(live)} live token(s):")
+            for item in live:
+                print(
+                    f"    [{item['id']}] {item['user']}/{item['name']} "
+                    f"created {item['created_at']}, last used {item['last_used_at'] or 'never'}"
+                )
+        return 0
+
+    if not args.name:
+        print(f"ai user {action} <name>", file=sys.stderr)
+        return 2
+
+    if action == "add":
+        password = args.password or getpass.getpass(f"password for {args.name}: ")
+        if not args.password:
+            again = getpass.getpass("again: ")
+            if again != password:
+                print("those did not match", file=sys.stderr)
+                return 1
+        try:
+            user = client.post(
+                "/users",
+                json={
+                    "name": args.name,
+                    "password": password,
+                    "role": "owner" if args.owner else "user",
+                },
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"created {user['name']} ({user['role']})")
+        print("  they sign in with:  ai login <url>")
+        return 0
+
+    if action == "passwd":
+        password = args.password or getpass.getpass(f"new password for {args.name}: ")
+        client.post(f"/users/{args.name}", json={"password": password})
+        print(f"{args.name}: password changed; every token and session was revoked")
+        return 0
+
+    if action in ("disable", "enable"):
+        client.post(f"/users/{args.name}", json={"disabled": action == "disable"})
+        print(f"{args.name} is now {'disabled' if action == 'disable' else 'enabled'}")
+        return 0
+
+    if action == "role":
+        role = args.password or "user"   # reuses the positional for the new role
+        client.post(f"/users/{args.name}", json={"role": role})
+        print(f"{args.name} is now {role}")
+        return 0
+
+    if action == "token":
+        payload = client.post(
+            f"/users/{args.name}", json={"token": args.label or "cli"}
+        )
+        print(payload["token"])
+        print("  shown once. On the other machine:  ai login <url> --token <this>",
+              file=sys.stderr)
+        return 0
+
+    if action == "delete":
+        client.request("DELETE", f"/users/{args.name}")
+        print(f"deleted {args.name}")
+        return 0
+
+    print(f"unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
+def _endpoint(args: argparse.Namespace):
+    """Which server this invocation talks to: a flag, the environment, or the file."""
+    from gustav import client as client_config
+
+    return client_config.resolve(
+        url=getattr(args, "url", None), token=getattr(args, "token", None)
+    )
+
+
 def _resolve_socket(args: argparse.Namespace) -> Path:
     if args.socket:
         return Path(args.socket)
@@ -1283,19 +1498,35 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        # Bare `ai` is a chat, so give the namespace what cmd_chat expects.
+        args.message, args.session, args.no_stream = [], None, False
 
     if getattr(args, "not_yet", None):
         return cmd_not_yet(args.not_yet)
     if getattr(args, "local", False):
-        local = {"start": cmd_start, "init": cmd_init, "service": cmd_service}
+        local = {
+            "start": cmd_start,
+            "init": cmd_init,
+            "service": cmd_service,
+            "login": cmd_login,
+            "logout": cmd_logout,
+        }
         return local[args.command](args)
     if args.command == "plan-hardware" and (args.offline or args.simulate):
         return cmd_plan_hardware_offline(args)
 
-    client = Client(_resolve_socket(args), base_url=args.url, token=args.token)
+    endpoint = _endpoint(args)
+    client = Client(
+        _resolve_socket(args), base_url=endpoint.url, token=endpoint.token
+    )
     try:
-        if args.command == "chat":
+        if args.command in (None, "chat"):
             return cmd_chat(args, client)
+        if args.command == "whoami":
+            return cmd_whoami(args, client)
+        if args.command == "user":
+            return cmd_user(args, client)
         if args.command == "status":
             return cmd_status(args, client)
         if args.command == "sleep":

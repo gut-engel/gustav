@@ -362,12 +362,29 @@ class Daemon:
         self._servers.append(uds_server)
         self._tasks.append(asyncio.create_task(uds_server.serve(), name="uds-server"))
 
-        if self.config.instance.http_enabled:
+        # `api.enabled` is the switch; `instance.http_enabled` is what it used to be
+        # called and still works. Either one opens the port, and the port is the only
+        # way the network can reach any of this.
+        api = self.config.api
+        if api.enabled or self.config.instance.http_enabled:
+            host = api.host if api.enabled else self.config.instance.http_host
+            port = api.port if api.enabled else self.config.instance.http_port
+            self.log.info(
+                "the API is listening on %s:%s (%s)",
+                host,
+                port,
+                "accounts" if api.accounts else "shared token only",
+            )
+            if host not in ("127.0.0.1", "localhost", "::1") and not api.accounts:
+                self.log.warning(
+                    "the API is reachable from the network with accounts switched off; "
+                    "everyone who has instance.http_token is the owner"
+                )
             tcp_server = _Server(
                 uvicorn.Config(
                     app,
-                    host=self.config.instance.http_host,
-                    port=self.config.instance.http_port,
+                    host=host,
+                    port=port,
                     log_level=level,
                     access_log=False,
                 )

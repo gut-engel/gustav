@@ -31,11 +31,11 @@ import uuid
 
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from gustav.server.auth import COOKIE, Accounts, Identity, RateLimiter
+from gustav.server.auth import COOKIE, Accounts, AuthError, Identity, RateLimiter
 
 if TYPE_CHECKING:
     from gustav.daemon import Daemon
@@ -124,6 +124,32 @@ class ToolRequestBody(BaseModel):
     text: str
 
 
+class UserRequest(BaseModel):
+    name: str = Field(min_length=1)
+    password: str = Field(min_length=8)
+    role: str = "user"
+    note: str = ""
+
+
+class UserUpdate(BaseModel):
+    password: str | None = None
+    role: str | None = None
+    disabled: bool | None = None
+    #: Issue a token for this account and return it, once.
+    token: str | None = None
+
+
+class Credentials(BaseModel):
+    name: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+
+class TokenRequest(Credentials):
+    #: What the token is for, so `ai user tokens` is readable later.
+    label: str = "cli"
+    days: int | None = None
+
+
 def create_app(daemon: "Daemon") -> FastAPI:
     app = FastAPI(
         title="gustav",
@@ -199,6 +225,139 @@ def create_app(daemon: "Daemon") -> FastAPI:
             "pid": daemon.status()["pid"],
         }
 
+    # ------------------------------------------------------------------
+    # accounts
+    # ------------------------------------------------------------------
+    @app.get("/auth/me")
+    async def whoami(request: Request) -> dict[str, Any]:
+        """Who the daemon thinks you are. The one endpoint a client calls first."""
+        identity = identify(request)
+        return {
+            **identity.to_dict(),
+            "accounts": daemon.config.api.accounts,
+            "instance": daemon.config.instance.name,
+            "version": daemon.status()["version"],
+        }
+
+    @app.post("/auth/token")
+    async def issue_token(req: TokenRequest, request: Request) -> dict[str, Any]:
+        """Exchange a password for a token. What `ai login` calls.
+
+        Deliberately available without being signed in — proving you know the password
+        *is* the authentication. It is rate limited like everything else on the TCP
+        listener, and it is the only place a password is accepted.
+        """
+        if not daemon.config.api.accounts:
+            raise HTTPException(
+                status_code=404,
+                detail="this daemon has accounts switched off (api.accounts)",
+            )
+        try:
+            user = accounts.authenticate(req.name, req.password)
+            token = accounts.issue_token(user.name, label=req.label, days=req.days)
+        except AuthError as exc:
+            # One message for a wrong name and a wrong password: which of the two it
+            # was is not the caller's business.
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        daemon.events.emit(
+            "auth.token_issued",
+            f"a {req.label} token was issued for {user.name}",
+            user=user.name,
+            label=req.label,
+        )
+        return {"token": token, "user": user.to_dict()}
+
+    @app.post("/auth/login")
+    async def login(req: Credentials, request: Request, response: Response) -> dict[str, Any]:
+        """Sign a browser in. Sets an httpOnly cookie; the page never sees the token."""
+        if not daemon.config.api.accounts:
+            raise HTTPException(status_code=404, detail="accounts are switched off")
+        try:
+            user = accounts.authenticate(req.name, req.password)
+        except AuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        token = accounts.start_session(
+            user, user_agent=request.headers.get("user-agent", "")
+        )
+        response.set_cookie(
+            COOKIE,
+            token,
+            httponly=True,
+            samesite="lax",
+            # Only over HTTPS when the request itself came over HTTPS, so this works on
+            # a plain-HTTP machine on your own network without silently dropping the
+            # cookie — and is secure wherever it matters.
+            secure=request.url.scheme == "https",
+            max_age=daemon.config.api.session_days * 86400,
+            path="/",
+        )
+        return {"user": user.to_dict()}
+
+    @app.post("/auth/logout")
+    async def logout(request: Request, response: Response) -> dict[str, Any]:
+        cookie = request.cookies.get(COOKIE)
+        if cookie:
+            accounts.end_session(cookie)
+        response.delete_cookie(COOKIE, path="/")
+        return {"ok": True}
+
+    @app.get("/users", dependencies=guard)
+    async def list_users() -> dict[str, Any]:
+        return {
+            "accounts": daemon.config.api.accounts,
+            "users": [user.to_dict() for user in accounts.all()],
+            "tokens": accounts.tokens(),
+        }
+
+    @app.post("/users", dependencies=guard)
+    async def create_user(req: UserRequest) -> dict[str, Any]:
+        try:
+            user = accounts.create(
+                req.name, req.password, role=req.role, note=req.note or ""
+            )
+        except AuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        daemon.events.emit(
+            "auth.user_created",
+            f"the account {user.name!r} was created ({user.role})",
+            level="warning",
+            user=user.name,
+            role=user.role,
+        )
+        return user.to_dict()
+
+    @app.post("/users/{name}", dependencies=guard)
+    async def update_user(name: str, req: UserUpdate) -> dict[str, Any]:
+        try:
+            if req.password is not None:
+                accounts.set_password(name, req.password)
+            if req.role is not None:
+                accounts.set_role(name, req.role)
+            if req.disabled is not None:
+                accounts.disable(name, disabled=req.disabled)
+            if req.token:
+                return {
+                    "user": accounts.find(name).to_dict(),
+                    "token": accounts.issue_token(name, label=req.token),
+                }
+        except AuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        user = accounts.find(name)
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"no account called {name!r}")
+        return {"user": user.to_dict()}
+
+    @app.delete("/users/{name}", dependencies=guard)
+    async def delete_user(name: str) -> dict[str, Any]:
+        try:
+            accounts.delete(name)
+        except AuthError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        daemon.events.emit(
+            "auth.user_deleted", f"the account {name!r} was deleted", level="warning"
+        )
+        return {"deleted": name}
+
     @app.get("/status", dependencies=guard)
     async def status() -> dict[str, Any]:
         return daemon.status()
@@ -206,7 +365,9 @@ def create_app(daemon: "Daemon") -> FastAPI:
     def sse(payload: dict[str, Any]) -> str:
         return f"data: {json.dumps(payload)}\n\n"
 
-    @app.post("/chat", dependencies=guard)
+    # Chatting is what an ordinary account is for. Everything else on this app changes
+    # what the system *is* rather than what it says, and stays with the owner.
+    @app.post("/chat", dependencies=account)
     async def chat(req: ChatRequest):
         if not req.stream:
             try:
@@ -229,7 +390,7 @@ def create_app(daemon: "Daemon") -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    @app.post("/v1/chat/completions", dependencies=guard)
+    @app.post("/v1/chat/completions", dependencies=account)
     async def openai_chat(req: OpenAIRequest):
         """OpenAI-compatible, so existing clients work against the local daemon."""
         user_messages = [m for m in req.messages if m.role == "user"]

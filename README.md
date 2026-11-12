@@ -66,31 +66,65 @@ useful kind of result:
 
 ## Install
 
-Needs Python 3.12+ (3.14 is fine; torch 2.15 ships `cp314` wheels) and an NVIDIA GPU.
+One command on the machine you want it on. The repository is private, so the command
+carries a credential — see [below](#the-token) for how to mint one that can do nothing
+else.
+
+**A server** — runs the model, learns, sleeps. Needs an NVIDIA GPU:
+
+```bash
+GUSTAV_TOKEN=github_pat_… bash -c "$(curl -fsSL \
+  -H "Authorization: Bearer $GUSTAV_TOKEN" -H 'Accept: application/vnd.github.raw' \
+  https://api.github.com/repos/gut-engel/gustav/contents/scripts/install.sh)" -- --server
+```
+
+**A client** — just the `ai` command, talking to a server you already run. No CUDA, no
+model, a few megabytes:
+
+```bash
+GUSTAV_TOKEN=github_pat_… bash -c "$(curl -fsSL \
+  -H "Authorization: Bearer $GUSTAV_TOKEN" -H 'Accept: application/vnd.github.raw' \
+  https://api.github.com/repos/gut-engel/gustav/contents/scripts/install.sh)" -- \
+  --client --url https://your-server:8713
+```
+
+Both install into `~/gustav`, run as you, and put `ai` in `~/.local/bin`. Neither asks
+for sudo: gustav wants your GPU, your files and your home directory, and a daemon
+running as root has none of those. Run the same command again to update — your
+`config.yaml`, your database, your adapters and your tools are left alone.
+
+`--dry-run` prints what it would do and changes nothing. `--help` lists the rest:
+`--dir`, `--ref`, `--ssh` (clone over SSH instead of using a token), `--source` (install
+from a checkout you already have), `--no-service`.
+
+`scripts/uninstall.sh` takes away what the installer put there — the virtualenv, the
+`ai` symlink, the service — and **leaves what it learned**: the database, the adapters,
+the tools you approved, the backups. `--purge` deletes those too, after listing them.
+Uninstalling a program should not silently delete a year of learning.
+
+### The token
+
+A one-liner that can read a private repository *is* a credential — treat it like one.
+Make a fine-grained token that can do nothing else:
+
+1. github.com → Settings → Developer settings → **Fine-grained tokens** → Generate new
+2. Repository access: **Only select repositories** → `gustav`
+3. Permissions: **Contents: Read-only**. Nothing else.
+4. Set an expiry you are comfortable with.
+
+Then keep it out of your shell history — `read -rs GUSTAV_TOKEN` before pasting the
+command, or put it in a file only you can read. The installer uses it to clone and then
+**removes it from `.git/config`**, so it does not end up in a backup of the machine.
+
+With SSH access to GitHub already set up, `--ssh` skips the token entirely.
+
+### From a checkout
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[ml,dev]"   # ~4 GB of CUDA wheels
 .venv/bin/python daemon.py             # plans, then loads the model it chose
 ```
-
-Installed rather than cloned, start with an empty directory:
-
-```bash
-pip install gustav[ml]
-mkdir ~/gustav && cd ~/gustav
-ai init                    # writes config.yaml, modules/registry.yaml, docs/sources.yaml
-ai plan-hardware -v        # what it would run here, and why
-ai model pull qwen3-4b
-ai service install         # a systemd *user* unit, so it runs as you
-```
-
-`ai init` never overwrites a file you already have, and the daemon writes the default
-registry and source map by itself if they are missing — a project with neither is not a
-useful default, and a file under `site-packages` is not somewhere anyone would think to
-edit. The service unit keeps the one always-on process running and is **not** a
-scheduler: the daemon decides when to sleep by itself, and a timer there would break the
-rule the whole design rests on.
 
 In another terminal:
 
@@ -100,14 +134,52 @@ ai chat "what can you do?"
 ai bench                   # measures this machine; the planner then stops guessing
 ```
 
-`pip install -e .` puts `ai` on your PATH inside the venv. Without installing, `python
-daemon.py` works straight from a checkout. Without the `ml` extra the daemon still runs
-end to end with a placeholder responder (`inference.responder: echo`), which is how most
-of the test suite stays fast.
+Needs Python 3.12+ (3.14 is fine; torch 2.15 ships `cp314` wheels) and an NVIDIA GPU.
 
-**FlashAttention-2 is optional.** It is not in the extras because it builds from source;
-install `flash-attn` yourself and the planner picks it up. Without it, PyTorch SDPA is
-used, and the plan says so rather than claiming otherwise.
+### Reaching it from another machine
+
+The TCP API is **off until you turn it on**, and with it off nothing but the Unix socket
+can reach the daemon — which means whoever can log in to that machine, and nobody else.
+
+```yaml
+api:
+  enabled: true
+  host: 0.0.0.0        # or a tailscale/wireguard address
+  port: 8713
+```
+
+Then make yourself an account and a token for the other machine:
+
+```
+$ ai user add simon --owner
+password for simon: ********
+again: ********
+created simon (owner)
+  they sign in with:  ai login <url>
+```
+
+On the laptop, after the client install:
+
+```
+$ ai login https://your-server:8713
+account: simon
+password: ********
+signed in to https://your-server:8713 as simon (owner)
+  saved to /home/you/.config/gustav/client.json
+  ai            # chat
+```
+
+`ai` on its own now opens a chat against that server. `ai whoami` says which server and
+account are in use; `ai logout` forgets them. The saved file holds a token and is
+written `600`.
+
+Accounts come in two kinds. An **owner** can do everything the local socket can —
+review tools, approve expansions, take backups, make accounts. A plain **user** can
+chat and read their own chats, and that is all: approving a tool means letting generated
+code run on your machine, which is not something to hand out with a chat account.
+
+Put it behind TLS if it leaves your own network. There is no certificate handling here
+on purpose — a reverse proxy does that job better than anything this would grow.
 
 ## How the daemon schedules itself
 
@@ -909,6 +981,9 @@ and the estimates become exact.
 
 | | |
 |---|---|
+| `ai` | chat, against whichever server this machine is pointed at |
+| `ai login <url>` / `ai logout` / `ai whoami` | point this machine at a server, once |
+| `ai user add\|list\|passwd\|role\|token\|disable\|delete` | accounts for the API and the web interface |
 | `ai init [dir]` | make a directory into a gustav project (never overwrites) |
 | `ai start` | run the daemon in the foreground |
 | `ai service install\|uninstall\|status` | run it as a systemd user service |
@@ -948,7 +1023,8 @@ existing clients work against the local daemon), `/health`, `/status`, `/adapter
 `/adapter/rollback`, `/adapter/activate`, `/hardware`, `/models`, `/bench`, `/runs`,
 `/facts`, `/skills`, `/report`, `/approvals`, `/expansion`, `/expansion/revert`,
 `/optimisation`, `/optimisation/revert`, `/tools`, `/tools/{name}`,
-`/tools/{name}/review`, `/tools/{name}/run` and `/tools/requests`.
+`/tools/{name}/review`, `/tools/{name}/run`, `/tools/requests`, `/auth/me`,
+`/auth/token`, `/auth/login`, `/auth/logout` and `/users`.
 
 ## Configuration
 
@@ -968,6 +1044,8 @@ The sections the night reads, with the defaults worth knowing:
 | `gate` | `min_improvement` (0.0), `max_regression` (0.02), `min_items` (8), `max_promotions_per_run` (1), `scorer` (embedding) |
 | `expansion` | `max_changes_per_run` (1), `min_uncovered_requests` (8), `saturation_runs` (3), `rank_step` (8), `allow_pruning` (off), `allow_base_merge` (off), `require_approval` |
 | `optimisation` | `settings` (the knobs it may measure), `max_trials_per_run` (2), `min_relative_gain` (0.05), `max_quality_loss` (0.02) |
+| `api` | `enabled` (off), `host`, `port`, `accounts`, `session_days` (30), `rate_limit_per_minute` (120) |
+| `web` | `enabled` (off), `title` |
 | `tools` | `enabled`, `allow_authoring`, `require_approval` (on), `max_calls_per_turn` (4), `timeout_seconds` (10), `allow_capabilities` (`pure`, `write_workspace`), `readable_paths` (empty), `allowed_hosts` (empty), `allowed_modules` |
 
 `docs/sources.yaml` maps topics to documentation URLs and records the licence of each
@@ -998,6 +1076,7 @@ re-measuring it.
 ```
 daemon.py              the entry point
 config.yaml            your settings
+scripts/install.sh     the one-liner's installer: server or client, idempotent
 profiles/              hardware profiles, including the generated one
 docs/sources.yaml      topic -> documentation map, with licences; the fetcher's whole world
 modules/registry.yaml  the modules, their descriptions and their topic keywords
