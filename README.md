@@ -97,17 +97,6 @@ curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/unins
 ---
 
 
-You can install the CLI client with:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client
-```
-
-You can install the systemd service (server) with:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --service
-```
 
 The project can be installed in several ways:
 
