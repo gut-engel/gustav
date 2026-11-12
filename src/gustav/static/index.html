@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Gustav</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <div id="app">
+        <section id="login" class="panel hidden">
+            <h2>Login</h2>
+            <form id="loginForm">
+                <label>
+                    Username
+                    <input name="name" required minlength="1" />
+                </label>
+                <label>
+                    Password
+                    <input type="password" name="password" required minlength="1" />
+                </label>
+                <button type="submit">Log in</button>
+            </form>
+            <div id="loginError" class="error hidden"></div>
+        </section>
+
+        <section id="chatList" class="panel hidden">
+            <h2>Your Chats</h2>
+            <button id="newChatBtn">New Chat</button>
+            <ul id="chatUl"></ul>
+        </section>
+
+        <section id="chatView" class="panel hidden">
+            <h2 id="chatTitle"></h2>
+            <div id="messages" class="messages"></div>
+            <form id="msgForm">
+                <input id="msgInput" placeholder="Type a message…" autocomplete="off" required />
+                <button type="submit">Send</button>
+            </form>
+            <button id="backBtn">← Back to list</button>
+        </section>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
