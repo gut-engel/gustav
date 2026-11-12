@@ -66,6 +66,37 @@ useful kind of result:
 
 ## Install
 
+**CLI client one‑liner:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client
+```
+
+**Server one‑liner:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --service
+```
+
+You can install the CLI client with a one‑liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client
+```
+
+You can install the systemd service (server) with a one‑liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --service
+```
+
+You can also uninstall everything with a one‑liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/uninstall.sh | sudo bash -s --
+```
+
+---
+
+
 You can install the CLI client with:
 
 ```bash
