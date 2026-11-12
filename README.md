@@ -1,15 +1,1162 @@
 # Gustav
 
-A local, self-improving chat AI ...
+A local, self-improving chat AI with a wake/sleep cycle, run by **one always-on process**.
 
-*(full content omitted for brevity)*
+While awake it chats and records experience. While asleep it consolidates what it learned,
+studies documentation on topics where it measurably struggled, practises in a verifiable
+sandbox, trains LoRA adapters on the data that survived verification, optionally grows its
+own capacity, and promotes new weights **only** if a regression gate passes. Everything is
+local. The only component that touches the network is the documentation fetcher.
 
-## One‑liner installer
+There is no cron job, no systemd timer and no external scheduler. If `daemon.py` is
+running, the system is complete.
 
-You can install Gustav with a single command that you can copy‑paste into a fresh server:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | sudo bash -s -- --client --no-prompt
+```
+python daemon.py      # or: ai start
+ai status             # talk to it from another terminal
+ai chat "hello"
+ai sleep now
 ```
 
-This will automatically re‑exec with `sudo` if needed and use `python -m pip` for installations.
+## Status
+
+Built in reviewable stages, and all seven are done. It loads real weights and answers;
+it learns from the day, studies, practises under a verifier, trains LoRA adapters and
+promotes them only if a regression gate says they are better; it grows and tunes itself
+within budgets the hardware sets, asking first for anything it cannot take back; and it
+writes its own tools, which run sandboxed on the server and do nothing at all until you
+have read the source.
+
+| Stage | What it is | State |
+|---|---|---|
+| 1 | Daemon: state machine, scheduler, child supervision, journal, crash recovery, control plane | **done** |
+| 2 | Hardware detection, memory pre-flight, auto planner, base-model approvals | **done** |
+| 3 | Inference harness (transformers + PEFT), streaming chat, adapters, the wake phase | **done** |
+| 4 | Backups, verification, atomic promotion, the weight-change guard | **done** |
+| 5 | Sleep phase: consolidation, study, practice, training, the gate, the report | **done** |
+| 6 | Self-expansion, self-optimisation, router training, packaging | **done** |
+| 7 | Tools it writes for itself: sandbox, admission checks, review | **done** |
+
+Measured on the development machine (RTX 4070 SUPER, 12 GB) with Qwen3-4B in 4-bit NF4:
+**54 tok/s**, 25 ms to first token, 4.3 GiB peak VRAM. It hands the GPU over for real:
+VRAM drops from 6.8 GiB to 1.8 GiB when a sleep step takes the card, and a chat request
+takes it back and answers within two seconds, reload included.
+
+A complete night on the small model (Qwen3-0.6B, bf16, so it fits beside everything else
+on the card) runs end to end in **57 seconds** in `tests/test_gpu_night.py`: snapshot,
+consolidation, reflect, fetch, study, practice, dreaming, a LoRA, the gate, the expansion
+review, the retest, the measured tuning and the report — thirteen steps, each in its own
+child process, with the model loaded and dropped per step. That run is also where the
+tuning loop earns its keep in miniature: it measured `prefix_cache: False` at +1.6%,
+decided that was noise rather than a win, and put it back.
+
+Two things stage 6 measured and then refused to pretend about, because they are the
+useful kind of result:
+
+- **Speculative decoding is implemented and off by default.** The loop works and a
+  model drafting for itself accepts over 90% of proposals, but on this backend a draft
+  step costs nearly as much as a target step — a decode step at batch 1 is dominated by
+  per-layer launch and framework overhead, not arithmetic — so a 0.6B draft for a 4B
+  target measured **0.5x**, slower than not speculating. The planner therefore names a
+  draft model and leaves it off, and `ai optimize` measures it on *your* machine and
+  keeps it only if it wins.
+- **Self-optimisation only tunes what the serving path actually reads.** `batch_size`
+  sits in `tunable` because the planner reasons about it, but requests are served one at
+  a time, so "tuning" it would have been measuring noise and keeping the winner by luck.
+
+## Install
+
+The project can be installed in several ways:
+
+### 1️⃣ Python package (editable)
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e "[ml,dev]"
+```
+
+### 2️⃣ System-wide installation via the **pure‑bash installer**
+A full shell installer is provided in `scripts/install.sh`. It can install the CLI client, the systemd service, or both, and lets you configure:
+- Installation directory
+- Git reference or local source
+- Web UI enablement
+- Default per‑user usage limit
+- First admin account creation
+- Non‑interactive mode (`--no-prompt`)
+
+#### Basic usage
+```bash
+# Install both CLI and service (interactive)
+./scripts/install.sh --dir /opt/gustav
+
+# Install only the CLI client, no prompts
+./scripts/install.sh --client --no-prompt --dir /opt/gustav
+
+# Install only the systemd service with a custom port and usage limit
+./scripts/install.sh --service --port 8080 --no-prompt
+```
+
+The installer creates a systemd unit at `/etc/systemd/system/gustav.service` and starts it automatically. After installation you can manage it with `systemctl`:
+```bash
+sudo systemctl status gustav
+sudo systemctl restart gustav
+```
+
+### 3️⃣ Direct pip install (no repo checkout)
+```bash
+pip install gustav[ml]
+mkdir ~/gustav && cd ~/gustav
+ai init
+```
+
+---
+
+*`ai service install`* from the CLI is still available for a per‑user systemd unit, but the new `install.sh` offers a full‑system installer for administrators.
+
+
+`ai init` never overwrites a file you already have, and the daemon writes the default
+registry and source map by itself if they are missing — a project with neither is not a
+useful default, and a file under `site-packages` is not somewhere anyone would think to
+edit. The service unit keeps the one always-on process running and is **not** a
+scheduler: the daemon decides when to sleep by itself, and a timer there would break the
+rule the whole design rests on.
+
+In another terminal:
+
+```bash
+ai model pull qwen3-4b     # ~7.5 GiB, the only part that uses the network
+ai chat "what can you do?"
+ai bench                   # measures this machine; the planner then stops guessing
+```
+
+`pip install -e .` puts `ai` on your PATH inside the venv. Without installing, `python
+daemon.py` works straight from a checkout. Without the `ml` extra the daemon still runs
+end to end with a placeholder responder (`inference.responder: echo`), which is how most
+of the test suite stays fast.
+
+**FlashAttention-2 is optional.** It is not in the extras because it builds from source;
+install `flash-attn` yourself and the planner picks it up. Without it, PyTorch SDPA is
+used, and the plan says so rather than claiming otherwise.
+
+## How the daemon schedules itself
+
+One asyncio process holds the state machine:
+
+```
+STARTING ──▶ WAKE ──▶ SLEEP_PENDING ──▶ SLEEP ──▶ WAKE
+                │                                   │
+                └──────── SAFE_MODE / ERROR ◀───────┘
+```
+
+Four triggers can start a sleep, in any combination (`config.yaml`, section `schedule`):
+
+1. **Window** — a local-time window, `00:00-06:00` by default.
+2. **Idle** — no user activity for `idle_minutes` (45), inside a window or when pending
+   work is above the threshold.
+3. **Pending work** — enough unprocessed experience has accumulated (`pending_threshold`).
+4. **Manual** — `ai sleep now`, `ai wake`.
+
+Guards that stop it being annoying: `min_idle_seconds` (never interrupt a live
+conversation — and the same guard governs how soon a paused night resumes),
+`cooldown_minutes` between nights, `max_duration_minutes` per night, and
+`max_gpu_temp_c` to pause when the card is too hot.
+
+**It stays out of the way when the GPU is needed elsewhere.** If another process holds
+more than `schedule.max_foreign_vram_mb` (2 GiB) or the card is busier than
+`max_foreign_gpu_percent` (35%), it will not start a sleep run and says why — playing a
+game should not mean fighting the daemon for the card. `wake.idle_unload_minutes` (15)
+also releases the model after that long without a message, so several gigabytes of VRAM
+are not held for nothing; the next message reloads it. `ai release-gpu` does it now.
+
+**A message during sleep wins.** The daemon asks the running step to stop, the child
+checkpoints at a step boundary and exits, the GPU lease comes back to inference, you get
+your answer, and the night resumes later from the journal. With separate inference and
+training GPUs this never has to happen at all (`inference_gpus` / `training_gpus`, stage 2).
+
+## What makes it survive being killed
+
+- **One lock.** An exclusive `flock` on `var/gustav.pid`. A second daemon refuses to
+  start; a daemon killed with `-9` leaves no lock to clean up, because the kernel drops it.
+- **A journalled pipeline.** Every step of the night is written to SQLite before it runs,
+  with a status, an attempt count, a checkpoint and an `on_crash` policy:
+  `resume` (continue from the checkpoint), `restart` (cheap, redo it cleanly),
+  `rollback` (undo and abandon the night — used for anything that changes weights),
+  `skip`. Startup reads the journal and applies those policies before serving.
+- **Children, not threads.** Training, sandboxing and fetching run in `spawn`ed
+  processes with a heartbeat deadline, a wall-clock timeout, an `RLIMIT_AS` cap and
+  SIGTERM→SIGKILL escalation. A CUDA OOM or a segfault in a child is an event in the log,
+  not an outage.
+- **A watchdog.** A child that stops heart-beating is killed, logged, and retried with
+  backoff. After `max_attempts` the step is skipped for the night and shown in the report.
+- **One choke point for weight changes.** From stage 4, nothing writes adapters or base
+  checkpoints except through a guard that takes and verifies a backup first and swaps an
+  `active` symlink atomically. A crash at any instant leaves the previous working version live.
+- **Safe mode.** If the active adapter will not load or fails its health prompt at
+  startup, the daemon serves the last known-good weights (or the plain base model) and
+  says so in `ai status` instead of flapping.
+
+## Chatting
+
+```
+$ ai chat
+Chatting with gustav. /help for commands, Ctrl-D to leave.
+you> name three rust crates for async IO, just the names
+ai > tokio, async-std, tokio-stream
+[50.0 tok/s, 91 ms to first token, modules: personal-memory, rust, general]
+```
+
+Tokens stream as they are produced. The harness is ours end to end — transformers and
+PEFT for the weights, but the generation loop, the sampling (temperature, top-p, top-k,
+min-p, repetition penalty), the stop sequences and the KV handling are this project's:
+
+- **The model's own chat template**, never a format we invented. Hybrid reasoning models
+  such as Qwen3 have their `<think>` block switched off, detected from the template
+  rather than hardcoded. The backend takes a flag for it; nothing in the night turns it
+  on yet, so practice answers are measured without a reasoning block.
+- **Stop sequences match across token boundaries.** A model emitting `</tool` then `>`
+  has produced `</tool>`, and a partial match at the tail is held back rather than
+  streamed, so a client never sees half a stop sequence.
+- **Prefix caching.** A multi-turn chat re-sends the whole conversation every turn, so
+  the shared prefix — nearly the whole prompt — is reused instead of recomputed. In the
+  example above, turn 3 reused 64 of 117 prompt tokens. It is a genuine trade-off:
+  a reused cache computes the prefill differently, so a *greedy* answer can differ by a
+  token from the same question asked cold. Set `tunable.prefix_cache: false` if you need
+  bit-exactness.
+- **The context budget keeps room for the answer.** When the conversation outgrows the
+  window, the turns that fall off are folded into one summary message rather than
+  dropped — one short generation per conversation, cached until more turns fall off, so
+  a long chat pays for it once. The system prompt and the newest message always survive,
+  and a single over-long message is trimmed in the middle rather than cut off.
+  `wake.summarise_history: false` goes back to simply dropping them.
+
+Commands are handled before the model sees anything, and they are your control over what
+the system learns:
+
+| | |
+|---|---|
+| `/good`, `/bad` | becomes a preference pair |
+| `/correct <answer>` | highest-priority training data (weighted 10x against a thumb) |
+| `/forget [all]` | the last exchange, or the session, is never trained on — and the queued work for it is withdrawn |
+| `/clear`, `/help` | fresh conversation, the command list |
+
+**Secrets never reach the training data, or the disk.** Every message is scanned for API
+keys, tokens, private keys, credentials in URLs and `password: …` assignments. A hit
+marks the turn never-train *and* stores a redacted copy, because the store is backed up,
+copied between machines and summarised into reports:
+
+```
+$ ai chat "my key is sk-proj-abc... please remember it"
+(a openai-key was detected: stored redacted, never trained on)
+I cannot store or remember your key. ...
+
+$ sqlite3 var/gustav.db "select content, trainable from turns limit 1"
+my key is [REDACTED:openai-key] please remember it|0
+```
+
+The live request still sees the original text, so the answer is unaffected — only what is
+persisted changes. `wake.redact_secrets: false` keeps the raw text on disk; it is still
+never trained on. Detection is deliberately eager: a false positive costs one turn of
+training data, a false negative puts a credential in a file that gets copied around.
+
+**Implicit feedback is a candidate, not a verdict.** If you rephrase a question or say
+"no, that's wrong", that is recorded with a confidence and a reason and waits for review.
+It is never trained on by itself.
+
+## The night
+
+`ai sleep now`, or the scheduler, runs thirteen journalled steps. Every one of them is a
+spawned child process that is handed two paths, rebuilds the project from them, works
+through the SQLite store, and returns a result the journal keeps — so `ai runs <id>`
+explains any night, finished or not, and the morning report is regenerated from the
+store rather than from whatever the steps happened to print.
+
+| step | what it does |
+|---|---|
+| `snapshot` | a verified backup. Critical: if it fails, the night stops here |
+| `consolidation` | the day's turns and feedback become facts and training examples |
+| `reflect` | name tonight's topics from the measured skill table |
+| `fetch_docs` | fetch allowlisted documentation for those topics (the only network use) |
+| `study` | turn documentation into cited answers and verified exercises |
+| `practice` | attempt the exercises greedily; the verifier decides |
+| `dreaming` | sample until something passes, and keep only that |
+| `training` | one new LoRA version per module, written but not switched on |
+| `gate` | measure the candidate against what is being served, and promote or refuse |
+| `expansion` | grow capacity where measurements demand it, or ask |
+| `tools` | write the tools that were asked for, for you to review |
+| `retest` | ask the things it got wrong again, with the new weights |
+| `speed` | refit the router, and measure one tunable change |
+| `report` | the HTML report for the run |
+
+### Nothing is learned on the model's word alone
+
+Every example carries a `verified` flag, and it is only set when something other than the
+model agreed:
+
+| evidence | sets `verified` | why |
+|---|---|---|
+| a `/correct` from you | yes | you are the authority on what you wanted |
+| a `/good` from you | yes | you endorsed the answer that was given |
+| a test, run in the sandbox | yes | the code either passes or it does not |
+| an excerpt from documentation | no | grounded is not the same as correct |
+| several samples agreeing with each other | no | self-consistency is evidence, not proof |
+| the model saying so | never | this is the failure mode the whole design is about |
+
+`training.verified_only` is off by default, which means unverified material is trained on
+too — with lower weight, and with the gate as the backstop. Turning it on is the strict
+setting.
+
+### Consolidation: the day, in order of authority
+
+```
+consolidation  done  {'exchanges': 2, 'feedback': 2, 'corrections': 1, 'endorsements': 1,
+                      'facts_new': 1, 'examples': 3, 'model': True,
+                      'by_kind': {'correction': 1, 'fact': 1, 'preference': 1}}
+```
+
+- **A correction is the answer.** `/correct` produces an example weighted **ten times** a
+  thumbs-up, marked verified, with the rejected answer kept beside it.
+- **A thumbs-up is an endorsement**, so the answer that was given becomes an example.
+- **A thumbs-down is a question, not an answer.** We know the reply was wrong; we do not
+  know what the right one is. It becomes a *rewrite task* for `dreaming` to attempt under
+  verification — never a training example on its own.
+- **Implicit feedback is a candidate.** A rephrased question is counted and left for
+  review. Training on "the user asked again" teaches noise.
+- **A turn marked never-train cannot reach a dataset.** The join that pairs questions with
+  answers drops the whole exchange if either side is untrainable, so a detected secret or
+  a `/forget` is excluded by construction rather than by a later filter that might be
+  forgotten.
+
+### Facts are stated in the third person, and superseded rather than overwritten
+
+Extraction is deliberately narrow — a false fact about you is worse than a missed one,
+because it gets trained on and then asserted. Only statements, never questions; secrets
+never; and every fact is rewritten into the third person, because training on *"my editor
+is helix"* teaches the model that **its** editor is helix.
+
+```
+$ ai facts
+4 facts held
+  0.90  The user's name is Simon.  [name]
+  0.75  The user's editor is helix.  [editor]
+  0.75  The user's GPU is an RTX 4070 SUPER.  [gpu]
+  0.70  The user prefers short answers without preamble.
+
+$ ai facts --subject editor
+everything it has believed about 'editor':
+  was  2026-11-11 16:24:38  The user's editor is vim.
+  now  2026-11-11 16:24:38  The user's editor is helix.
+```
+
+A newer statement about the same subject supersedes the old one, which leaves the history
+readable and makes a wrong extraction retractable rather than invisible. When a model is
+available it is also asked to read the day's messages for facts the patterns missed — and
+every statement it proposes is checked for being *grounded* in the message it came from.
+An invention is thrown away; the overlap test is cheap and catches the common case.
+
+### Reflect: topics are measured, not guessed
+
+```
+$ ai skills
+4 of 4 topics measured, mean score 0.57
+  module           topic             score  trials  demand
+  rust             lifetime           0.29       5    0.57
+  rust             borrow             0.43       5    0.39
+  coding           regex              0.71       5    0.29
+  coding           async              0.86       5    0.20
+```
+
+Every verified attempt — a practice task, a gate item, a retested failure, a `/correct` —
+is a trial against a `(module, topic)` pair, where topics are the keywords the modules
+declare in `modules/registry.yaml`. The score is Laplace-smoothed, so one lucky pass is
+not a skill, and the ranking is `(1 - score) x (0.25 + demand)`: being bad at something
+nobody asks about does not earn a night of GPU time.
+
+Topics with **no** measurement are not treated as weaknesses — "we have never tested this"
+is a different problem — but a topic in demand and never measured is the fallback choice
+when nothing is measurably weak. A request no module covered at all is recorded as a
+**gap**, which is one of the measured triggers the `expansion` step acts on — and goes in
+the report, so when it proposes a whole new module the evidence is in front of you.
+
+### Study: cited answers, and exercises that are checked twice
+
+Documentation is chunked on headings, so a citation means something, and each chunk
+becomes question/answer pairs with the URL and heading attached. Every model-written
+answer must be grounded in its excerpt or it is discarded.
+
+Exercises are the interesting part. The model is asked for a task **with a reference
+solution and tests**, and the task is admitted only if the sandbox agrees twice:
+
+1. the reference solution passes the tests — otherwise the task is incoherent; and
+2. the tests **fail** when every function is replaced by a stub — otherwise they assert
+   nothing.
+
+That second check is what makes self-generated practice worth anything. A model that
+writes `assert True` has produced a task everything passes, and a night of practice
+against it measures nothing while looking productive. On the 0.6B model most proposals are
+rejected outright, which is the honest outcome and visible in the report.
+
+### Practice measures; dreaming manufactures
+
+Both run the same tasks, and the difference is the point:
+
+- **`practice` is a measurement.** One attempt per task, greedy, and the result goes into
+  the skill table whether it passed or not. If it sampled until something worked, the
+  number would describe the sampler, and `reflect` would then pick tonight's topics from
+  it.
+- **`dreaming` is data generation.** Up to four samples at temperature 0.8, keeping only
+  what passes the tests — rejection sampling, where the rejection is the valuable part.
+  It also answers the questions you marked bad: several candidates are sampled and
+  compared with *each other*, and a replacement is kept only if they agree and the winner
+  does not simply restate what you rejected.
+
+### The practice sandbox
+
+A practice result is a measurement because the code is actually run:
+
+- a wall-clock timeout, then `SIGKILL` to the whole session, so an infinite loop costs
+  seconds and a child that spawned children does not outlive it;
+- `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_NOFILE`, `RLIMIT_FSIZE` and `RLIMIT_NPROC`, set by
+  the program's own prelude with soft and hard limits equal so the candidate cannot raise
+  them again (a `preexec_fn` would run Python between fork and exec in a process that has
+  torch's threads in it — a documented way to deadlock);
+- a throwaway working directory, an almost empty environment and `python -I`;
+- a prelude that blocks sockets, `subprocess` and `os.system`.
+
+That last one is a guardrail against generated code casually reaching for the network, not
+a security boundary, and the docstring says so. The code being run is written by a local
+model from local documentation; if you intend to run *untrusted* code, put a container
+under `Sandbox._spawn`, which is the one place a process is started.
+
+### Training: replay, weights, and the guard
+
+```
+training       done  {'modules': ['coding'], 'trained': 1, 'skipped': 0}
+```
+
+- **Replay against forgetting.** A LoRA trained on nothing but tonight's forty examples
+  will learn them and forget the rest. `sleep.replay_fraction` (0.30) of every mix is
+  drawn from examples earlier nights already learned, spread across the module's history
+  rather than taken newest-first.
+- **Weights are a loss scale, normalised to mean 1.0.** Without the normalisation, raising
+  a weight would raise the total gradient and act as a hidden learning-rate change — the
+  night would train harder simply because you made more corrections.
+- **Only the completion is trained on.** The prompt is rendered with the model's own chat
+  template, exactly as the server renders it, and masked out with `-100`.
+- **It can be interrupted.** A message mid training saves the adapter, records the step,
+  and gives the card back; the next night resumes from there instead of restarting.
+- **It writes a version; it does not switch one on.** The adapter lands in
+  `adapters/<module>/vNNN` with `active` untouched, inside `guard.change(...)` — so a
+  verified snapshot exists first, and a failure restores from it.
+- **Preference pairs can train as preferences.** With
+  `training.preference_objective: dpo`, an example that carries a rejected answer — a
+  `/good`, a `/bad` the night replaced, a rewrite the samples agreed on — is trained
+  against the *adapter-disabled* model as the reference. That reference is free: turning
+  the LoRA off **is** the base model, already resident, so there is no second checkpoint
+  in VRAM. It costs four forward passes per pair instead of one, and the gate decides
+  whether it was worth it. The default is still plain SFT on the preferred answer.
+
+### The gate
+
+```
+$ ai runs 7
+run 7  completed  trigger=window
+  ✓ snapshot      done      snapshot 20261111T030112-sleep-run-7, size mb 4.2
+  ✓ consolidation done      exchanges 31, examples 24, facts new 3, corrections 2
+  ...
+  ✓ training      done      trained 1
+  ✓ gate          done      promoted coding
+```
+
+The step the whole design exists to make possible. A system that trains on its own output
+every night will drift, and the only defence is a measurement it cannot talk its way past:
+
+- **Both suites, both versions, the same prompts, greedy, in one process.** The candidate
+  and the weights currently being served answer identical questions. Comparing tonight's
+  number with one from last week would measure the weather.
+- **Better on held-out, *and* not worse on what it already knew.** The held-out split is
+  decided by each example's fingerprint before training begins, so it cannot drift into
+  the training set on a later night. The retention suite is material from *earlier* nights
+  — explicitly excluding what tonight trained on, because measuring retention with the
+  answers you were just given flatters the candidate.
+- **Too few items is a `skip`, not a promotion.** Below `gate.min_items` there is no
+  measurement, and "we did not measure it" must never be a reason to switch weights on.
+- **Promotion is one guarded `os.replace` of a symlink.** A crash at any instant leaves
+  the previous version live.
+- **One module per night by default.** If something breaks tomorrow, the cause should be a
+  single, named change.
+
+A rejected candidate stays on disk, unpromoted, with its scores in `gate_results` — so
+"why did it not promote" is answerable, and a disabled gate refuses to promote rather than
+promoting blind. A **tie** is not an improvement either: `min_improvement: 0.0` means "any
+improvement at all", because changing the weights being served needs a measurement that
+moved.
+
+Scoring code is easy — it is run. Scoring prose is the weak link, so free-text answers are
+compared with mean-pooled hidden states from the model already in VRAM (`gate.scorer:
+embedding`), which recognises a right answer in different words that word overlap would
+have called a failure. It is still blunt, so it is used carefully: a share over a minimum
+number of items, with a threshold, and with word overlap as the fallback when the backend
+cannot embed — the report says which was used.
+
+### Growing, only where it is measured
+
+```
+$ ai expansion
+modules: general, personal-memory, coding, rust
+budget:
+  up to 6 adapters, LoRA rank <= 32
+  at most 200M adapter parameters (1024 MiB of VRAM)
+  warm (pinned RAM) cache 8 GiB, cold (disk) 64 GiB
+  10% of VRAM kept free at peak
+what the measurements say now:
+  [0.63] uncovered_topics: 9 of 14 requests no module covered are about 'kubernetes'
+history:
+  [3] 2026-11-11 03:12  applied   new_module kubernetes  snapshot=20261111T031200-expansion
+        registered module 'kubernetes' with 7 keywords; it has no adapter until a
+        night has material for it
+```
+
+Section 8 says capacity may grow *only if measurements demand it*, so the triggers are
+all things the system already counts:
+
+| trigger | what it means | what it proposes |
+|---|---|---|
+| `uncovered_topics` | requests the router could not place, clustered by the words they share | a new module |
+| `saturated_module` | a module trained repeatedly whose held-out score stopped moving | a higher LoRA rank |
+| `unused_module` | an adapter with no demand and no routing hits | archiving it |
+| `merge_candidate` | an always-on module promoted again and again | merging it into the base |
+
+A cluster has to be a subject rather than a pile: eight requests by default, sharing
+enough vocabulary, and question words (`question`, `number`, `error`, `help`) are
+excluded from naming one — otherwise "how do I write a kubernetes manifest" asked five
+ways produces a module called `write`.
+
+The **budget is derived, not configured**: `ExpansionBudget` comes from the card — how
+many adapters fit beside inference, the largest LoRA rank that fits, how much warm cache
+there is. A proposal that does not fit is recorded as *refused with the arithmetic*,
+which is more useful than silence.
+
+Then the brakes:
+
+- **One structural change per night**, so tomorrow's "what broke" has one answer.
+- **Everything goes through the guard.** The registry counts as weights here: it decides
+  which adapters load and how requests are routed, so it is written to a staging file and
+  moved into place with one `os.replace`, with a verified snapshot already taken.
+- **A new module gets no weights.** It is registered so that tonight's routing and
+  tomorrow's consolidation can start collecting material for it; the first adapter is
+  trained by the normal training step and promoted by the normal gate.
+- **Only one kind happens unsupervised, by default.** `expansion.require_approval` ships
+  as `[merge_to_base, prune_module, new_module]`, so out of the box the only change it
+  makes by itself is raising a LoRA rank — which the gate then has to agree was an
+  improvement, and which a rollback undoes. Everything else is filed with its evidence
+  for `ai approvals`. Take `new_module` out of that list if you want it to add modules on
+  its own; it is in there because a new module changes how every later request is routed.
+- **The irreversible ones are off entirely.** Archiving a module changes what the system
+  can do. Merging an adapter into the base rewrites the weights everything else is built
+  on — so it is off, approval-gated even when on, and its snapshot includes the base
+  checkpoint. `ai approve-expansion <id>` applies one; `ai expansion --revert` restores
+  the last applied change from its own snapshot, and that revert is itself undoable.
+
+Merging has two catches worth stating plainly.
+
+It cannot be done in the quantised weights the server runs, because a 4-bit NF4 linear
+layer has no fp16 matrix to add a LoRA delta to. So it loads the original checkpoint
+unquantised (on the CPU, while the GPU keeps serving), merges there, and replaces the
+checkpoint atomically under the same model id — which stays valid because merging
+`W + BA` changes no shapes.
+
+And it invalidates **every other adapter**, because they were all trained as a delta from
+the base as it was before. The model id does not change, so the loader's base-model check
+cannot see this: the merge stamps the other versions instead, and the harness refuses to
+load a stamped adapter until a night has retrained it, with a warning in `ai status`.
+Refusing is the point — quietly applying a delta to the wrong weights shows up as the
+model getting mysteriously worse, which is the hardest kind of problem to find.
+
+### Tuning itself, by measurement
+
+```
+$ ai optimize
+settings it may measure: prefix_cache, kv_cache_dtype, warm_cache_mb, speculative_decoding
+in use:
+  prefix_cache           True
+  kv_cache_dtype         'auto'
+  warm_cache_mb          8192
+  speculative_decoding   False
+router: fitted 2026-11-11T03:14:02 on 412 pieces of material, threshold 0.38,
+        86% agreement with the keyword scorer
+it would try next: kv_cache_dtype='fp16'
+history:
+  [2] 2026-11-11 03:14  reverted  speculative_decoding=True  -48.9%  -48.9% is below
+                                  the 5.0% that counts as a win
+```
+
+Section 10 draws a hard line: the daemon may change the values in `tunable` and nothing
+else — never its source, never the hardware plan, never a threshold that decides what
+gets learned. What it learns goes in `var/tunable.yaml`, which sits *underneath* your
+`config.yaml`, so anything you pin stays pinned and the file it owns can never clobber
+your comments.
+
+The loop is deliberately boring, because the failure mode of self-optimisation is
+believing noise: measure the current setting on a short fixed benchmark, change one
+value, measure again, and — for anything that can change what the model *says* — score a
+slice of the held-out suite too. A win has to clear `min_relative_gain` (5%) on speed and
+cost no more than `max_quality_loss` (2%) in quality. Anything else goes back and is
+remembered, so the same losing value is not re-tried every night for the rest of time.
+
+That is how the speculative-decoding result above was reached: the system tried it,
+measured it, found it half as fast on this machine, put it back, and wrote down why.
+
+### The report
+
+`ai report [run]` writes `var/reports/run-NNNNNN.html` (and `latest.html`): one
+self-contained file, no JavaScript, no external fonts, light and dark. It leads with what
+changed and why — promotions, gate deltas, the step table with durations and failures —
+then the facts it now holds, what it read with the licence you recorded for each source,
+where it still struggles, and the night's log.
+
+## Tools it writes for itself
+
+```
+$ ai tools request "convert between units"
+asked for: convert between units
+  [1] the next sleep writes it, then 'ai tools' shows it
+
+$ ai tools
+limits: pure: compute only: no files, no network, no subprocesses; limits: 10s, 512 MiB,
+        42 importable modules
+a tool may ask for: pure, write_workspace
+
+  tool                   status     ver     calls  capabilities
+  convert_units          approved   v001        1  pure
+      Convert a value between two units of length, mass or temperature.
+  week_number            proposed   -           0  pure
+      Return the ISO week number for a date given as YYYY-MM-DD.
+
+waiting for you to read them:
+  week_number@v001  [pure]  Return the ISO week number for a date given as YYYY-MM-DD.
+  ai tools show <name>     # the source, the checks, the limits
+```
+
+A tool is source code that runs on this machine, written by the model. That is the most
+dangerous thing in the project, so it is also the most restricted: **nothing is callable
+until a human has read it**, the night cannot approve its own work, and the daemon has no
+code path that approves anything.
+
+### What gets written, and when
+
+Only two things cause a tool to be written, and neither is "the model felt like it":
+
+- **you asked** — `ai tools request "..."`, which also counts as pending work, so it is
+  one of the things that triggers a sleep;
+- **something kept failing in a way a tool fixes** — a practice task that failed every
+  attempt and whose text is about converting, parsing, calculating or dates, rather than
+  the kind of failure more training fixes.
+
+A queue of plausible-looking tools nobody asked for is a queue nobody reads, and at that
+point the review is theatre.
+
+### Six checks before anyone is asked to read it
+
+Your attention is the scarce resource, so the mechanical objections are the machine's
+job. In order of what they cost:
+
+1. the name and description are usable;
+2. the source compiles and defines `run` with named parameters — no `*args`, no
+   `**kwargs`, because then the schema could not be checked against it;
+3. every import is on the allowlist;
+4. the capabilities it declares are ones you permit;
+5. the declared JSON schema matches `run`'s signature, parameter by parameter;
+6. its examples run in the sandbox and produce exactly what it claimed — **and** the
+   same examples fail when `run` is emptied out.
+
+That last check is the one that makes the others worth having. It is the same trick the
+practice exercises use: a tool whose examples pass with no implementation has examples
+that test nothing. When a check fails, the objections go back to the model *once* so it
+can repair its own work; a second failure is reported rather than retried.
+
+A version that failed its checks cannot be approved, by you or anyone — `ai tools
+approve` refuses it and says which check it failed.
+
+### The review
+
+```
+$ ai tools show week_number
+week_number@v001  (proposed)
+  Return the ISO week number for a date given as YYYY-MM-DD.
+  written by model on 2026-11-12 14:04:54
+
+what it may do:
+  pure: compute only: no files, no network, no subprocesses
+  limits: 10s, 512 MiB, 42 importable modules
+
+arguments:
+  date: string — a date as YYYY-MM-DD
+
+checks: passed
+  ok: run(date='2026-11-12') -> 46
+
+source:
+  import datetime
+  def run(date):
+      return datetime.date.fromisoformat(date).isocalendar().week
+
+  ai tools approve week_number    # make it callable
+  ai tools reject week_number --note '...'
+  ai tools run week_number '{...}'   # try it first
+```
+
+`ai tools run` works on an unapproved version *on purpose*: reading the source and then
+watching what it does is the review. The model still cannot call it.
+
+Every version is kept. A tool the model rewrites is a new version that needs its own
+review, and the one you approved keeps working until you say otherwise —
+`ai tools rollback` goes back, `ai tools retire` stops offering it without deleting
+anything. Tools live in `tools/<name>/vNNN/tool.py` with an `active` symlink, the same
+shape as the adapters, and they are in the backup set.
+
+### The tool sandbox
+
+A tool runs in its own process, with four things enforced at once because none of them
+is sufficient alone:
+
+| | |
+|---|---|
+| process | `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NPROC`, a wall-clock timeout and `SIGKILL` to the whole session |
+| imports | a denylist at runtime (`socket`, `subprocess`, `ctypes`, …) on the audit hook, and the full allowlist checked statically before review |
+| files | writes only in its own throwaway workspace, reads only there and under `tools.readable_paths` — which is empty by default, because your project directory holds your configuration |
+| operations | `subprocess`, `os.system`, `os.exec*`, `os.fork`, socket use and directory listing outside the allowed roots, refused on the audit event rather than by patching names |
+
+The import rule is split for a reason worth stating: an allowlist at *runtime* would also
+catch the standard library importing itself — `pathlib` imports `os` — so the runtime
+list is a small denylist of things nothing permitted needs (a test asserts that), and the
+allowlist is enforced where a refusal can be explained.
+
+The arguments go in as JSON on stdin and one JSON object comes back on stdout. A tool
+cannot return a Python object, keep state between calls, or talk to the daemon. Each call
+gets a fresh workspace, which a test checks by writing a file in one call and looking for
+it in the next.
+
+**What this does not guarantee.** CPython's audit hooks are a monitoring interface, not a
+security boundary: code that reaches a C extension or an interpreter bug can get around
+them, and a tool that spends its ten seconds doing arithmetic can still return a wrong
+answer. The real boundary is you reading the source. If you intend to run tools you have
+not read, put a container or a seccomp filter under `ToolRunner` — which is why
+everything goes through one subprocess call.
+
+### Calling them
+
+The tool definitions are rendered into the prompt through the model's **own** chat
+template (`tools=`), so a model trained to call tools uses the format it was trained on,
+and a template that does not understand tools is not offered any — asked of the template,
+not assumed from the model's name.
+
+Generation stops at the closing `</tool_call>` tag, the tool runs, its result goes back as
+a `tool` message, and generation continues. That makes calls serial — one per round — on
+purpose: letting the model carry on past its own tool call means letting it write down
+what the tool returned before the tool has run, and it will. `tools.max_calls_per_turn`
+(4) bounds the rounds. A failure is handed to the model as the result, so it can try
+different arguments or answer without the tool, which are both better than a silent
+retry. The markup never reaches you, streaming included, and every call is logged with
+its arguments and its result.
+
+## Adapters and routing
+
+Adapters live in `adapters/<module>/vNNN` with an `active` symlink. Promotion is a symlink
+swap via `os.replace`, so a crash at any instant leaves the previous version live and
+loadable, and `ai rollback <module>` goes back a version without restarting the model.
+An adapter trained on a different base model is detected and skipped rather than loaded
+into weights it does not belong to.
+
+A router picks which modules a request needs *before* generation, so the right adapters
+are resident when the first token is produced. It scores the request against each
+module's description with IDF-weighted keyword overlap — cheap and explainable, and
+replaceable by an embedding model behind the same interface. Every decision is logged
+with its scores, which is what the `speed` step fits a router on.
+
+**The fitted router.** A keyword list is only as wide as somebody remembered to make it:
+the rust module's keywords do not contain `axum`, so a question about an axum extractor
+scored zero and was recorded as uncovered. The `speed` step fits a scorer from the
+vocabulary each module has actually accumulated — the prompts of its examples, its
+tasks, its benchmark items, with its description as an anchor — weighted so that a word
+only one module uses counts and a word everything uses does not. It is installed only if
+it still agrees with the keyword scorer on the requests that scorer was confident about,
+and only with a threshold calibrated so the share of requests called *uncovered* does not
+jump; otherwise self-expansion would be flooded with false triggers. The honest caveat is
+in the module's own docstring: the labels come from the keyword router, so this widens its
+vocabulary rather than correcting its mistakes.
+When nothing scores above the threshold, that is recorded as an *uncovered topic* — one
+of the measured triggers for self-expansion.
+
+Modules are held in a tiered cache (VRAM → pinned RAM → disk, LRU) inside the adapter
+budget the hardware plan computed, so the VRAM ceiling is never exceeded by accident.
+
+## Backups
+
+Section 9 of the specification is a rule, not a feature: *no operation that adds,
+changes, merges or removes weights may start without a verified backup; if the backup
+fails, the operation is refused.* That rule is a single context manager, and every weight
+change goes through it:
+
+```python
+with guard.change("promote coding v004", sources=("adapters",)) as change:
+    ...                                  # write the new weights
+    change.activate(link, "v004")        # atomic symlink swap
+```
+
+On entry it takes a snapshot and **verifies it by re-hashing**; if that fails for any
+reason — disk full, permissions, a bad hash — it raises and the body never runs. If the
+body raises, the touched sources are restored from that snapshot before the error
+propagates. A test asserts the body does not execute when the backup fails, and
+[a structural test](tests/test_backup_invariants.py) reads the source to prove the guard
+is the only path: it parses `daemon.py` and fails if an `activate_adapter` or
+`rollback_adapter` call is not lexically inside a `with ... guard.change(...)` block.
+
+**Snapshots** go to `backups/<timestamp>-<operation>/` with a manifest of SHA-256 hashes
+covering the adapters and their metadata, the module registry, the SQLite store, the
+config, the profiles and hardware plan, the router and draft model, and the held-out
+benchmarks. The base checkpoint is included only for operations that could change it,
+since it is several gigabytes.
+
+Three details that matter more than they look:
+
+- **The database is copied through SQLite's own backup API**, not as a file. In WAL mode
+  the newest commits live in the `-wal` sidecar and a plain copy can catch a torn state.
+- **Symlinks are recorded as symlinks, not followed.** `adapters/<module>/active` *is*
+  the promotion mechanism; resolving it would quietly turn a pointer into a copy.
+- **The manifest is written last and atomically.** A snapshot directory without one is by
+  definition incomplete, which is how an interrupted backup is told apart from a finished
+  one — and incomplete ones are never restored from.
+
+**A restore is itself a change**, so it snapshots the current state first and tells you
+the id, which makes "I restored the wrong one" recoverable. Restores are staged beside the
+target and swapped in, so a crash mid-restore leaves the old tree or the new one, never a
+mixture — and a failed swap puts the original back.
+
+**An interrupted promotion is undone at startup.** Every change is logged in
+`weight_changes` with its snapshot id; an entry still `in_progress` when the daemon starts
+is by definition an interrupted operation, and recovery restores from its snapshot before
+anything else runs.
+
+```
+$ ai backup list
+snapshots in /home/simon/devel/gustav/backups  (1649.2 GiB free)
+retention: keep the last 5, one daily for 7 days, one weekly for 4 weeks
+  20261110T164051-manual             manual               0.1 MiB   3 files
+  20261110T164102-promote-coding     promote coding v004  4.2 MiB  18 files  protected
+
+recent weight changes:
+  2026-11-10 16:41:02  done  promote coding v004  snapshot=20261110T164102-promote-coding
+```
+
+`ai backup create [--dry-run]` (the dry run shows what would be copied and how much space
+it needs), `ai backup verify <id>`, `ai backup restore <id> [--module M] [--only adapters]`,
+`ai backup retention [--dry-run]`.
+
+**Retention** keeps the last N, one a day for M days and one a week for K weeks — and
+never the newest complete snapshot or one a pending approval refers to. When the location
+runs low it *warns*; it does not delete beyond the policy, because losing backups to free
+space is precisely the failure backups exist to prevent.
+
+## Hardware and the auto planner
+
+`ai plan-hardware` sizes the system for the machine it is on. It reads the GPUs through
+NVML (no torch needed), computes what each model on the ladder would cost in VRAM, and
+picks **the largest model that fits and is fast enough**:
+
+```
+$ ai plan-hardware -v
+plan: qwen3-4b @ 4bit-nf4, seq 4096, LoRA r16, ~36 tok/s (estimated), training on GPU 0
+
+  Chose Qwen3 4B (4.02B, 36 layers, 8 KV heads) in 4-bit NF4 (bitsandbytes, double quant).
+  It is the largest model on the ladder that fits and is fast enough: balance 0.5 turns
+  the 15 tok/s floor into an effective 30 tok/s requirement.
+  GPU0 NVIDIA GeForce RTX 4070 SUPER: 12.0 GiB, Ada Lovelace (sm_89), ~504 GB/s, bfloat16,
+  flash_attention_2
+  GPU0: 10.20 GiB usable of 11.99 GiB (15% reserved for other software, 690 MiB already in
+  use by others)
+  Inference at seq 4096 needs 4.43 GiB, leaving 5.77 GiB spare.
+  QLoRA training at seq 1024, rank 16 needs 5.35 GiB, so this machine can train itself.
+  ...
+not chosen:
+  qwen3-8b@4bit-nf4   seq 4096  8.11 GiB  17 tok/s  rung 4  17 tok/s is below the 30 tok/s
+                                                            floor that balance 0.5 demands
+  qwen3-14b@4bit-nf4  seq 4096 12.48 GiB  10 tok/s  rung 5  needs 12.48 GiB but only 10.20
+                                                            GiB is usable (2.28 GiB short)
+```
+
+**One knob.** `hardware.balance`, from 0.0 to 1.0, does its work by raising the speed
+floor rather than by trading capability away point by point — which is what keeps it from
+quietly picking a tiny model on a big card. On the 12 GB card above: 0.0 gives Qwen3-1.7B
+at ~73 tok/s with speculative decoding on, 0.5 gives Qwen3-4B, 1.0 gives Qwen3-8B at
+~17 tok/s.
+
+**The memory model is explicit**, because its job is to refuse a configuration before it
+OOMs rather than to be clever. Each estimate is broken down (`ai plan-hardware -v`), and
+the two terms usually left out of back-of-the-envelope sizing are both in it:
+
+- **Unquantised weights.** bitsandbytes only touches `nn.Linear`, so Qwen3's
+  151 936-token embedding and lm_head stay in 16-bit — 2.5 GiB on the 8B model, more than
+  a third of its 4-bit footprint.
+- **Training logits.** Cross-entropy over the whole sequence materialises
+  `batch x seq x vocab` in fp32: ~1.2 GiB at seq 1024, typically the single largest
+  training allocation.
+
+A refusal says what to change: *"needs 12.48 GiB but only 10.20 GiB is usable on GPU0
+(2.28 GiB short); try max_seq_len 2048"*.
+
+**The base model never changes by itself.** Adapters are tied to the base they were
+trained on, so when the planner would prefer a different one — because you changed
+`balance`, or moved the disk into a bigger machine — it files a pending approval, keeps
+serving the current base, and tells you:
+
+```
+$ ai approvals
+[1] base_change: qwen3-1.7b -> qwen3-30b-a3b   (pending)
+$ ai approve-base-change 1
+```
+
+**It notices the machine changing.** A fingerprint over GPU names, VRAM, compute
+capability, RAM and core count is stored and compared at startup and on a timer. It
+deliberately ignores anything that moves on its own — free VRAM, clocks, temperature,
+what else is running — so it fires when you add a GPU, not when the desktop opens a tab.
+
+**Other software on the card is respected.** Foreign VRAM is measured per process, and
+the 15 % reserve and the measured foreign usage are not double-counted: the larger wins.
+
+**Profiles.** `hardware.profile: auto` plans and writes `profiles/auto-generated.yaml`,
+a self-documenting file you can edit — anything pinned there wins and the planner will not
+overwrite it. Three presets ship: `small-12gb` (12 GB, 4B + QLoRA), `tiny-4gb` (Turing,
+fp16 and SDPA only, serve here and train elsewhere) and `server-multigpu` (one card
+serves while the others train, so chat stays up during sleep).
+
+**Adding a model** is one entry in `src/gustav/hw/ladder.yaml`. Parameter counts, KV-cache
+size and LoRA footprints are computed from the architecture, so nothing is hardcoded
+elsewhere — and once the weights are on disk, `config.json` replaces the YAML's numbers
+and the estimates become exact.
+
+## Commands
+
+| | |
+|---|---|
+| `ai init [dir]` | make a directory into a gustav project (never overwrites) |
+| `ai start` | run the daemon in the foreground |
+| `ai service install\|uninstall\|status` | run it as a systemd user service |
+| `ai status [--json]` | state, schedule, adapters, GPU holder, pending work, failures, approvals |
+| `ai chat [message]` | one message, or an interactive session |
+| `ai sleep now [--dry-run]` | sleep immediately; `--dry-run` plans the night without doing it |
+| `ai wake` | pause a running sleep and come back online |
+| `ai pause-learning` / `ai resume-learning` | stop/allow sleeping and training |
+| `ai plan-hardware [--balance X] [--apply] [-v]` | size the system for this machine, and say why |
+| `ai hardware` | what was detected, the VRAM budget, the active plan |
+| `ai approvals` / `ai approve-base-change <id>` | decisions waiting for you |
+| `ai model list` / `ai model pull <id>` | what weights are on disk; fetch one (uses the network) |
+| `ai bench` | measure tokens/s, latency and peak VRAM, and record it for the planner |
+| `ai adapters` / `ai rollback <module>` | adapter versions and what is loaded; go back one version |
+| `ai backup list\|create\|verify\|restore\|retention` | snapshots; every weight change takes one first |
+| `ai release-gpu` | unload now and free the VRAM (reloads on the next message) |
+| `ai runs [id]` | sleep runs and their steps, with what each one did, checkpoints and errors |
+| `ai facts [--subject S]` | durable facts it holds; `--subject` shows everything it has believed about one |
+| `ai skills [--all]` | the measured skill table: score, trials and demand per topic |
+| `ai tools [show\|approve\|reject\|run\|retire\|rollback\|delete] <name>` | tools it wrote: read them, try them, approve them |
+| `ai tools request "..."` | ask for a tool; the next night writes it |
+| `ai expansion [--revert]` | what it has grown and would like to; undo the last change |
+| `ai approve-expansion <id> [--reject]` | accept a proposed structural change |
+| `ai optimize [--revert]` | what it has tuned about itself; put the last change back |
+| `ai report [run]` | write the HTML report for a run (the newest by default) |
+| `ai events [--kind K]` | the daemon's event log |
+| `ai stop` | graceful shutdown |
+
+Every command in that table exists; a test parses this table and the parser and fails if
+they disagree.
+
+Everything goes through the running daemon over a Unix socket at `var/gustav.sock`.
+Set `instance.http_enabled` (and `http_token`) to also listen on TCP for remote clients.
+
+The HTTP API has `/chat` (JSON or SSE), `/v1/chat/completions` (OpenAI-compatible, so
+existing clients work against the local daemon), `/health`, `/status`, `/adapter/status`,
+`/adapter/rollback`, `/adapter/activate`, `/hardware`, `/models`, `/bench`, `/runs`,
+`/facts`, `/skills`, `/report`, `/approvals`, `/expansion`, `/expansion/revert`,
+`/optimisation`, `/optimisation/revert`, `/tools`, `/tools/{name}`,
+`/tools/{name}/review`, `/tools/{name}/run` and `/tools/requests`.
+
+## Configuration
+
+`config.yaml` in the project root; every key has a default, so an empty file is valid and
+an unknown key is an error rather than a silent default. The `tunable` section is the only
+thing the daemon's own self-optimisation may ever change — never its source code. What it
+has learned lives in `var/tunable.yaml`, underneath this file, so your values always win.
+
+The sections the night reads, with the defaults worth knowing:
+
+| section | what it controls |
+|---|---|
+| `sleep` | `replay_fraction` (0.30), `heldout_fraction` (0.15), `max_topics_per_run` (5), `weak_score_threshold` (0.6), `use_model`, and `simulated_steps` — the steps that still run the placeholder |
+| `fetcher` | `enabled`, `allowed_hosts`, `local_sources`, `max_documents_per_run` (12), `cache_ttl_hours` (168), `delay_seconds` (1.0) |
+| `sandbox` | `timeout_seconds` (10), `memory_limit_mb` (1024), `isolate_env` |
+| `training` | `rank` (from the plan), `learning_rate` (1e-4), `grad_accum` (8), `max_steps` (200), `max_seconds` (1800), `min_examples` (16), `verified_only` (off) |
+| `gate` | `min_improvement` (0.0), `max_regression` (0.02), `min_items` (8), `max_promotions_per_run` (1), `scorer` (embedding) |
+| `expansion` | `max_changes_per_run` (1), `min_uncovered_requests` (8), `saturation_runs` (3), `rank_step` (8), `allow_pruning` (off), `allow_base_merge` (off), `require_approval` |
+| `optimisation` | `settings` (the knobs it may measure), `max_trials_per_run` (2), `min_relative_gain` (0.05), `max_quality_loss` (0.02) |
+| `tools` | `enabled`, `allow_authoring`, `require_approval` (on), `max_calls_per_turn` (4), `timeout_seconds` (10), `allow_capabilities` (`pure`, `write_workspace`), `readable_paths` (empty), `allowed_hosts` (empty), `allowed_modules` |
+
+`docs/sources.yaml` maps topics to documentation URLs and records the licence of each
+source. It is the complete list of what the fetcher can ever request, so an entry you did
+not add is a page it will never visit.
+
+## Moving to a bigger machine
+
+The plan is derived, not baked in, so the move is mostly a copy:
+
+1. Copy the project and `var/` (the SQLite store and the adapters) to the new machine.
+2. Start the daemon. It detects the new hardware, notices the fingerprint changed, and
+   re-plans — but keeps serving the base model your adapters belong to.
+3. `ai approvals` shows the base-model change it would prefer. Approving it is a
+   deliberate act: adapters trained on the old base no longer apply.
+4. With two or more GPUs the planner separates them by itself — `inference_gpus: [0]`,
+   `training_gpus: [1, 2, 3]` — so chat stays up while it sleeps. Override either list in
+   `config.yaml` if you want a different split.
+
+To keep serving on a small machine and train on a big one, set `allow_training: false` on
+the small one (see `profiles/tiny-4gb.yaml`) and copy the adapter versions over. The gate
+runs where the training happened, so the receiving machine activates a version
+deliberately — `POST /adapter/activate`, or `ai rollback` to step back — rather than
+re-measuring it.
+
+## Layout
+
+```
+daemon.py              the entry point
+config.yaml            your settings
+profiles/              hardware profiles, including the generated one
+docs/sources.yaml      topic -> documentation map, with licences; the fetcher's whole world
+modules/registry.yaml  the modules, their descriptions and their topic keywords
+src/gustav/
+  core/                state machine, scheduler, supervisor, journal, GPU lease, recovery
+  hw/                  detection, the model ladder, memory model, pre-flight, planner
+  inference/           backend, generation loop, sampling, adapters, router, caches
+  backup/              snapshots, manifests, atomic swaps, restore, retention, the guard
+  sleep/               the pipeline, its steps, and the model as a step sees it
+  learn/               facts, examples, tasks, skills, benchmarks, chunking, grounding
+  expansion/           triggers, proposals, the actions, merging into the base
+  optimize/            the measured tunable loop and the router fitting
+  tools/               the policy, the sandbox runner, the checks, the store, the loop
+  fetcher/             the allowlist, the cache, HTML to text — the only network use
+  sandbox/             where practice answers are run and judged
+  train/               the dataset mix and the LoRA trainer
+  report/              the HTML report
+  data/                the defaults a fresh project is given
+packaging/             the systemd user unit
+  wake/                the chat side
+  server/ cli.py       control plane and its client
+  store/               SQLite schema and migrations
+tools/                 tools it wrote, one directory per tool, source you can read
+var/                   databases, logs, run checkpoints, doc cache, reports, socket, lock
+```
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest -q                 # everything except the GPU set
+.venv/bin/python -m pytest -q -m "not slow"   # skip the tests that start real processes
+.venv/bin/python -m pytest -q -m gpu          # real weights on a real card
+```
+
+Three sets, with different jobs.
+
+**The fast set** (around 940 tests) runs on any machine with no GPU and no weights. Most
+of the sleep tests call a step's body directly with a *scripted* model, which is what
+makes the interesting cases cheap to pin down: an ungrounded fact, an exercise whose tests
+pass without a solution, a candidate adapter that is better on new material and worse on
+old, a replacement answer that just restates the one you rejected, an expansion proposal
+the hardware budget cannot afford, a tunable change that bought speed with quality.
+The tool sandbox gets a test per refusal — imports, files, directory listings,
+subprocesses, resource limits, a tool trying to raise its own limits — because a sandbox
+nobody tested is a sandbox nobody has.
+
+**The slow set** starts the real daemon as a subprocess and `kill -9`s it while **each**
+step of the night is running, then restarts it and checks that finished steps were not
+re-run, that checkpoints survived, and that the night finishes. `tests/test_sleep_night.py`
+runs the whole pipeline in real child processes with no model at all — which is how a
+laptop without CUDA behaves, and it has to end with a completed run and a report.
+
+**The GPU set** needs `models/qwen3-0.6b` (`ai model pull qwen3-0.6b`) and takes a couple
+of minutes. `test_gpu_training.py` trains a LoRA, checks the loss falls when it is shown
+the same thing repeatedly, interrupts training and resumes it, trains a preference
+objective against the adapter-disabled model, and loads the result through the *serving*
+path. `test_gpu_speculative.py` checks the one thing that makes speculative decoding safe
+— a model drafting for itself accepts over 90% of its proposals, which is what fails
+loudly if the cache rollback or the logits alignment is wrong. And `test_gpu_night.py`
+runs an entire night with the model loaded, asserting only on structure, never on the
+quality of a 0.6B model's answers.
+
+The planner is tested against simulated machines — a 4 GB Turing laptop, a 12 GB desktop,
+a four-card server, and a machine with no GPU at all — so none of it needs the hardware it
+plans for. `GUSTAV_SIMULATE_HARDWARE=server-multigpu python daemon.py` runs the daemon
+against one of them too.
+
+## Known limitations
+
+- **A dense model has no "coding part" to split out.** Modularity here means LoRA
+  adapters and, for a Mixture-of-Experts base, expert offloading. Nothing else.
+- **No layer or depth growth.** Self-expansion adds modules, raises LoRA ranks, archives
+  what nothing uses and (with your approval) merges an adapter into the base. Growing the
+  network itself — more layers, wider ones, new frozen-base experts — is a documented
+  future direction, not implemented.
+- **The fitted router widens the keyword list; it does not correct it.** Its training
+  labels come from the keyword scorer that assigned each example's module, so it learns
+  the vocabulary that surrounds words that list already knew. Properly learned routing
+  needs per-module credit for an answer, which nothing measures yet. The check that keeps
+  this safe is that a new router is installed only if it still agrees with the keyword
+  scorer where that one was confident.
+- **Speculative decoding is implemented and measured slower here.** A model drafting for
+  itself accepts over 90% of proposals, so the mechanism is right, but at batch 1 a decode
+  step costs mostly per-layer launch and framework overhead rather than arithmetic — so a
+  0.6B draft forward costs nearly as much as a 4B target forward and the result was 0.5x.
+  CUDA graphs or a leaner draft path would change that; until then it is off by default
+  and `ai optimize` measures it per machine. Its output is also greedy-but-not-identical
+  to the sequential path, for the same batched-forward reason the prefix cache is.
+- **One GPU means no chatting during training.** Sleep pauses to answer you and resumes
+  afterwards. Two GPUs remove the trade-off.
+- **Training on your own output has a ceiling.** Test verification, documentation
+  grounding and the gate raise it; they do not remove it. Expect small, measurable gains
+  on narrow verifiable skills, not open-ended self-improvement. A night with no
+  corrections, no practice passes and nothing new to read is a night that should and
+  usually does change nothing.
+- **Scoring free text is still the weakest link.** Code is run; a `/correct` is
+  authoritative. A prose answer is now compared with mean-pooled hidden states from the
+  model itself, which is much better than word overlap at recognising a right answer in
+  different words — but it is a similarity, not a judgement, and a confidently wrong
+  answer that *sounds* like the reference can pass. That is why the gate needs a minimum
+  number of items, refuses to promote on a tie, and promotes one module a night.
+- **Self-generated exercises are only as good as their tests.** Both checks (the reference
+  solution passes, the stubbed version fails) catch incoherent and vacuous tasks, but not
+  a task that tests the wrong thing correctly. Small models mostly fail to produce usable
+  JSON for this at all, which the report counts rather than hides.
+- **A tool sandbox is not a jail.** The audit hook, the resource limits and the
+  throwaway workspace stop the ordinary accidents and the obvious misbehaviour, and a
+  test suite tries each of them. They are not a boundary against code written to break
+  out, and CPython does not offer one. The boundary is the review: nothing runs until
+  you have read it, and what it declared is in front of you when you do.
+- **A reviewed tool can still be wrong.** The checks prove it compiles, matches its
+  schema and does what its examples claim. They say nothing about the other inputs. A
+  tool that converts units correctly for Celsius and silently wrongly for Kelvin passes
+  everything here — which is why the examples are shown at review time rather than
+  summarised as "passed".
+- **Documentation licences are your call.** `docs/sources.yaml` records the licence you
+  declared for each source; the fetcher stores it with every document, the report shows
+  it, and a source with no licence is fetched *and* warned about. Nothing verifies the
+  declaration, and nothing refuses to study without one.
+- **Speeds are estimates until you run `ai bench`.** The planner derives tokens/s from
+  memory bandwidth and a per-quantisation efficiency factor, labelled "estimated"
+  everywhere it appears. One benchmark replaces it with a measurement per model and
+  quantisation. (On the development machine the estimate was 36 tok/s and the measurement
+  54 — conservative, which is the safe direction.)
+- **Requests are served one at a time.** The GPU is single-tenant, so generation is
+  serialised behind a lock. The queue interface is in place for continuous batching
+  later; it is not implemented yet, concurrent callers wait their turn, and this is why
+  `batch_size` is not something self-optimisation pretends to tune.
+- **Self-optimisation can only tune four things.** `prefix_cache`, `kv_cache_dtype`,
+  `warm_cache_mb` and `speculative_decoding` are the `tunable` values the serving path
+  actually reads. The others are there for the planner, and a measured loop over settings
+  that do nothing would be a machine for keeping noise.
+- **Architecture numbers come from `ladder.yaml`** until the weights are downloaded;
+  the planner says so in its warnings, and reads the real `config.json` when it exists.
