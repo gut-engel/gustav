@@ -89,6 +89,21 @@ class ApprovalDecision(BaseModel):
     note: str = ""
 
 
+class ToolReview(BaseModel):
+    approve: bool = True
+    version: str | None = None
+    by: str = "user"
+    note: str = ""
+
+
+class ToolCallRequest(BaseModel):
+    arguments: dict[str, Any] = {}
+
+
+class ToolRequestBody(BaseModel):
+    text: str
+
+
 def create_app(daemon: "Daemon") -> FastAPI:
     app = FastAPI(
         title="gustav",
@@ -426,6 +441,66 @@ def create_app(daemon: "Daemon") -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return result
+
+    @app.get("/tools", dependencies=guard)
+    async def tools(limit: int = 20) -> dict[str, Any]:
+        return daemon.tools_status(limit=limit)
+
+    @app.get("/tools/{name}", dependencies=guard)
+    async def tool_detail(name: str, version: str | None = None) -> dict[str, Any]:
+        try:
+            return daemon.tool_detail(name, version)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - ToolError and friends
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/tools/{name}/review", dependencies=guard)
+    async def review_tool(name: str, req: ToolReview) -> dict[str, Any]:
+        try:
+            return daemon.review_tool(
+                name, approve=req.approve, version=req.version,
+                by=req.by or "user", note=req.note or "",
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/tools/{name}/run", dependencies=guard)
+    async def run_tool(name: str, req: ToolCallRequest) -> dict[str, Any]:
+        try:
+            return await daemon.run_tool(name, req.arguments or {})
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/tools/{name}/retire", dependencies=guard)
+    async def retire_tool(name: str, req: ToolReview | None = None) -> dict[str, Any]:
+        try:
+            return daemon.retire_tool(name, note=(req.note if req else "") or "")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/tools/{name}/rollback", dependencies=guard)
+    async def rollback_tool(name: str) -> dict[str, Any]:
+        try:
+            return daemon.rollback_tool(name)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/tools/{name}", dependencies=guard)
+    async def delete_tool(name: str) -> dict[str, Any]:
+        try:
+            return daemon.delete_tool(name)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/tools/requests", dependencies=guard)
+    async def request_tool(req: ToolRequestBody) -> dict[str, Any]:
+        try:
+            return daemon.request_tool(req.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/expansion", dependencies=guard)
     async def expansion(limit: int = 20) -> dict[str, Any]:

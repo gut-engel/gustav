@@ -164,6 +164,7 @@ class SnapshotStore:
         paths = self.paths
         found = [
             Source("adapters", paths.adapters),
+            Source("tools", paths.tools),
             Source("registry", paths.registry),
             Source("database", paths.db, database=True),
             Source("config", paths.root / "config.yaml"),

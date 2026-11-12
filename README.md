@@ -20,10 +20,12 @@ ai sleep now
 
 ## Status
 
-Built in reviewable stages, and all six are done. It loads real weights and answers;
+Built in reviewable stages, and all seven are done. It loads real weights and answers;
 it learns from the day, studies, practises under a verifier, trains LoRA adapters and
-promotes them only if a regression gate says they are better; and it grows and tunes
-itself within budgets the hardware sets, asking first for anything it cannot take back.
+promotes them only if a regression gate says they are better; it grows and tunes itself
+within budgets the hardware sets, asking first for anything it cannot take back; and it
+writes its own tools, which run sandboxed on the server and do nothing at all until you
+have read the source.
 
 | Stage | What it is | State |
 |---|---|---|
@@ -33,6 +35,7 @@ itself within budgets the hardware sets, asking first for anything it cannot tak
 | 4 | Backups, verification, atomic promotion, the weight-change guard | **done** |
 | 5 | Sleep phase: consolidation, study, practice, training, the gate, the report | **done** |
 | 6 | Self-expansion, self-optimisation, router training, packaging | **done** |
+| 7 | Tools it writes for itself: sandbox, admission checks, review | **done** |
 
 Measured on the development machine (RTX 4070 SUPER, 12 GB) with Qwen3-4B in 4-bit NF4:
 **54 tok/s**, 25 ms to first token, 4.3 GiB peak VRAM. It hands the GPU over for real:
@@ -250,6 +253,7 @@ store rather than from whatever the steps happened to print.
 | `training` | one new LoRA version per module, written but not switched on |
 | `gate` | measure the candidate against what is being served, and promote or refuse |
 | `expansion` | grow capacity where measurements demand it, or ask |
+| `tools` | write the tools that were asked for, for you to review |
 | `retest` | ask the things it got wrong again, with the new weights |
 | `speed` | refit the router, and measure one tunable change |
 | `report` | the HTML report for the run |
@@ -376,7 +380,7 @@ Both run the same tasks, and the difference is the point:
   compared with *each other*, and a replacement is kept only if they agree and the winner
   does not simply restate what you rejected.
 
-### The sandbox
+### The practice sandbox
 
 A practice result is a measurement because the code is actually run:
 
@@ -581,6 +585,151 @@ changed and why — promotions, gate deltas, the step table with durations and f
 then the facts it now holds, what it read with the licence you recorded for each source,
 where it still struggles, and the night's log.
 
+## Tools it writes for itself
+
+```
+$ ai tools request "convert between units"
+asked for: convert between units
+  [1] the next sleep writes it, then 'ai tools' shows it
+
+$ ai tools
+limits: pure: compute only: no files, no network, no subprocesses; limits: 10s, 512 MiB,
+        42 importable modules
+a tool may ask for: pure, write_workspace
+
+  tool                   status     ver     calls  capabilities
+  convert_units          approved   v001        1  pure
+      Convert a value between two units of length, mass or temperature.
+  week_number            proposed   -           0  pure
+      Return the ISO week number for a date given as YYYY-MM-DD.
+
+waiting for you to read them:
+  week_number@v001  [pure]  Return the ISO week number for a date given as YYYY-MM-DD.
+  ai tools show <name>     # the source, the checks, the limits
+```
+
+A tool is source code that runs on this machine, written by the model. That is the most
+dangerous thing in the project, so it is also the most restricted: **nothing is callable
+until a human has read it**, the night cannot approve its own work, and the daemon has no
+code path that approves anything.
+
+### What gets written, and when
+
+Only two things cause a tool to be written, and neither is "the model felt like it":
+
+- **you asked** — `ai tools request "..."`, which also counts as pending work, so it is
+  one of the things that triggers a sleep;
+- **something kept failing in a way a tool fixes** — a practice task that failed every
+  attempt and whose text is about converting, parsing, calculating or dates, rather than
+  the kind of failure more training fixes.
+
+A queue of plausible-looking tools nobody asked for is a queue nobody reads, and at that
+point the review is theatre.
+
+### Six checks before anyone is asked to read it
+
+Your attention is the scarce resource, so the mechanical objections are the machine's
+job. In order of what they cost:
+
+1. the name and description are usable;
+2. the source compiles and defines `run` with named parameters — no `*args`, no
+   `**kwargs`, because then the schema could not be checked against it;
+3. every import is on the allowlist;
+4. the capabilities it declares are ones you permit;
+5. the declared JSON schema matches `run`'s signature, parameter by parameter;
+6. its examples run in the sandbox and produce exactly what it claimed — **and** the
+   same examples fail when `run` is emptied out.
+
+That last check is the one that makes the others worth having. It is the same trick the
+practice exercises use: a tool whose examples pass with no implementation has examples
+that test nothing. When a check fails, the objections go back to the model *once* so it
+can repair its own work; a second failure is reported rather than retried.
+
+A version that failed its checks cannot be approved, by you or anyone — `ai tools
+approve` refuses it and says which check it failed.
+
+### The review
+
+```
+$ ai tools show week_number
+week_number@v001  (proposed)
+  Return the ISO week number for a date given as YYYY-MM-DD.
+  written by model on 2026-11-12 14:04:54
+
+what it may do:
+  pure: compute only: no files, no network, no subprocesses
+  limits: 10s, 512 MiB, 42 importable modules
+
+arguments:
+  date: string — a date as YYYY-MM-DD
+
+checks: passed
+  ok: run(date='2026-11-12') -> 46
+
+source:
+  import datetime
+  def run(date):
+      return datetime.date.fromisoformat(date).isocalendar().week
+
+  ai tools approve week_number    # make it callable
+  ai tools reject week_number --note '...'
+  ai tools run week_number '{...}'   # try it first
+```
+
+`ai tools run` works on an unapproved version *on purpose*: reading the source and then
+watching what it does is the review. The model still cannot call it.
+
+Every version is kept. A tool the model rewrites is a new version that needs its own
+review, and the one you approved keeps working until you say otherwise —
+`ai tools rollback` goes back, `ai tools retire` stops offering it without deleting
+anything. Tools live in `tools/<name>/vNNN/tool.py` with an `active` symlink, the same
+shape as the adapters, and they are in the backup set.
+
+### The tool sandbox
+
+A tool runs in its own process, with four things enforced at once because none of them
+is sufficient alone:
+
+| | |
+|---|---|
+| process | `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NPROC`, a wall-clock timeout and `SIGKILL` to the whole session |
+| imports | a denylist at runtime (`socket`, `subprocess`, `ctypes`, …) on the audit hook, and the full allowlist checked statically before review |
+| files | writes only in its own throwaway workspace, reads only there and under `tools.readable_paths` — which is empty by default, because your project directory holds your configuration |
+| operations | `subprocess`, `os.system`, `os.exec*`, `os.fork`, socket use and directory listing outside the allowed roots, refused on the audit event rather than by patching names |
+
+The import rule is split for a reason worth stating: an allowlist at *runtime* would also
+catch the standard library importing itself — `pathlib` imports `os` — so the runtime
+list is a small denylist of things nothing permitted needs (a test asserts that), and the
+allowlist is enforced where a refusal can be explained.
+
+The arguments go in as JSON on stdin and one JSON object comes back on stdout. A tool
+cannot return a Python object, keep state between calls, or talk to the daemon. Each call
+gets a fresh workspace, which a test checks by writing a file in one call and looking for
+it in the next.
+
+**What this does not guarantee.** CPython's audit hooks are a monitoring interface, not a
+security boundary: code that reaches a C extension or an interpreter bug can get around
+them, and a tool that spends its ten seconds doing arithmetic can still return a wrong
+answer. The real boundary is you reading the source. If you intend to run tools you have
+not read, put a container or a seccomp filter under `ToolRunner` — which is why
+everything goes through one subprocess call.
+
+### Calling them
+
+The tool definitions are rendered into the prompt through the model's **own** chat
+template (`tools=`), so a model trained to call tools uses the format it was trained on,
+and a template that does not understand tools is not offered any — asked of the template,
+not assumed from the model's name.
+
+Generation stops at the closing `</tool_call>` tag, the tool runs, its result goes back as
+a `tool` message, and generation continues. That makes calls serial — one per round — on
+purpose: letting the model carry on past its own tool call means letting it write down
+what the tool returned before the tool has run, and it will. `tools.max_calls_per_turn`
+(4) bounds the rounds. A failure is handed to the model as the result, so it can try
+different arguments or answer without the tool, which are both better than a silent
+retry. The markup never reaches you, streaming included, and every call is logged with
+its arguments and its result.
+
 ## Adapters and routing
 
 Adapters live in `adapters/<module>/vNNN` with an `active` symlink. Promotion is a symlink
@@ -779,6 +928,8 @@ and the estimates become exact.
 | `ai runs [id]` | sleep runs and their steps, with what each one did, checkpoints and errors |
 | `ai facts [--subject S]` | durable facts it holds; `--subject` shows everything it has believed about one |
 | `ai skills [--all]` | the measured skill table: score, trials and demand per topic |
+| `ai tools [show\|approve\|reject\|run\|retire\|rollback\|delete] <name>` | tools it wrote: read them, try them, approve them |
+| `ai tools request "..."` | ask for a tool; the next night writes it |
 | `ai expansion [--revert]` | what it has grown and would like to; undo the last change |
 | `ai approve-expansion <id> [--reject]` | accept a proposed structural change |
 | `ai optimize [--revert]` | what it has tuned about itself; put the last change back |
@@ -796,7 +947,8 @@ The HTTP API has `/chat` (JSON or SSE), `/v1/chat/completions` (OpenAI-compatibl
 existing clients work against the local daemon), `/health`, `/status`, `/adapter/status`,
 `/adapter/rollback`, `/adapter/activate`, `/hardware`, `/models`, `/bench`, `/runs`,
 `/facts`, `/skills`, `/report`, `/approvals`, `/expansion`, `/expansion/revert`,
-`/optimisation` and `/optimisation/revert`.
+`/optimisation`, `/optimisation/revert`, `/tools`, `/tools/{name}`,
+`/tools/{name}/review`, `/tools/{name}/run` and `/tools/requests`.
 
 ## Configuration
 
@@ -816,6 +968,7 @@ The sections the night reads, with the defaults worth knowing:
 | `gate` | `min_improvement` (0.0), `max_regression` (0.02), `min_items` (8), `max_promotions_per_run` (1), `scorer` (embedding) |
 | `expansion` | `max_changes_per_run` (1), `min_uncovered_requests` (8), `saturation_runs` (3), `rank_step` (8), `allow_pruning` (off), `allow_base_merge` (off), `require_approval` |
 | `optimisation` | `settings` (the knobs it may measure), `max_trials_per_run` (2), `min_relative_gain` (0.05), `max_quality_loss` (0.02) |
+| `tools` | `enabled`, `allow_authoring`, `require_approval` (on), `max_calls_per_turn` (4), `timeout_seconds` (10), `allow_capabilities` (`pure`, `write_workspace`), `readable_paths` (empty), `allowed_hosts` (empty), `allowed_modules` |
 
 `docs/sources.yaml` maps topics to documentation URLs and records the licence of each
 source. It is the complete list of what the fetcher can ever request, so an entry you did
@@ -857,6 +1010,7 @@ src/gustav/
   learn/               facts, examples, tasks, skills, benchmarks, chunking, grounding
   expansion/           triggers, proposals, the actions, merging into the base
   optimize/            the measured tunable loop and the router fitting
+  tools/               the policy, the sandbox runner, the checks, the store, the loop
   fetcher/             the allowlist, the cache, HTML to text — the only network use
   sandbox/             where practice answers are run and judged
   train/               the dataset mix and the LoRA trainer
@@ -866,6 +1020,7 @@ packaging/             the systemd user unit
   wake/                the chat side
   server/ cli.py       control plane and its client
   store/               SQLite schema and migrations
+tools/                 tools it wrote, one directory per tool, source you can read
 var/                   databases, logs, run checkpoints, doc cache, reports, socket, lock
 ```
 
@@ -879,12 +1034,15 @@ var/                   databases, logs, run checkpoints, doc cache, reports, soc
 
 Three sets, with different jobs.
 
-**The fast set** (around 850 tests) runs on any machine with no GPU and no weights. Most
+**The fast set** (around 940 tests) runs on any machine with no GPU and no weights. Most
 of the sleep tests call a step's body directly with a *scripted* model, which is what
 makes the interesting cases cheap to pin down: an ungrounded fact, an exercise whose tests
 pass without a solution, a candidate adapter that is better on new material and worse on
 old, a replacement answer that just restates the one you rejected, an expansion proposal
 the hardware budget cannot afford, a tunable change that bought speed with quality.
+The tool sandbox gets a test per refusal — imports, files, directory listings,
+subprocesses, resource limits, a tool trying to raise its own limits — because a sandbox
+nobody tested is a sandbox nobody has.
 
 **The slow set** starts the real daemon as a subprocess and `kill -9`s it while **each**
 step of the night is running, then restarts it and checks that finished steps were not
@@ -945,6 +1103,16 @@ against one of them too.
   solution passes, the stubbed version fails) catch incoherent and vacuous tasks, but not
   a task that tests the wrong thing correctly. Small models mostly fail to produce usable
   JSON for this at all, which the report counts rather than hides.
+- **A tool sandbox is not a jail.** The audit hook, the resource limits and the
+  throwaway workspace stop the ordinary accidents and the obvious misbehaviour, and a
+  test suite tries each of them. They are not a boundary against code written to break
+  out, and CPython does not offer one. The boundary is the review: nothing runs until
+  you have read it, and what it declared is in front of you when you do.
+- **A reviewed tool can still be wrong.** The checks prove it compiles, matches its
+  schema and does what its examples claim. They say nothing about the other inputs. A
+  tool that converts units correctly for Celsius and silently wrongly for Kelvin passes
+  everything here — which is why the examples are shown at review time rather than
+  summarised as "passed".
 - **Documentation licences are your call.** `docs/sources.yaml` records the licence you
   declared for each source; the fetcher stores it with every document, the report shows
   it, and a source with no licence is fetched *and* warned about. Nothing verifies the

@@ -32,6 +32,10 @@ ALLOWED_MUTATORS = {
     "backup/snapshot.py",
     "backup/manifest.py",
     "inference/adapters.py",
+    # The tool store owns tools/ the way the adapter store owns adapters/: versions are
+    # written once and never edited, the `active` symlink is swapped with os.replace,
+    # and deleting a tool is an explicit command. Nothing else may touch that tree.
+    "tools/store.py",
     "core/recovery.py",       # clears staging directories, which are by definition dead
     "inference/models.py",    # downloaded weights, before anything is live
     "testing/fakes.py",
@@ -170,3 +174,36 @@ def test_every_crash_rollback_step_has_a_handler_registered():
         assert f'"{name}"' in source, (
             f"step {name!r} rolls back on crash but the daemon registers no handler for it"
         )
+
+
+def test_nothing_outside_the_tool_store_writes_to_the_tools_tree():
+    """A tool is source code that runs here. One module decides what is on disk.
+
+    The same rule the adapters tree has, for a stronger reason: an adapter that appeared
+    from nowhere would be refused by the base-model check, while a *tool* that appeared
+    from nowhere would be source code nobody reviewed.
+    """
+    offenders: list[str] = []
+    for path in modules():
+        name = relative(path)
+        if name in ("tools/store.py", "paths.py", "data/__init__.py"):
+            continue
+        for node in ast.walk(parse(path)):
+            if not isinstance(node, ast.Attribute) or node.attr != "tools":
+                continue
+            receiver = _receiver(node)
+            if receiver not in ("paths", "self"):
+                continue
+            # Reading the path is fine; what matters is who writes through it.
+            parent_writes = [
+                writer
+                for writer in ("mkdir", "write_text", "write_bytes", "unlink",
+                               "symlink_to", "rmtree", "replace", "rename")
+                if f".tools" in ast.unparse(node) and writer in ast.unparse(node)
+            ]
+            if parent_writes:
+                offenders.append(f"{name}:{node.lineno} {ast.unparse(node)}")
+    assert not offenders, (
+        "these write to the tools tree without going through the tool store:\n  "
+        + "\n  ".join(offenders)
+    )

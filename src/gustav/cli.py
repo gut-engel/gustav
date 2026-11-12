@@ -847,6 +847,165 @@ def cmd_optimize(args: argparse.Namespace, client: Client) -> int:
     return 0
 
 
+def cmd_tools(args: argparse.Namespace, client: Client) -> int:
+    action = args.action or "list"
+    if action == "list":
+        payload = client.get("/tools", params={"limit": args.limit})
+        if not payload["enabled"]:
+            print("tool use is switched off in config (tools.enabled)")
+        print("limits: " + "; ".join(payload["limits"]))
+        print("a tool may ask for: " + ", ".join(payload["allow_capabilities"]))
+        if payload["tools"]:
+            print()
+            print(f"  {'tool':<22} {'status':<10} {'ver':<6} {'calls':>6}  capabilities")
+            for tool in payload["tools"]:
+                usage = tool["usage"]
+                failed = f" ({usage['failed']} failed)" if usage["failed"] else ""
+                print(
+                    f"  {tool['name']:<22} {tool['status']:<10} "
+                    f"{tool['active_version'] or '-':<6} {usage['calls']:>6}{failed}  "
+                    f"{', '.join(tool['capabilities'])}"
+                )
+                print(f"      {tool['description'][:94]}")
+        else:
+            print("\nno tools yet. 'ai tools request \"...\"' asks for one.")
+        if payload["pending"]:
+            print()
+            print("waiting for you to read them:")
+            for item in payload["pending"]:
+                print(
+                    f"  {item['name']}@{item['version']}  "
+                    f"[{', '.join(item['capabilities'])}]  {item['description'][:70]}"
+                )
+            print("  ai tools show <name>     # the source, the checks, the limits")
+        if payload["requests"]:
+            print()
+            print("requested, not written yet:")
+            for item in payload["requests"]:
+                print(f"  [{item['id']}] {item['text'][:88]}")
+        return 0
+
+    if action == "show":
+        payload = client.get(
+            f"/tools/{args.name}", params={"version": args.version} if args.version else {}
+        )
+        print(f"{payload['name']}@{payload['version']}  ({payload['version_status']})")
+        print(f"  {payload['description']}")
+        print(f"  written by {payload['author']} on {payload['created_at']}")
+        if payload["reviewed_at"]:
+            print(
+                f"  reviewed by {payload['reviewed_by']} on {payload['reviewed_at']}"
+                + (f": {payload['note']}" if payload["note"] else "")
+            )
+        print()
+        print("what it may do:")
+        for line in payload["limits"]:
+            print(f"  {line}")
+        print()
+        print("arguments:")
+        properties = (payload["parameters"] or {}).get("properties") or {}
+        required = set((payload["parameters"] or {}).get("required") or [])
+        for name, spec in properties.items():
+            mark = "" if name in required else " (optional)"
+            print(f"  {name}: {spec.get('type', 'any')}{mark} — {spec.get('description', '')}")
+        checks = payload["checks"] or {}
+        print()
+        print("checks: " + ("passed" if checks.get("ok") else "REFUSED"))
+        for problem in checks.get("problems") or []:
+            print(f"  ! {problem}")
+        for example in checks.get("examples") or []:
+            mark = "ok" if example.get("ok") else "failed"
+            print(
+                f"  {mark}: run({', '.join(f'{k}={v!r}' for k, v in (example.get('arguments') or {}).items())})"
+                f" -> {example.get('got')!r}"
+                + ("" if example.get("ok") else f" (claimed {example.get('expected')!r})")
+            )
+        usage = payload["usage"]
+        if usage["calls"]:
+            print()
+            print(f"used {usage['calls']} time(s), {usage['failed']} failed, "
+                  f"last {usage['last']}")
+        print()
+        print("source:")
+        print("".join(f"  {line}\n" for line in payload["source"].splitlines()), end="")
+        if payload["versions"] and len(payload["versions"]) > 1:
+            print()
+            print("versions: " + ", ".join(
+                f"{v['version']} ({v['status']})" for v in payload["versions"]
+            ))
+        if payload["version_status"] == "proposed":
+            print()
+            print(f"  ai tools approve {payload['name']}    # make it callable")
+            print(f"  ai tools reject {payload['name']} --note '...'")
+            print(f"  ai tools run {payload['name']} '{{...}}'   # try it first")
+        return 0
+
+    if action in ("approve", "reject"):
+        try:
+            payload = client.post(
+                f"/tools/{args.name}/review",
+                json={
+                    "approve": action == "approve",
+                    "version": args.version,
+                    "note": args.note or "",
+                },
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        verb = "approved" if payload["approved"] else "rejected"
+        print(f"{payload['name']}@{payload['version']} {verb}")
+        if payload["approved"]:
+            print("the model can call it from the next message on")
+        return 0
+
+    if action == "run":
+        import json as _json
+
+        try:
+            arguments = _json.loads(args.arguments or "{}")
+        except ValueError as exc:
+            print(f"the arguments must be JSON: {exc}", file=sys.stderr)
+            return 2
+        payload = client.post(f"/tools/{args.name}/run", json={"arguments": arguments})
+        if payload["ok"]:
+            print(_json.dumps(payload["result"], indent=2, ensure_ascii=False))
+        else:
+            print(f"failed: {payload['error']}", file=sys.stderr)
+        if payload.get("stdout"):
+            print(f"(it also printed: {payload['stdout'].strip()[:200]})")
+        if payload["status"] != "approved":
+            print(
+                f"(this version is {payload['status']}; running it by hand is part of "
+                f"the review, but the model cannot call it)"
+            )
+        return 0 if payload["ok"] else 1
+
+    if action == "retire":
+        payload = client.post(f"/tools/{args.name}/retire", json={"note": args.note or ""})
+        print(f"{payload['name']} retired; it stays on disk and stops being offered")
+        return 0
+
+    if action == "rollback":
+        payload = client.post(f"/tools/{args.name}/rollback")
+        print(f"{payload['name']} is back to {payload['version']}")
+        return 0
+
+    if action == "delete":
+        payload = client.request("DELETE", f"/tools/{args.name}")
+        print(f"{payload['name']} deleted" + (f" ({payload['path']})" if payload.get("path") else ""))
+        return 0
+
+    if action == "request":
+        payload = client.post("/tools/requests", json={"text": args.name or ""})
+        print(f"asked for: {payload['text']}")
+        print(f"  [{payload['id']}] the next sleep writes it, then 'ai tools' shows it")
+        return 0
+
+    print(f"unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Make a directory into a gustav project, without overwriting anything."""
     from gustav.data import install_defaults
@@ -1068,6 +1227,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--revert", action="store_true", help="undo the last kept change")
     p.add_argument("--limit", type=int, default=20)
 
+    p = sub.add_parser("tools", help="tools it wrote: read them, approve them, try them")
+    p.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=("list", "show", "approve", "reject", "run", "retire", "rollback",
+                 "delete", "request"),
+    )
+    p.add_argument("name", nargs="?", help="the tool (or the text, for 'request')")
+    p.add_argument("arguments", nargs="?", help="JSON arguments, for 'run'")
+    p.add_argument("--version", help="a specific version (default: the newest)")
+    p.add_argument("--note", help="why (recorded with the decision)")
+    p.add_argument("--limit", type=int, default=20)
+
     p = sub.add_parser("facts", help="durable facts it has learned about you")
     p.add_argument("--module", help="only this module's facts")
     p.add_argument("--subject", help="every statement it has believed about one subject")
@@ -1169,6 +1342,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_expansion(args, client)
         if args.command == "optimize":
             return cmd_optimize(args, client)
+        if args.command == "tools":
+            return cmd_tools(args, client)
         if args.command == "approve-expansion":
             return cmd_approve_expansion(args, client)
         parser.error(f"unhandled command {args.command}")

@@ -429,9 +429,89 @@ MIGRATION_0004 = [
     "CREATE INDEX idx_optimisations_setting ON optimisations (setting, id DESC)",
 ]
 
+MIGRATION_0005 = [
+    # Section 11: tools the system writes for itself. A tool is source code that runs
+    # on this machine, so the table is built around the review: nothing is callable
+    # until a human has read it, every version is kept, and every call is logged with
+    # what went in and what came out.
+    """
+    CREATE TABLE tools (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT NOT NULL UNIQUE,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        description   TEXT NOT NULL DEFAULT '',
+        status        TEXT NOT NULL DEFAULT 'proposed',
+                      -- proposed | approved | rejected | retired
+        active_version TEXT,
+        request_id    INTEGER,
+        run_id        INTEGER
+    )
+    """,
+    "CREATE INDEX idx_tools_status ON tools (status, name)",
+    """
+    CREATE TABLE tool_versions (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        tool_id      INTEGER NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+        version      TEXT NOT NULL,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        source       TEXT NOT NULL,
+        parameters   TEXT NOT NULL DEFAULT '{}',
+        capabilities TEXT NOT NULL DEFAULT '[]',
+        examples     TEXT NOT NULL DEFAULT '[]',
+        -- What the admission checks found: compiled, examples passed, stubbed version
+        -- failed, declared capabilities within the allowance. Shown at review time.
+        checks       TEXT NOT NULL DEFAULT '{}',
+        status       TEXT NOT NULL DEFAULT 'proposed',
+                     -- proposed | approved | rejected | superseded
+        author       TEXT NOT NULL DEFAULT 'model',
+        reviewed_at  TEXT,
+        reviewed_by  TEXT,
+        note         TEXT,
+        run_id       INTEGER,
+        fingerprint  TEXT NOT NULL UNIQUE,
+        UNIQUE (tool_id, version)
+    )
+    """,
+    "CREATE INDEX idx_tool_versions_status ON tool_versions (status, tool_id)",
+    """
+    CREATE TABLE tool_calls (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        tool_id     INTEGER REFERENCES tools(id) ON DELETE SET NULL,
+        name        TEXT NOT NULL,
+        version     TEXT,
+        session_id  INTEGER,
+        turn_id     INTEGER,
+        arguments   TEXT,
+        result      TEXT,
+        ok          INTEGER NOT NULL DEFAULT 0,
+        error       TEXT,
+        duration_ms INTEGER,
+        source      TEXT NOT NULL DEFAULT 'chat'   -- chat | review | cli | sleep
+    )
+    """,
+    "CREATE INDEX idx_tool_calls_tool ON tool_calls (tool_id, id DESC)",
+    """
+    CREATE TABLE tool_requests (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        text       TEXT NOT NULL,
+        source     TEXT NOT NULL DEFAULT 'user',
+        status     TEXT NOT NULL DEFAULT 'open',
+                   -- open | written | refused | withdrawn
+        detail     TEXT,
+        tool_id    INTEGER REFERENCES tools(id) ON DELETE SET NULL,
+        run_id     INTEGER
+    )
+    """,
+    "CREATE INDEX idx_tool_requests_open ON tool_requests (status, id)",
+]
+
 MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (1, "initial_daemon_schema", MIGRATION_0001),
     (2, "weight_change_log", MIGRATION_0002),
     (3, "learning_store", MIGRATION_0003),
     (4, "expansion_and_optimisation", MIGRATION_0004),
+    (5, "tools", MIGRATION_0005),
 ]

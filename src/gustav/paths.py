@@ -80,6 +80,11 @@ class Paths:
         return self.root / "adapters"
 
     @property
+    def tools(self) -> Path:
+        """Tools the system wrote for itself — source you are meant to read."""
+        return self.root / "tools"
+
+    @property
     def models(self) -> Path:
         return self.root / "models"
 

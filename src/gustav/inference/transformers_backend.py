@@ -178,6 +178,7 @@ class TransformersBackend(InferenceBackend):
         #: for practice tasks, where the reasoning is the point.
         self.thinking = thinking
         self._template_supports_thinking: bool | None = None
+        self._template_supports_tools: bool | None = None
         self.log = logger or get_logger("inference")
 
         self._model: Any = None
@@ -471,7 +472,11 @@ class TransformersBackend(InferenceBackend):
     # prompting
     # ------------------------------------------------------------------
     def render_prompt(
-        self, messages: Sequence[Message], *, thinking: bool | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        thinking: bool | None = None,
+        tools: Sequence[dict[str, Any]] = (),
     ) -> str:
         """The model's own chat template — never a hardcoded format."""
         if self._tokenizer is None:
@@ -480,10 +485,13 @@ class TransformersBackend(InferenceBackend):
         want_thinking = self.thinking if thinking is None else thinking
         if self._supports_thinking_flag():
             kwargs["enable_thinking"] = want_thinking
+        if tools and self.supports_tools:
+            kwargs["tools"] = list(tools)
         try:
             return self._tokenizer.apply_chat_template(list(messages), **kwargs)
         except TypeError:
             self._template_supports_thinking = False
+            self._template_supports_tools = False
             return self._tokenizer.apply_chat_template(
                 list(messages), tokenize=False, add_generation_prompt=True
             )
@@ -491,6 +499,21 @@ class TransformersBackend(InferenceBackend):
             self.log.warning("no usable chat template (%s); falling back to a plain format", exc)
             lines = [f"{m['role']}: {m['content']}" for m in messages]
             return "\n".join([*lines, "assistant:"])
+
+    @property
+    def supports_tools(self) -> bool:
+        """Does this model's template know what to do with ``tools=``?
+
+        Asked of the template rather than assumed from the model's name: a template
+        that never mentions tools would render them into nothing, and the model would
+        then be offered tools it cannot see and blamed for not calling them.
+        """
+        if self._template_supports_tools is None:
+            template = getattr(self._tokenizer, "chat_template", None) or ""
+            if not isinstance(template, str):
+                template = str(template)
+            self._template_supports_tools = "tools" in template and "tool_call" in template
+        return bool(self._template_supports_tools)
 
     def _supports_thinking_flag(self) -> bool:
         """Does this model's template take ``enable_thinking``? Asked once, of the template."""
@@ -582,7 +605,7 @@ class TransformersBackend(InferenceBackend):
         import torch
 
         try:
-            prompt = self.render_prompt(messages)
+            prompt = self.render_prompt(messages, tools=params.tools)
             input_ids = self._tokenizer(
                 prompt, return_tensors="pt", add_special_tokens=False
             )["input_ids"].to(self._device)

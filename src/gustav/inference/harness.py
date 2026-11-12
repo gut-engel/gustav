@@ -38,7 +38,9 @@ from gustav.inference.backend import (
 from gustav.inference.conversation import ContextBudget, Conversation
 from gustav.inference.registry import Registry, load_registry
 from gustav.inference.router import RouteDecision, Router, RouterLog
+from gustav.inference.stopping import StopSequenceMatcher
 from gustav.inference.tiered_cache import Tier, TieredCache
+from gustav.tools.loop import CLOSE, OPEN, parse_calls, strip_calls
 from gustav.paths import Paths
 from gustav.wake.responder import Reply
 
@@ -92,6 +94,8 @@ class Harness:
         self._last_route: RouteDecision | None = None
         #: Summaries of turns that fell out of the window, per conversation.
         self._summaries: dict[tuple[str, int, int], str] = {}
+        #: What the last streamed answer's tools did, for the server's final event.
+        self._last_tools: Any = None
         #: Set when a load was attempted and failed. "Not loaded yet" is not a failure:
         #: the daemon's startup health check runs *before* the first load, and treating
         #: that as unhealthy would send it straight to safe mode.
@@ -406,6 +410,33 @@ class Harness:
         with contextlib.suppress(BackendError):
             await self.backend.set_active_adapters(wanted)
 
+    # ------------------------------------------------------------------
+    # tools
+    # ------------------------------------------------------------------
+    def tool_session(self, *, session_id: int | None = None, source: str = "chat"):
+        """The approved tools this answer may call, or None if there are none.
+
+        Built per answer, so a tool approved while you were typing is available on the
+        next message rather than at the next restart.
+        """
+        if not self.config.tools.enabled or self.db is None:
+            return None
+        if not getattr(self.backend, "supports_tools", False):
+            return None
+        from gustav.tools.loop import ToolSession
+        from gustav.tools.runner import ToolRunner
+        from gustav.tools.store import ToolStore
+
+        session = ToolSession(
+            ToolStore(self.db, self.paths.tools, max_tools=self.config.tools.max_tools),
+            self.config.tools,
+            runner=ToolRunner(workspace_root=self.paths.tmp),
+            events=self.events,
+            session_id=session_id,
+            source=source,
+        )
+        return session if session.enabled else None
+
     async def respond(
         self,
         *,
@@ -418,9 +449,34 @@ class Harness:
         messages, decision = await self._prepare(
             message, history, params, session_id=session_id
         )
-        generation = await self.backend.generate(messages, params)
+        tools = self.tool_session(session_id=session_id)
+        if tools is None:
+            generation = await self.backend.generate(messages, params)
+            self._record(generation, decision)
+            return self._reply(generation, decision)
+
+        # With tools, one answer can take several rounds: generate, run what it asked
+        # for, tell it the result, generate again. Generation stops at the closing tag
+        # so the tool runs before the model can invent what it returned.
+        params = params.merged(
+            tools=tools.schemas(), stop=tuple({*params.stop, CLOSE})
+        )
+        generation = None
+        for _round in range(self.config.tools.max_calls_per_turn + 1):
+            generation = await self.backend.generate(messages, params)
+            calls = parse_calls(generation.text)
+            if not calls or tools.remaining <= 0:
+                break
+            messages = [*messages, {"role": "assistant", "content": generation.text}]
+            for call in calls[: tools.remaining]:
+                result = await asyncio.to_thread(tools.execute, call)
+                messages.append(tools.message_for(call, result))
+
+        assert generation is not None
         self._record(generation, decision)
-        return self._reply(generation, decision)
+        reply = self._reply(generation, decision, tools=tools.use)
+        reply.text = strip_calls(reply.text) or reply.text
+        return reply
 
     async def stream(
         self,
@@ -434,16 +490,62 @@ class Harness:
         messages, decision = await self._prepare(
             message, history, params, session_id=session_id
         )
-        async for chunk in self.backend.stream(messages, params):
-            yield chunk
+        tools = self.tool_session(session_id=session_id)
+        if tools is None:
+            async for chunk in self.backend.stream(messages, params):
+                yield chunk
+            generation = getattr(self.backend, "_last_generation", None)
+            if generation is not None:
+                self._record(generation, decision)
+            return
+
+        params = params.merged(
+            tools=tools.schemas(), stop=tuple({*params.stop, CLOSE})
+        )
+        index = 0
+        for _round in range(self.config.tools.max_calls_per_turn + 1):
+            # A tool call is machinery, not an answer, so it is held back rather than
+            # streamed: the matcher only releases text that cannot be the start of the
+            # marker, which is the same trick the stop sequences use.
+            matcher = StopSequenceMatcher(stop=(OPEN,))
+            raw: list[str] = []
+            hiding = False
+            async for chunk in self.backend.stream(messages, params):
+                raw.append(chunk.text)
+                if hiding:
+                    continue
+                outcome = matcher.feed(chunk.text)
+                if outcome.emit:
+                    yield Chunk(text=outcome.emit, index=index)
+                    index += 1
+                if outcome.stopped:
+                    # The rest of this round is the call itself; collect it, say nothing.
+                    hiding = True
+            text = "".join(raw)
+            calls = parse_calls(text)
+            if not calls or tools.remaining <= 0:
+                tail = matcher.flush() if not hiding else ""
+                if tail:
+                    yield Chunk(text=tail, index=index)
+                    index += 1
+                break
+            messages = [*messages, {"role": "assistant", "content": text}]
+            for call in calls[: tools.remaining]:
+                outcome = await asyncio.to_thread(tools.execute, call)
+                messages.append(tools.message_for(call, outcome))
+
+        yield Chunk(text="", index=index, finish_reason="stop")
         generation = getattr(self.backend, "_last_generation", None)
         if generation is not None:
             self._record(generation, decision)
+            self._last_tools = tools.use
 
     def last_generation(self) -> Generation | None:
         return getattr(self.backend, "_last_generation", None)
 
-    def _reply(self, generation: Generation, decision: RouteDecision) -> Reply:
+    def _reply(
+        self, generation: Generation, decision: RouteDecision, *, tools: Any = None
+    ) -> Reply:
         return Reply(
             text=generation.text,
             adapter_versions=generation.adapters,
@@ -459,6 +561,11 @@ class Harness:
                 "router_uncovered": decision.uncovered,
                 "cached_prompt_tokens": generation.meta.get("cached_prompt_tokens", 0),
                 "vram_peak_mb": generation.vram_peak_mb,
+                **(
+                    {"tools": tools.names, "tool_calls": tools.describe()}
+                    if tools is not None and tools.calls
+                    else {}
+                ),
             },
         )
 

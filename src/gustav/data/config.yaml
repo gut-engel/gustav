@@ -247,3 +247,33 @@ optimisation:
   min_relative_gain: 0.05
   # ...and may not cost more than this on the held-out suite.
   max_quality_loss: 0.02
+
+tools:
+  # Section 11: tools the system writes for itself. A tool is source code that runs on
+  # this machine, which makes it the most dangerous thing here — so nothing is callable
+  # until you have read it, and the sandbox assumes the code is hostile even though it
+  # came from your own model.
+  enabled: true
+  # May the night write new ones? Off leaves the tools you approved working.
+  allow_authoring: true
+  # Nothing is callable until a human approves it. Turning this off is a deliberate act.
+  require_approval: true
+  max_tools: 20
+  # Tool calls one answer may make, so a loop cannot become a night.
+  max_calls_per_turn: 4
+  timeout_seconds: 10
+  memory_limit_mb: 512
+  max_new_per_run: 2
+  # What a tool may ever ask for:
+  #   pure            - compute only: no files, no network, no subprocesses
+  #   write_workspace - read and write inside its own throwaway directory
+  #   read_paths      - read files under tools.readable_paths (empty by default)
+  #   network         - HTTP to tools.allowed_hosts (empty by default)
+  allow_capabilities: [pure, write_workspace]
+  # Directories a read_paths tool may read. Empty is the right default: your project
+  # directory holds your configuration.
+  readable_paths: []
+  # Hosts a network tool may reach. Empty means no tool can use the network.
+  allowed_hosts: []
+  # allowed_modules: the standard library a tool may import. The default list is in
+  # src/gustav/config/schema.py; add to it only if you are happy for a tool to use it.

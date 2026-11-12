@@ -206,6 +206,59 @@ class TunableConfig(Strict):
     warm_cache_mb: int = 8192
 
 
+class ToolsConfig(Strict):
+    """Section 11: tools the system writes for itself.
+
+    A tool is *source code that runs on this machine*, which makes it the most
+    dangerous thing in the project — so the defaults are the cautious ones and the
+    review is not optional. The sandbox is described in `gustav/tools/policy.py`,
+    including what it does and does not guarantee.
+    """
+
+    #: May the model call approved tools at all?
+    enabled: bool = True
+    #: May the night write new ones? Turning this off leaves the tools you approved
+    #: working and stops new ones appearing.
+    allow_authoring: bool = True
+    #: Nothing is callable until a human has read the source. Turning this off is a
+    #: deliberate act and the daemon says so every time it runs a tool.
+    require_approval: bool = True
+    max_tools: int = 20
+    #: Tool calls one answer may make, so a loop cannot turn into a night.
+    max_calls_per_turn: int = 4
+    #: Per call.
+    timeout_seconds: float = 10.0
+    memory_limit_mb: int = 512
+    max_output_bytes: int = 64 * 1024
+    #: Tools a single night may write.
+    max_new_per_run: int = 2
+    max_source_bytes: int = 20_000
+    #: What a tool may ever ask for. A tool that declares anything else is refused
+    #: before it reaches review.
+    #:
+    #: ``pure``            compute only: no files, no network, no subprocesses
+    #: ``write_workspace`` read and write inside its own throwaway directory
+    #: ``read_paths``      read files under `tools.readable_paths`
+    #: ``network``         HTTP to `tools.allowed_hosts`, and nothing else
+    allow_capabilities: list[str] = ["pure", "write_workspace"]
+    #: Modules a tool may import. Enforced twice: statically before review, and at
+    #: runtime by an audit hook that cannot be removed once installed.
+    allowed_modules: list[str] = [
+        "base64", "bisect", "calendar", "cmath", "collections", "colorsys", "copy",
+        "csv", "dataclasses", "datetime", "decimal", "difflib", "enum", "fnmatch",
+        "fractions", "functools", "hashlib", "heapq", "hmac", "html", "io",
+        "ipaddress", "itertools", "json", "math", "operator", "pathlib", "pprint",
+        "random", "re", "secrets", "statistics", "string", "textwrap", "time",
+        "timeit", "types", "typing", "unicodedata", "urllib.parse", "uuid",
+        "zoneinfo",
+    ]
+    #: Directories a `read_paths` tool may read. Empty means the capability is useless,
+    #: which is the right default: your project directory holds your configuration.
+    readable_paths: list[str] = []
+    #: Hosts a `network` tool may reach. Empty means no tool can use the network.
+    allowed_hosts: list[str] = []
+
+
 class ExpansionConfig(Strict):
     """Section 8: growing its own capacity, within a budget the hardware sets.
 
@@ -448,6 +501,7 @@ class Config(Strict):
     #: file still loads under this build.
     backup: BackupConfig = BackupConfig()
     inference: dict[str, Any] = {}
+    tools: ToolsConfig = ToolsConfig()
     expansion: ExpansionConfig = ExpansionConfig()
     optimisation: OptimisationConfig = OptimisationConfig()
     fetcher: FetcherConfig = FetcherConfig()

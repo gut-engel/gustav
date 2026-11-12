@@ -45,6 +45,10 @@ class FakeBackend(InferenceBackend):
         self.fail_adapter = fail_adapter
         self.load_delay = load_delay
         self.embed_fails = embed_fails
+        #: Whether this fake pretends its template understands tools, and what it was
+        #: offered each time it rendered a prompt.
+        self.tools_supported = True
+        self.offered_tools: list[list[str]] = []
 
         self._loaded = False
         self._adapters: dict[str, str] = {}
@@ -90,6 +94,9 @@ class FakeBackend(InferenceBackend):
             raise BackendNotLoaded()
         self.prompts.append(list(messages))
         self.params.append(params)
+        # The real backend renders the prompt (with any tools) before generating, and
+        # tests assert on what the model was offered — so this fake does too.
+        self.render_prompt(messages, tools=params.tools)
 
         words = self._answer(messages).split(" ")
         matcher = StopSequenceMatcher(stop=tuple(params.stop))
@@ -166,7 +173,14 @@ class FakeBackend(InferenceBackend):
     def count_tokens(self, text: str) -> int:
         return max(len(text.split()), 1)
 
-    def render_prompt(self, messages: Sequence[Message]) -> str:
+    @property
+    def supports_tools(self) -> bool:
+        return self.tools_supported
+
+    def render_prompt(
+        self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]] = ()
+    ) -> str:
+        self.offered_tools.append([t["function"]["name"] for t in tools])
         return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
     # --- adapters -------------------------------------------------------

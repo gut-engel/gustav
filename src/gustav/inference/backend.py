@@ -32,6 +32,10 @@ class GenerationParams:
     seed: int | None = None
     #: Adapter modules to apply, in order. Empty means "whatever the router picks".
     adapters: tuple[str, ...] = ()
+    #: Tool definitions offered to the model, in the shape a chat template's ``tools=``
+    #: argument expects. Empty means the model is not told about any tools at all —
+    #: which is the default, and what "tools disabled" looks like from down here.
+    tools: tuple[dict[str, Any], ...] = ()
 
     @property
     def greedy(self) -> bool:
@@ -43,6 +47,8 @@ class GenerationParams:
             data["stop"] = tuple(data["stop"])
         if isinstance(data.get("adapters"), (list, set)):
             data["adapters"] = tuple(data["adapters"])
+        if isinstance(data.get("tools"), list):
+            data["tools"] = tuple(data["tools"])
         return GenerationParams(**data)
 
 
@@ -134,8 +140,15 @@ class InferenceBackend(abc.ABC):
     def count_tokens(self, text: str) -> int: ...
 
     @abc.abstractmethod
-    def render_prompt(self, messages: Sequence[Message]) -> str:
-        """Apply the model's own chat template. No hardcoded formats anywhere."""
+    def render_prompt(
+        self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]] = ()
+    ) -> str:
+        """Apply the model's own chat template. No hardcoded formats anywhere.
+
+        ``tools`` is passed to the template, which is how a model that was trained to
+        call tools learns what it may call. A template that does not accept tools gets
+        the prompt without them, and the harness is told so it does not offer any.
+        """
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         """Mean-pooled hidden states, normalised. Optional: not every backend has them.

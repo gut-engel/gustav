@@ -761,6 +761,210 @@ class Daemon:
         }
 
     # ------------------------------------------------------------------
+    # tools (section 11)
+    # ------------------------------------------------------------------
+    def _tool_store(self):
+        from gustav.tools.store import ToolStore
+
+        return ToolStore(
+            self.db, self.paths.tools, max_tools=self.config.tools.max_tools
+        )
+
+    def tools_status(self, *, limit: int = 20) -> dict[str, Any]:
+        """Every tool, what it may do, and whether anyone has read it."""
+        store = self._tool_store()
+        from gustav.tools.policy import policy_for
+
+        tools = []
+        for record in store.all():
+            version = None
+            with contextlib.suppress(Exception):
+                version = store.version(record.name, record.active_version)
+            tools.append(
+                {
+                    "name": record.name,
+                    "description": record.description,
+                    "status": record.status,
+                    "active_version": record.active_version,
+                    "versions": record.versions,
+                    "capabilities": list(version.capabilities) if version else [],
+                    "usage": store.usage(record.name),
+                    "updated_at": record.updated_at,
+                }
+            )
+        return {
+            "enabled": self.config.tools.enabled,
+            "authoring": self.config.tools.allow_authoring,
+            "require_approval": self.config.tools.require_approval,
+            "allow_capabilities": list(self.config.tools.allow_capabilities),
+            "limits": policy_for(["pure"], self.config.tools).describe(),
+            "tools": tools,
+            "pending": [
+                {
+                    "name": version.name,
+                    "version": version.version,
+                    "description": version.description,
+                    "capabilities": list(version.capabilities),
+                    "created_at": version.created_at,
+                }
+                for version in store.pending()
+            ],
+            "requests": store.open_requests(limit=limit),
+            "calls": store.calls(limit=limit),
+        }
+
+    def tool_detail(self, name: str, version: str | None = None) -> dict[str, Any]:
+        """Everything a reviewer needs: the source, the schema, the checks, the usage."""
+        store = self._tool_store()
+        record = store.record(name)
+        if record is None:
+            raise KeyError(f"there is no tool called {name!r}")
+        chosen = store.version(name, version)
+        from gustav.tools.policy import policy_for
+
+        return {
+            "name": record.name,
+            "description": record.description or chosen.description,
+            "status": record.status,
+            "active_version": record.active_version,
+            "version": chosen.version,
+            "version_status": chosen.status,
+            "author": chosen.author,
+            "created_at": chosen.created_at,
+            "reviewed_at": chosen.reviewed_at,
+            "reviewed_by": chosen.reviewed_by,
+            "note": chosen.note,
+            "source": chosen.source,
+            "parameters": chosen.parameters,
+            "capabilities": list(chosen.capabilities),
+            "examples": list(chosen.examples),
+            "checks": chosen.checks,
+            "limits": policy_for(chosen.capabilities, self.config.tools).describe(),
+            "versions": [
+                {"version": v.version, "status": v.status, "created_at": v.created_at}
+                for v in store.versions(name)
+            ],
+            "usage": store.usage(name),
+            "calls": store.calls(name, limit=10),
+            "path": str(chosen.path) if chosen.path else None,
+        }
+
+    def review_tool(
+        self,
+        name: str,
+        *,
+        approve: bool,
+        version: str | None = None,
+        by: str = "user",
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Approve or reject a version. The only way a tool becomes callable."""
+        store = self._tool_store()
+        decided = (
+            store.approve(name, version, by=by, note=note)
+            if approve
+            else store.reject(name, version, by=by, note=note)
+        )
+        self.events.emit(
+            "tool.approved" if approve else "tool.rejected",
+            f"{decided.name}@{decided.version} was "
+            + ("approved" if approve else "rejected")
+            + f" by {by}" + (f": {note}" if note else ""),
+            level="warning",
+            tool=decided.name,
+            version=decided.version,
+            by=by,
+        )
+        return {
+            "name": decided.name,
+            "version": decided.version,
+            "status": decided.status,
+            "approved": approve,
+            "note": note or None,
+        }
+
+    def retire_tool(self, name: str, *, note: str = "") -> dict[str, Any]:
+        store = self._tool_store()
+        store.retire(name, note=note)
+        self.events.emit(
+            "tool.retired", f"{name} was retired", level="warning", tool=name
+        )
+        return {"name": name, "status": "retired"}
+
+    def rollback_tool(self, name: str, *, by: str = "user") -> dict[str, Any]:
+        decided = self._tool_store().rollback(name, by=by)
+        self.events.emit(
+            "tool.rolled_back",
+            f"{name} is back to {decided.version}",
+            level="warning",
+            tool=name,
+            version=decided.version,
+        )
+        return {"name": name, "version": decided.version, "status": decided.status}
+
+    def request_tool(self, text: str, *, source: str = "user") -> dict[str, Any]:
+        """Ask for a tool. The night writes it; you review it."""
+        if not text.strip():
+            raise ValueError("a tool request needs a description of what it should do")
+        request_id = self._tool_store().add_request(text, source=source)
+        self.journal.add_pending_work("tool_request", weight=5, ref=str(request_id))
+        self.events.emit(
+            "tool.requested", f"a tool was requested: {text[:160]}", request=request_id
+        )
+        return {"id": request_id, "text": text.strip(), "status": "open"}
+
+    async def run_tool(
+        self, name: str, arguments: dict[str, Any], *, source: str = "cli"
+    ) -> dict[str, Any]:
+        """Call a tool by hand — which is how you try one out before approving it.
+
+        An unapproved version can be run this way *on purpose*: reading the source and
+        then seeing what it does is the review. It is never reachable by the model
+        until it has been approved.
+        """
+        from gustav.tools.policy import policy_for
+        from gustav.tools.runner import ToolRunner
+
+        store = self._tool_store()
+        version = store.version(name)
+        runner = ToolRunner(workspace_root=self.paths.tmp)
+        policy = policy_for(version.capabilities, self.config.tools)
+        result = await asyncio.to_thread(
+            runner.run, version.source, arguments, policy
+        )
+        store.record_call(
+            name,
+            version=version.version,
+            arguments=arguments,
+            result=result.result,
+            ok=result.ok,
+            error="" if result.ok else result.summary,
+            duration_ms=result.duration_ms,
+            source=source,
+        )
+        return {
+            "name": name,
+            "version": version.version,
+            "status": version.status,
+            "ok": result.ok,
+            "result": result.result,
+            "error": None if result.ok else result.summary,
+            "detail": result.detail or None,
+            "stdout": result.stdout[:2000] or None,
+            "duration_ms": result.duration_ms,
+        }
+
+    def delete_tool(self, name: str) -> dict[str, Any]:
+        removed = self._tool_store().delete(name)
+        self.events.emit(
+            "tool.deleted",
+            f"{name} was deleted" + (f" from {removed}" if removed else ""),
+            level="warning",
+            tool=name,
+        )
+        return {"name": name, "deleted": True, "path": str(removed) if removed else None}
+
+    # ------------------------------------------------------------------
     # self-expansion (section 8)
     # ------------------------------------------------------------------
     def _expander(self):
