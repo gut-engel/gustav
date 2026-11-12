@@ -16,7 +16,7 @@ CLIENT_ONLY=false
 SERVICE_ONLY=false
 SOURCE=""
 REF="main"
-INTERACTIVE=false
+INTERACTIVE=true
 
 default_limit="0"
 

@@ -12,7 +12,7 @@ Usage: $0 [options]
 
 Options:
   --dir <path>            Installation directory to remove (default: $INSTALL_DIR).
-  --non-interactive       Run without prompts (default is interactive).
+  --interactive           Run with prompts (default is non‑interactive).
   --help                  Show this help message.
 EOF
   exit 1
@@ -22,7 +22,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case $1 in
     --dir) INSTALL_DIR="$2"; shift 2 ;;
-    --non-interactive) INTERACTIVE=false; shift ;;
+    --interactive) INTERACTIVE=true; shift ;;
     --help) usage ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
