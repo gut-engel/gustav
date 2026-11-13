@@ -50,6 +50,11 @@ ask() {  # ask <variable> <prompt>
   printf -v "$1" '%s' "$__reply"
 }
 
+# Bumped by hand when this script changes. raw.githubusercontent.com serves a cached
+# copy for five minutes, so the first question about any install is which version of
+# this file actually ran — and the answer should be in the paste, not guesswork.
+VERSION="2026-11-13.3"
+
 ARGV=("$@")
 REPO_SLUG="${GUSTAV_REPO:-gut-engel/gustav}"
 REF="${GUSTAV_REF:-main}"
@@ -222,6 +227,7 @@ Usage: install.sh [--server | --client] [options]
   --keep-local        the opposite: install what is in the checkout, changes and all
   --python <path>     interpreter to build the virtualenv with
   --log <path>        where to write the log (default: $logdefault)
+  --version           print the version of this script and stop
   --dry-run           print what would happen and change nothing
   --quiet             only errors (the log is written in full either way)
   -h, --help          this
@@ -252,6 +258,7 @@ while [ $# -gt 0 ]; do
     --log)        LOG="${2:-}"; shift 2 ;;
     --dry-run)    DRY_RUN=true; shift ;;
     --quiet)      QUIET=true; shift ;;
+    --version)    printf 'install.sh %s\n' "$VERSION"; exit 0 ;;
     -h|--help)    usage; exit 0 ;;
     *)            die "unknown option: $1 (try --help)" ;;
   esac
@@ -274,7 +281,7 @@ exec >>"$LOG" 2>&1
 LOG_READY=true
 trap on_exit EXIT
 
-log "install.sh"
+log "install.sh $VERSION"
 log "  argv:    $(mask "${ARGV[@]:-}")"
 log "  user:    $(id -un) (uid $(id -u))"
 log "  machine: $(uname -n) — $(uname -srm)"
@@ -288,7 +295,7 @@ log "  ref:     $REF   repo: $REPO_SLUG   source: ${SOURCE:-<clone>}"
 log "  dry-run: $DRY_RUN   quiet: $QUIET   terminal: ${TTY:-none}"
 
 if [ "$QUIET" != true ]; then
-  printf 'Writing a log of all of this to %s\n' "$LOG" >&3
+  printf 'gustav installer %s — writing all of this to %s\n' "$VERSION" "$LOG" >&3
 fi
 
 # Keep the last ten. A log nobody can find and nobody deletes is just a slow leak.
@@ -415,6 +422,29 @@ elif [ -d "$DIR/.git" ]; then
       if [ -n "$changed" ]; then
         warn "  you have local changes here; they were left alone:"
         printf '%s\n' "$changed" | sed 's/^/      /' >&4
+      fi
+    fi
+  fi
+
+  # A file that was deleted from the working tree but not from the commit is invisible
+  # to a fast-forward: git only touches what changed between the two commits, so the
+  # hole stays, the install succeeds, and the first thing anyone hears about it is an
+  # ImportError for a module that is right there in the repository.
+  if [ "$updated" = true ]; then
+    deleted="$(git -C "$DIR" ls-files --deleted 2>/dev/null || true)"
+    if [ -n "$deleted" ]; then
+      warn "  files that belong to this checkout are missing from it:"
+      printf '%s\n' "$deleted" | sed 's/^/      /' >&4
+      if [ "$RESET" = no ]; then
+        warn "  --keep-local: leaving them missing. The next check will stop on it."
+      elif [ "$DRY_RUN" = true ]; then
+        say "  would put them back from $REF"
+      else
+        log_cmd git -C "$DIR" checkout -- "<the files above>"
+        git -C "$DIR" ls-files -z --deleted \
+          | xargs -0 --no-run-if-empty git -C "$DIR" checkout -- \
+          || fail "could not restore them from $REF"
+        say "  put them back from $REF (nothing was overwritten: they were not there)"
       fi
     fi
   fi
@@ -564,8 +594,11 @@ else
   if "$VENV/bin/ai" --help >/dev/null 2>&1; then
     say "  'ai' runs"
   else
-    "$VENV/bin/ai" --help >/dev/null || true   # again, for the log
-    fail "the 'ai' command does not run — see the lines above"
+    "$VENV/bin/ai" --help >/dev/null || true   # again, with its complaint, for the log
+    fail "the 'ai' command does not run. Whatever the traceback above says is missing,
+       this checkout has not got it: 'cd $DIR && git status --short' shows what has been
+       edited or deleted here, and re-running with --reset puts all of that aside and
+       installs $REF as it is published."
   fi
 fi
 

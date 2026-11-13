@@ -270,6 +270,33 @@ def git_checkout_that_has_drifted(tmp_path) -> Path:
     return work
 
 
+def test_a_file_deleted_from_the_checkout_is_put_back(tmp_path):
+    """The server's actual failure: a fast-forward does not notice a hole in the tree."""
+    origin, work = tmp_path / "origin.git", tmp_path / "gustav"
+    subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(origin)], check=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(seed)], check=True)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    (seed / "pyproject.toml").write_text("[project]\nname='gustav'\n", encoding="utf-8")
+    (seed / "src").mkdir()
+    (seed / "src" / "needed.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "--quiet", "-m", "first"], check=True, env=env)
+    subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"], check=True)
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(work)], check=True)
+
+    (work / "src" / "needed.py").unlink()   # the hole a fast-forward will not fill
+    result = run("--client", "--dry-run", "--dir", str(work), "--url", "https://example:8713")
+    assert result.returncode == 0, result.stderr
+    assert "missing from it" in result.stderr and "needed.py" in result.stderr
+    assert "would put them back" in result.stdout
+
+    result = run("--client", "--keep-local", "--dry-run", "--dir", str(work),
+                 "--url", "https://example:8713")
+    assert "leaving them missing" in result.stderr, "--keep-local means what it says"
+
+
 def test_it_will_not_silently_install_a_checkout_that_has_drifted(tmp_path):
     """The failure that started this: a local edit installed as if it were the release."""
     work = git_checkout_that_has_drifted(tmp_path)
@@ -323,6 +350,13 @@ def test_the_uninstaller_writes_a_log_too(tmp_path, logs_go_somewhere_disposable
     assert "step 4/4" in text
     assert str(tmp_path / ".venv") in text, "it writes down what it removed"
     assert str(written[0]) in result.stdout
+
+
+def test_both_scripts_say_which_version_they_are():
+    """raw.githubusercontent.com caches for five minutes; a paste has to say what ran."""
+    stamped = run("--version").stdout.strip()
+    assert stamped.startswith("install.sh 20")
+    assert uninstall("--version").stdout.strip().startswith("uninstall.sh 20")
 
 
 def test_the_uninstaller_is_valid_and_explains_itself():

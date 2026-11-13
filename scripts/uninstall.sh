@@ -43,6 +43,9 @@ ask() {  # ask <variable> <prompt>
   printf -v "$1" '%s' "$__reply"
 }
 
+# See install.sh: bumped by hand, so a paste says which copy of this ran.
+VERSION="2026-11-13.3"
+
 ARGV=("$@")
 DIR="${GUSTAV_DIR:-$HOME/gustav}"
 BIN_DIR="${GUSTAV_BIN:-$HOME/.local/bin}"
@@ -108,6 +111,7 @@ Usage: uninstall.sh [options]
   --purge        also delete the database, adapters, tools and backups
   --yes          do not ask
   --log <path>   where to write the log (default: $logdefault)
+  --version      print the version of this script and stop
   --dry-run      print what would happen and change nothing
   -h, --help     this
 
@@ -126,6 +130,7 @@ while [ $# -gt 0 ]; do
     --yes|-y)  YES=true; shift ;;
     --log)     LOG="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
+    --version) printf 'uninstall.sh %s\n' "$VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *)         die "unknown option: $1 (try --help)" ;;
   esac
@@ -146,7 +151,7 @@ exec >>"$LOG" 2>&1
 LOG_READY=true
 trap on_exit EXIT
 
-log "uninstall.sh"
+log "uninstall.sh $VERSION"
 log "  argv:    ${ARGV[*]:-}"
 log "  user:    $(id -un) (uid $(id -u))"
 log "  machine: $(uname -n) — $(uname -srm)"
@@ -154,7 +159,7 @@ log "  dir:     $DIR"
 log "  bin:     $BIN_DIR"
 log "  purge:   $PURGE   dry-run: $DRY_RUN   terminal: ${TTY:-none}"
 
-printf 'Writing a log of all of this to %s\n' "$LOG" >&3
+printf 'gustav uninstaller %s — writing all of this to %s\n' "$VERSION" "$LOG" >&3
 
 if [ -d "$LOG_DIR" ]; then
   ls -1t "$LOG_DIR"/uninstall-*.log 2>/dev/null | tail -n +11 | while IFS= read -r old; do

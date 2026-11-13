@@ -118,6 +118,16 @@ first import — which is how you get a daemon that quits on startup with a `Syn
 in a file nobody meant to edit. That is now a failure at install time, next to the file
 that caused it.
 
+Both scripts print their own version on the first line and take `--version`.
+`raw.githubusercontent.com` serves a cached copy for five minutes, so the first question
+about any install is which copy of the script actually ran, and the answer belongs in
+the paste. To skip the cache: add `?v=$(date +%s)` to the URL.
+
+A file deleted from the working tree but not from the commit is invisible to a
+fast-forward — git only touches what changed between the two commits, so the hole stays
+and the install succeeds with a module missing. It now names those files and puts them
+back from the ref (`--keep-local` leaves them).
+
 Updating a checkout that has drifted — local edits, or commits of your own — is no
 longer a shrug and a warning. It says what is in the way and offers to put it aside
 (`git stash`) and match the ref. With nothing attached to ask, it stops instead:
