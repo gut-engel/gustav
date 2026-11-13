@@ -53,7 +53,7 @@ ask() {  # ask <variable> <prompt>
 # Bumped by hand when this script changes. raw.githubusercontent.com serves a cached
 # copy for five minutes, so the first question about any install is which version of
 # this file actually ran — and the answer should be in the paste, not guesswork.
-VERSION="2026-11-13.3"
+VERSION="2026-11-13.4"
 
 ARGV=("$@")
 REPO_SLUG="${GUSTAV_REPO:-gut-engel/gustav}"
@@ -64,6 +64,7 @@ SOURCE=""          # a local path, instead of cloning
 URL="${GUSTAV_URL:-}"
 TOKEN="${GUSTAV_TOKEN:-}"
 USE_SSH=false
+DRIVER_CUDA=""     # the newest CUDA this machine's driver can run, from nvidia-smi
 WITH_SERVICE=""    # yes | no, asked if neither flag is given
 RESET=""           # yes | no, asked if the checkout cannot be fast-forwarded
 DRY_RUN=false
@@ -353,6 +354,14 @@ fi
 if [ "$MODE" = server ]; then
   if command -v nvidia-smi >/dev/null 2>&1; then
     say "  gpu        $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
+    # The number in the nvidia-smi header is the newest CUDA the *driver* can run, and
+    # it is the one thing that decides which torch is allowed to exist on this machine.
+    DRIVER_CUDA="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+    if [ -n "$DRIVER_CUDA" ]; then
+      say "  driver     supports CUDA up to $DRIVER_CUDA"
+    else
+      warn "  driver     nvidia-smi did not say which CUDA it supports; torch is on its own"
+    fi
     log "nvidia-smi says:"
     nvidia-smi || log "  (nvidia-smi would not run a second time)"
   else
@@ -536,7 +545,112 @@ run_long "pip itself" "$VENV/bin/python" -m pip install --upgrade --disable-pip-
 # -v so that the log holds the whole of it: every candidate considered, every wheel
 # downloaded, and — the one that matters — the entire output of a build that failed.
 # The screen is not any noisier for it; it shows the lines a person would have read.
+# A torch built for CUDA 13 does not run on a CUDA 12 driver: it installs, it imports,
+# and torch.cuda.is_available() is quietly False. PyPI only carries one build — the
+# newest — so the machine with the older driver has to be pointed at the right channel
+# of download.pytorch.org, and told plainly when no channel there can satisfy it. Asking
+# this now costs a few seconds; finding out afterwards costs the whole download.
+TORCH_CHANNEL=""
+if [ "$MODE" = server ] && [ -n "$DRIVER_CUDA" ] && [ "$DRIVER_CUDA" != "${DRIVER_CUDA%%.*}" ] \
+   && [ "$DRY_RUN" = true ]; then
+  say "  would ask download.pytorch.org for a torch built for CUDA $DRIVER_CUDA"
+elif [ "$MODE" = server ] && [ -n "$DRIVER_CUDA" ] && [ "$DRIVER_CUDA" != "${DRIVER_CUDA%%.*}" ]; then
+  say "  looking for a torch built for CUDA ${DRIVER_CUDA%%.*} (what your driver runs)"
+  torch_floor="$(sed -n 's/.*"torch>=\([0-9][0-9.]*\)".*/\1/p' "$DIR/pyproject.toml" | head -1)"
+  log "torch requirement in pyproject: >=${torch_floor:-any}"
+  if torch_pick="$("$PYTHON" - "${DRIVER_CUDA%%.*}" "${DRIVER_CUDA##*.}" "${torch_floor:-0}" <<'PICK'
+import sys, urllib.request, re
+
+major, driver_minor, floor = sys.argv[1], int(sys.argv[2]), tuple(
+    int(n) for n in sys.argv[3].split(".") if n.isdigit()
+)
+
+
+def versions(channel):
+    """What torch versions download.pytorch.org has for this CUDA channel."""
+    url = f"https://download.pytorch.org/whl/{channel}/torch/"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            page = response.read().decode("utf-8", "replace")
+    except Exception as why:                      # a channel that was never built
+        print(f"  {channel}: {why}", file=sys.stderr)
+        return []
+    found = {tuple(int(n) for n in v.split("."))
+             for v in re.findall(r"torch-(\d+\.\d+\.\d+)%2B" + channel + "-", page)}
+    if found:
+        print(f"  {channel}: up to {'.'.join(str(n) for n in max(found))}", file=sys.stderr)
+    return sorted(found)
+
+
+best = None
+# Built for no more CUDA than the driver has: always safe. Newest first, because a
+# newer minor within the same major is the better build when it is allowed at all.
+# Only if nothing there is new enough do we consider the minors above the driver's,
+# which work by CUDA's minor-version compatibility and are not guaranteed to.
+for pass_name, minors in (("at or below the driver", range(driver_minor, -1, -1)),
+                          ("above the driver", range(9, driver_minor, -1))):
+    for minor in minors:
+        channel = f"cu{major}{minor}"
+        have = versions(channel)
+        if not have:
+            continue
+        if best is None or have[-1] > best[1]:
+            best = (channel, have[-1])
+        if have[-1] >= floor:
+            print(f"{channel} {'.'.join(str(n) for n in have[-1])} {pass_name}")
+            sys.exit(0)
+
+if best:
+    print(f"none {best[0]} {'.'.join(str(n) for n in best[1])}")
+sys.exit(1)
+PICK
+  )"; then
+    set -- $torch_pick
+    TORCH_CHANNEL="$1"
+    say "  torch $2 from $TORCH_CHANNEL"
+    if [ "$3 $4" = "above the" ]; then
+      warn "  $TORCH_CHANNEL is newer than your driver's CUDA $DRIVER_CUDA. It should still run"
+      warn "  (CUDA is compatible across minor versions), but it is the first thing to"
+      warn "  suspect if the daemon says it cannot see the GPU."
+    fi
+  else
+    case "$torch_pick" in
+      none*)
+        set -- $torch_pick
+        warn "  no torch this machine can run satisfies gustav's torch>=$torch_floor."
+        warn "  Your driver supports CUDA $DRIVER_CUDA; the newest torch built for CUDA"
+        warn "  ${DRIVER_CUDA%%.*} is $3 (channel $2). PyPI's torch is built for a newer CUDA, so it"
+        warn "  will install, import, and quietly report no GPU."
+        warn "  Either update the NVIDIA driver until nvidia-smi says CUDA $(( ${DRIVER_CUDA%%.*} + 1 )).x,"
+        warn "  or install $3 by hand and loosen torch>=$torch_floor in pyproject.toml."
+        if asking; then
+          ask answer "  Install anyway, knowing the GPU will not be used? [y/N]: "
+          case "$answer" in
+            [yY]*) ;;
+            *) die "stopped before downloading 4 GiB of wheels this machine cannot run" ;;
+          esac
+        else
+          warn "  carrying on; the check after the install will say the same thing again."
+        fi
+        ;;
+      *)
+        # No answer is not the same as a bad answer: the index can be unreachable, slow,
+        # or rate-limiting, and none of that is a reason to stop someone's install.
+        warn "  could not ask download.pytorch.org which torch fits — carrying on with"
+        warn "  whatever PyPI offers. The check after the install says whether it works."
+        ;;
+    esac
+  fi
+fi
+
 if [ "$MODE" = server ]; then
+  if [ -n "$TORCH_CHANNEL" ]; then
+    say "  torch first, from the $TORCH_CHANNEL channel"
+    run_long "torch ($TORCH_CHANNEL)" "$VENV/bin/python" -m pip install \
+      --disable-pip-version-check --progress-bar off -v \
+      --index-url "https://download.pytorch.org/whl/$TORCH_CHANNEL" torch \
+      || fail "pip could not install torch from the $TORCH_CHANNEL channel"
+  fi
   say "  installing with the ML extras — this is the slow part, about 4 GiB of wheels"
   run_long "the wheels" "$VENV/bin/python" -m pip install --disable-pip-version-check \
     --progress-bar off -v -e "$DIR[ml]" \
@@ -585,7 +699,14 @@ else
     if torch_says="$("$VENV/bin/python" -c 'import torch; print(f"torch {torch.__version__}, CUDA {torch.version.cuda}, available={torch.cuda.is_available()}, devices={torch.cuda.device_count()}")')"; then
       say "  $torch_says"
       case "$torch_says" in
-        *available=False*) warn "  torch cannot reach the GPU. The driver, or a torch built without CUDA." ;;
+        *available=False*)
+          warn "  torch cannot reach the GPU, so the daemon would run on the CPU."
+          if [ -n "$DRIVER_CUDA" ]; then
+            warn "  torch above says which CUDA it was built for; your driver runs CUDA $DRIVER_CUDA."
+            warn "  If those majors differ, no pip flag fixes it: update the NVIDIA driver, or"
+            warn "  install a torch from https://download.pytorch.org/whl/cu<major><minor>."
+          fi
+          ;;
       esac
     else
       warn "  torch did not import — the log says why. The daemon will not run without it."

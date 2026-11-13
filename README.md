@@ -112,6 +112,13 @@ and what `pip check` made of it. The screen gets one line — `61 packages, 4.1 
 server install it then asks torch what it can see, because a CUDA wheel that cannot
 reach the GPU is much easier to understand here than three screens into a hardware plan.
 
+A server install also asks the NVIDIA driver which CUDA it can run, and then asks
+download.pytorch.org for a torch built for that CUDA — **before** downloading four
+gigabytes of one that cannot run here. PyPI only carries the newest build, so a machine
+with an older driver silently gets a torch whose `torch.cuda.is_available()` is `False`;
+when no published build can satisfy gustav's `torch>=` floor, it says so, with the
+newest version that *would* work, and asks before going ahead anyway.
+
 After installing, it byte-compiles the source and runs `ai --help` before saying Done.
 A checkout with one broken file in it installs perfectly happily and then dies at the
 first import — which is how you get a daemon that quits on startup with a `SyntaxError`

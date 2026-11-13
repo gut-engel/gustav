@@ -352,6 +352,27 @@ def test_the_uninstaller_writes_a_log_too(tmp_path, logs_go_somewhere_disposable
     assert str(written[0]) in result.stdout
 
 
+def test_a_server_install_reads_the_driver_before_it_downloads_anything(tmp_path):
+    """torch must match the driver's CUDA, and the driver is the thing that cannot change."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "nvidia-smi").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--query-gpu=name,memory.total" ]; then\n'
+        "  echo 'NVIDIA GeForce GTX 1650, 4096 MiB'; exit 0\n"
+        "fi\n"
+        "echo '| NVIDIA-SMI 550.54.14   Driver Version: 550.54.14   CUDA Version: 12.4   |'\n",
+        encoding="utf-8",
+    )
+    (fake / "nvidia-smi").chmod(0o755)
+    result = run("--server", "--dry-run", "--no-service", "--source", str(REPO),
+                 "--dir", str(tmp_path / "s"),
+                 env={"PATH": f"{fake}:{os.environ['PATH']}"})
+    assert result.returncode == 0, result.stderr
+    assert "supports CUDA up to 12.4" in result.stdout
+    assert "would ask download.pytorch.org" in result.stdout, "and before the 4 GiB, not after"
+
+
 def test_both_scripts_say_which_version_they_are():
     """raw.githubusercontent.com caches for five minutes; a paste has to say what ran."""
     stamped = run("--version").stdout.strip()
