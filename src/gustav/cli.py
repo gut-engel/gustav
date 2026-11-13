@@ -1049,6 +1049,55 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(args: argparse.Namespace) -> int:
+    """Bring this install up to date: the source, the package, and the service."""
+    from gustav.update import Transcript, UpdateError, run_update
+
+    transcript = Transcript(Path(args.log).expanduser() if args.log else None)
+    try:
+        result = run_update(
+            args.directory,
+            transcript=transcript,
+            ref=args.ref or "",
+            check_only=args.check,
+            reset=args.reset,
+            reinstall=not args.no_install,
+            restart=not args.no_restart,
+            dry_run=args.dry_run,
+        )
+    except UpdateError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        transcript.close()
+
+    print(f"{result.root}  ({result.ref})")
+    if result.behind:
+        print(f"  {len(result.behind)} new commit(s):")
+        for line in result.behind[:10]:
+            print(f"    {line}")
+        if len(result.behind) > 10:
+            print(f"    … and {len(result.behind) - 10} more")
+    elif args.check:
+        print("  already up to date")
+
+    if args.check:
+        print(f"\n  the log is in {result.log}")
+        return 0
+
+    print()
+    for step in result.steps:
+        print(f"  {step.mark} {step.name:<9}{step.detail}")
+    print()
+    print(f"  the log is in {result.log}")
+    if not result.ok:
+        print("\nthat did not finish; the log has the whole of it", file=sys.stderr)
+        return 1
+    if not result.restarted and not args.no_restart and not args.dry_run:
+        print("  nothing was restarted: 'systemctl --user restart gustav' when you want it")
+    return 0
+
+
 def cmd_service(args: argparse.Namespace) -> int:
     from gustav import service
 
@@ -1159,6 +1208,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--python", help="interpreter for the unit (default: this one)")
     p.add_argument("--force", action="store_true", help="replace an existing unit")
     p.add_argument("--dry-run", action="store_true", help="print the unit instead")
+    p.set_defaults(local=True)
+
+    p = sub.add_parser("update", help="update this install: source, package, service")
+    p.add_argument("directory", nargs="?", help="default: the checkout this 'ai' runs from")
+    p.add_argument("--ref", help="branch or tag to follow (default: the current branch)")
+    p.add_argument("--check", action="store_true", help="say what is new and change nothing")
+    p.add_argument(
+        "--reset", action="store_true",
+        help="local changes go to a git stash and the checkout matches the ref",
+    )
+    p.add_argument("--no-install", action="store_true", help="pull the source, skip pip")
+    p.add_argument("--no-restart", action="store_true", help="leave the service alone")
+    p.add_argument("--log", help="write the transcript here instead of ~/.local/state/gustav")
+    p.add_argument("--dry-run", action="store_true", help="print what it would do")
     p.set_defaults(local=True)
 
     p = sub.add_parser("chat", help="chat with the model (interactive if no message)")
@@ -1509,6 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
             "start": cmd_start,
             "init": cmd_init,
             "service": cmd_service,
+            "update": cmd_update,
             "login": cmd_login,
             "logout": cmd_logout,
         }

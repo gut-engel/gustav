@@ -44,7 +44,7 @@ ask() {  # ask <variable> <prompt>
 }
 
 # See install.sh: bumped by hand, so a paste says which copy of this ran.
-VERSION="2026-11-13.4"
+VERSION="2026-11-13.5"
 
 ARGV=("$@")
 DIR="${GUSTAV_DIR:-$HOME/gustav}"

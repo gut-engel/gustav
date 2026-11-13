@@ -423,8 +423,17 @@ def create_app(daemon: "Daemon") -> FastAPI:
             return result
 
         async def events():
-            async for event in daemon.chat_stream(req.message, session=key):
-                yield sse(event)
+            # Once the response has begun there is no status code left to send, so a
+            # failure in here has to travel as an event. Without this the connection
+            # simply dies and the browser invents its own reason — "Error in input
+            # stream" — while the real one (no weights, no GPU, safe mode) stays in
+            # the log where nobody in a browser can see it.
+            try:
+                async for event in daemon.chat_stream(req.message, session=key):
+                    yield sse(event)
+            except Exception as exc:  # noqa: BLE001 - the page gets the reason, not a dead socket
+                daemon.log.exception("streaming chat failed")
+                yield sse({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
             chats.touch(chat_id)
             yield "data: [DONE]\n\n"
 

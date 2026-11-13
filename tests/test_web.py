@@ -164,6 +164,29 @@ async def test_a_chat_streams_the_way_the_page_reads_it(owner):
     assert "".join(e["text"] for e in events if e["type"] == "chunk")
 
 
+async def test_a_failure_mid_stream_reaches_the_page(owner, daemon, monkeypatch):
+    """A dead socket makes the browser invent a reason. The daemon has the real one."""
+    chat = (await owner.post("/chats", json={})).json()
+
+    async def refuse(message, *, session=None):
+        yield {"type": "start", "session": session, "sleep_paused": False, "redacted": []}
+        raise RuntimeError("the weights for qwen3-0.6b are not on this machine")
+
+    monkeypatch.setattr(daemon, "chat_stream", refuse)
+    async with owner.stream(
+        "POST", f"/chats/{chat['id']}/messages", json={"message": "hi", "stream": True}
+    ) as response:
+        assert response.status_code == 200
+        payloads = [
+            json.loads(line[6:])
+            async for line in response.aiter_lines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+
+    assert payloads[-1]["type"] == "error"
+    assert "not on this machine" in payloads[-1]["error"], "the reason, not just a type"
+
+
 async def test_a_command_in_the_box_is_answered_without_the_model(owner):
     chat = (await owner.post("/chats", json={})).json()
     async with owner.stream(

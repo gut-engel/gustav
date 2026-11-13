@@ -53,7 +53,7 @@ ask() {  # ask <variable> <prompt>
 # Bumped by hand when this script changes. raw.githubusercontent.com serves a cached
 # copy for five minutes, so the first question about any install is which version of
 # this file actually ran — and the answer should be in the paste, not guesswork.
-VERSION="2026-11-13.4"
+VERSION="2026-11-13.5"
 
 ARGV=("$@")
 REPO_SLUG="${GUSTAV_REPO:-gut-engel/gustav}"
@@ -792,6 +792,8 @@ if [ "$MODE" = server ]; then
     say "  ai start                   # run it in this terminal"
   fi
   say ""
+  say ""
+  say "  Later: 'ai update' brings this install up to date without the download."
   say "  The API and the web interface are off until you turn them on. To reach this"
   say "  machine from elsewhere, set api.enabled (and web.enabled) in $DIR/config.yaml,"
   say "  then make an account:  ai user add <name> --owner"

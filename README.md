@@ -96,6 +96,33 @@ for sudo: gustav wants your GPU, your files and your home directory, and a daemo
 running as root has none of those. Run the same command again to update — your
 `config.yaml`, your database, your adapters and your tools are left alone.
 
+### Updating
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/update.sh | bash
+```
+
+or, on a machine where `ai` is already new enough to have it:
+
+```bash
+ai update --check     # what is new, and nothing else
+ai update             # fetch, fast-forward, reinstall the package, restart the service
+```
+
+The one-liner exists because `ai update` is itself part of what needs updating — and
+because it is the one thing you can paste into a machine you have not logged into for a
+month. It moves the checkout far enough to have the current `ai update` in hand (the
+install is editable, so that is immediate) and then hands over to it, rather than
+keeping a second set of rules in a shell script.
+
+It updates the checkout this `ai` runs from, whatever directory you are standing in. It
+refuses a checkout that has gone its own way rather than installing something else's
+code (`--reset` stashes that work and matches the ref, and says which commit it was, so
+nothing becomes unreachable), it puts back files deleted from the tree that the commit
+still has, it byte-compiles the source before declaring success, and it restarts
+`gustav.service` only if it was already running. Every command and all of its output
+goes to `~/.local/state/gustav/update-<date>.log`, next to the installer's.
+
 It says what it is doing while it does it — six numbered steps, and a clock with the
 last line of output beside it while pip spends ten minutes on four gigabytes of CUDA —
 and it writes **everything** down: every command, everything those commands printed, how
@@ -1081,6 +1108,7 @@ and the estimates become exact.
 | `ai init [dir]` | make a directory into a gustav project (never overwrites) |
 | `ai start` | run the daemon in the foreground |
 | `ai service install\|uninstall\|status` | run it as a systemd user service |
+| `ai update [--check] [--reset]` | update this install: source, package, service — and nothing else |
 | `ai status [--json]` | state, schedule, adapters, GPU holder, pending work, failures, approvals |
 | `ai chat [message]` | one message, or an interactive session |
 | `ai sleep now [--dry-run]` | sleep immediately; `--dry-run` plans the night without doing it |
@@ -1171,6 +1199,7 @@ re-measuring it.
 daemon.py              the entry point
 config.yaml            your settings
 scripts/install.sh     the one-liner's installer: server or client, idempotent
+scripts/update.sh      the one-liner's updater: moves the checkout, then 'ai update'
 profiles/              hardware profiles, including the generated one
 docs/sources.yaml      topic -> documentation map, with licences; the fetcher's whole world
 modules/registry.yaml  the modules, their descriptions and their topic keywords

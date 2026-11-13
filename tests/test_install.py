@@ -325,6 +325,88 @@ def test_keep_local_installs_what_is_there_and_says_so(tmp_path):
     assert "stash" not in result.stdout
 
 
+# --- the updater --------------------------------------------------------
+UPDATE = REPO / "scripts" / "update.sh"
+
+
+def update_sh(*args: str, env: dict | None = None, timeout: int = 120):
+    return subprocess.run(
+        ["bash", str(UPDATE), *args],
+        capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, **(env or {})},
+    )
+
+
+def a_checkout_with_an_origin(tmp_path, name: str = "gustav") -> Path:
+    """A clone that is exactly its origin — the ordinary case an update starts from."""
+    origin, seed, work = tmp_path / "origin.git", tmp_path / "seed", tmp_path / name
+    subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(seed)], check=True)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    (seed / "pyproject.toml").write_text("[project]\nname='gustav'\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "--quiet", "-m", "first"], check=True, env=env)
+    subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"], check=True)
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(work)], check=True)
+    return work
+
+
+def fake_ai(checkout: Path, body: str) -> Path:
+    binary = checkout / ".venv" / "bin" / "ai"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(body, encoding="utf-8")
+    binary.chmod(0o755)
+    return binary
+
+
+def test_the_updater_is_valid_and_explains_itself():
+    assert subprocess.run(["bash", "-n", str(UPDATE)], capture_output=True).returncode == 0
+    assert update_sh("--version").stdout.strip().startswith("update.sh 20")
+    assert "--check" in update_sh("--help").stdout
+
+
+def test_updating_something_that_is_not_there_says_so(tmp_path):
+    result = update_sh("--dir", str(tmp_path / "nothing"))
+    assert result.returncode != 0 and "is not there" in result.stderr
+
+
+def test_it_will_not_update_what_it_did_not_install(tmp_path):
+    """A directory, but no checkout: there is nothing to pull and it says which."""
+    (tmp_path / "var").mkdir()
+    result = update_sh("--dir", str(tmp_path))
+    assert result.returncode != 0 and "not a git checkout" in result.stderr
+
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    result = update_sh("--dir", str(tmp_path))
+    assert result.returncode != 0 and "no virtualenv" in result.stderr
+
+
+def test_the_updater_hands_over_to_the_command_in_the_package(tmp_path):
+    """The shell moves the source; everything after that is 'ai update', which has tests."""
+    checkout = a_checkout_with_an_origin(tmp_path)
+    said = checkout / "said.txt"
+    fake_ai(
+        checkout,
+        f'#!/bin/sh\nif [ "$2" = --help ]; then exit 0; fi\nprintf \'%s\\n\' "$*" > {said}\n',
+    )
+
+    result = update_sh("--dir", str(checkout), "--ref", "main", "--check", "--no-restart")
+    assert result.returncode == 0, result.stdout + result.stderr
+    handed = said.read_text(encoding="utf-8")
+    assert handed.startswith("update --log "), "the command gets the same log, not a second one"
+    assert "--ref main" in handed and "--check" in handed and "--no-restart" in handed
+
+
+def test_an_install_too_old_to_know_the_command_is_told_what_to_run(tmp_path):
+    checkout = a_checkout_with_an_origin(tmp_path)
+    fake_ai(checkout, "#!/bin/sh\nexit 2\n")
+
+    result = update_sh("--dir", str(checkout), "--ref", "main")
+    assert result.returncode != 0
+    assert "too old to know" in result.stderr and "install.sh" in result.stderr
+
+
 # --- the uninstaller ----------------------------------------------------
 UNINSTALL = REPO / "scripts" / "uninstall.sh"
 

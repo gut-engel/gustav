@@ -346,6 +346,11 @@ async function readStream(response, body, answer) {
         body.replaceChildren(bodyNode(text));
       } else if (event.type === "start" && (event.redacted || []).length) {
         answer.append(metaLine(`redacted before storing: ${event.redacted.join(", ")}`));
+      } else if (event.type === "error") {
+        // The daemon could not answer. It said why; say that, not "stream ended".
+        body.classList.remove("cursor");
+        if (!text) body.replaceChildren();
+        body.append(el("span", "error", ` ${event.error}`));
       } else if (event.type === "done") {
         body.classList.remove("cursor");
         finishAnswer(answer, event);
