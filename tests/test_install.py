@@ -23,6 +23,18 @@ REPO = Path(__file__).resolve().parents[1]
 INSTALL = REPO / "scripts" / "install.sh"
 
 
+@pytest.fixture(autouse=True)
+def logs_go_somewhere_disposable(tmp_path_factory, monkeypatch):
+    """Both scripts keep a log under XDG_STATE_HOME. Not in the home of whoever runs the tests."""
+    state = tmp_path_factory.mktemp("state")
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    return state
+
+
+def logs(state: Path, which: str = "install") -> list[Path]:
+    return sorted((state / "gustav").glob(f"{which}-*.log"))
+
+
 def run(*args: str, env: dict | None = None, timeout: int = 600):
     return subprocess.run(
         ["bash", str(INSTALL), *args],
@@ -58,7 +70,7 @@ def test_the_normal_path_carries_no_credential(tmp_path):
         "--url", "https://example:8713", env={"GUSTAV_TOKEN": ""},
     )
     assert result.returncode == 0, result.stderr
-    assert "git clone --quiet --branch main --depth 1 https://github.com/gut-engel/gustav.git" \
+    assert "git clone --progress --branch main --depth 1 https://github.com/gut-engel/gustav.git" \
         in result.stdout
     assert "x-access-token" not in result.stdout
 
@@ -172,6 +184,100 @@ def test_installing_again_updates_in_place(tmp_path):
     assert marker.read_text(encoding="utf-8") == "still here"
 
 
+def test_it_says_where_the_log_is_before_anything_happens(tmp_path, logs_go_somewhere_disposable):
+    """The path is on the screen first, so a failure five minutes later has somewhere to point."""
+    result = run("--client", "--dry-run", "--source", str(REPO), "--dir", str(tmp_path / "x"),
+                 "--url", "https://example:8713")
+    assert result.returncode == 0, result.stderr
+    written = logs(logs_go_somewhere_disposable)
+    assert len(written) == 1, "exactly one log per run"
+    assert str(written[0]) in result.stdout.splitlines()[0]
+
+
+def test_the_log_holds_the_machine_the_commands_and_the_steps(tmp_path, logs_go_somewhere_disposable):
+    result = run("--client", "--dry-run", "--source", str(REPO), "--dir", str(tmp_path / "x"),
+                 "--url", "https://example:8713")
+    assert result.returncode == 0, result.stderr
+    text = logs(logs_go_somewhere_disposable)[0].read_text(encoding="utf-8")
+    assert "uname" not in text, "the machine is described, not the command that described it"
+    assert "machine:" in text and "python" in text
+    assert "step 1/6: Checking what is here" in text
+    assert "$ " in text, "every command it runs is written down"
+    assert "pip install" in text
+
+
+def test_the_log_never_holds_the_token(tmp_path, logs_go_somewhere_disposable):
+    result = run("--client", "--dry-run", "--dir", str(tmp_path / "fresh"),
+                 "--url", "https://example:8713", env={"GUSTAV_TOKEN": "github_pat_pretend"})
+    assert result.returncode == 0, result.stderr
+    text = logs(logs_go_somewhere_disposable)[0].read_text(encoding="utf-8")
+    assert "github_pat_pretend" not in text
+    assert "x-access-token:***@github.com" in text
+
+
+def test_a_broken_command_shows_the_end_of_the_log(tmp_path, logs_go_somewhere_disposable):
+    """When something actually breaks, the last thing it said is on the screen."""
+    broken = tmp_path / "pretend-git"
+    broken.mkdir()
+    (broken / "git").write_text("#!/bin/sh\necho 'fatal: pretend git is broken' >&2\nexit 2\n",
+                                encoding="utf-8")
+    (broken / "git").chmod(0o755)
+    checkout = tmp_path / "gustav"
+    (checkout / ".git").mkdir(parents=True)
+    result = run("--client", "--dir", str(checkout),
+                 env={"PATH": f"{broken}:{os.environ['PATH']}"})
+    assert result.returncode != 0
+    assert "could not fetch" in result.stderr
+    assert "fatal: pretend git is broken" in result.stderr, "the reason, not just the complaint"
+
+
+def git_checkout_that_has_drifted(tmp_path) -> Path:
+    """An origin, a clone of it, and a commit of your own on top: no fast-forward from here."""
+    origin, work = tmp_path / "origin.git", tmp_path / "gustav"
+    subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(origin)], check=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(seed)], check=True)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    (seed / "pyproject.toml").write_text("[project]\nname='gustav'\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "--quiet", "-m", "first"], check=True, env=env)
+    subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"], check=True)
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(work)], check=True)
+    (work / "src.py").write_text("+  not valid python\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(work), "commit", "--quiet", "-m", "mine"], check=True, env=env)
+    return work
+
+
+def test_it_will_not_silently_install_a_checkout_that_has_drifted(tmp_path):
+    """The failure that started this: a local edit installed as if it were the release."""
+    work = git_checkout_that_has_drifted(tmp_path)
+    result = run("--client", "--dir", str(work), "--url", "https://example:8713")
+    assert result.returncode != 0
+    assert "cannot be brought up to main" in result.stderr
+    assert "--reset" in result.stderr and "--keep-local" in result.stderr
+    assert (work / "src.py").exists(), "it refused; it did not help itself to anything"
+
+
+def test_reset_puts_what_is_there_aside(tmp_path):
+    work = git_checkout_that_has_drifted(tmp_path)
+    result = run("--client", "--dry-run", "--reset", "--dir", str(work),
+                 "--url", "https://example:8713")
+    assert result.returncode == 0, result.stderr
+    assert "stash push" in result.stdout
+    assert "reset --hard" in result.stdout
+
+
+def test_keep_local_installs_what_is_there_and_says_so(tmp_path):
+    work = git_checkout_that_has_drifted(tmp_path)
+    result = run("--client", "--dry-run", "--keep-local", "--dir", str(work),
+                 "--url", "https://example:8713")
+    assert result.returncode == 0, result.stderr
+    assert "leaving the checkout as it is" in result.stderr
+    assert "stash" not in result.stdout
+
+
 # --- the uninstaller ----------------------------------------------------
 UNINSTALL = REPO / "scripts" / "uninstall.sh"
 
@@ -184,6 +290,19 @@ def uninstall(*args: str, env: dict | None = None, timeout: int = 120):
         timeout=timeout,
         env={**os.environ, **(env or {})},
     )
+
+
+def test_the_uninstaller_writes_a_log_too(tmp_path, logs_go_somewhere_disposable):
+    (tmp_path / "var").mkdir()
+    (tmp_path / ".venv").mkdir()
+    result = uninstall("--dir", str(tmp_path), "--yes", env={"GUSTAV_BIN": str(tmp_path / "bin")})
+    assert result.returncode == 0, result.stderr
+    written = logs(logs_go_somewhere_disposable, "uninstall")
+    assert len(written) == 1
+    text = written[0].read_text(encoding="utf-8")
+    assert "step 4/4" in text
+    assert str(tmp_path / ".venv") in text, "it writes down what it removed"
+    assert str(written[0]) in result.stdout
 
 
 def test_the_uninstaller_is_valid_and_explains_itself():

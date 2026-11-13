@@ -96,6 +96,25 @@ for sudo: gustav wants your GPU, your files and your home directory, and a daemo
 running as root has none of those. Run the same command again to update — your
 `config.yaml`, your database, your adapters and your tools are left alone.
 
+It says what it is doing while it does it — six numbered steps, and a clock with the
+last line of output beside it while pip spends ten minutes on four gigabytes of CUDA —
+and it writes **everything** down: every command, everything those commands printed, how
+long each step took. The log is at `~/.local/state/gustav/install-<date>.log`, and the
+path is printed before anything happens. If something breaks, the end of that log is
+printed right there with it, so the reason is on the screen rather than two scrollbacks
+up. (`--log <path>` puts it somewhere else; the last ten are kept.)
+
+After installing, it byte-compiles the source and runs `ai --help` before saying Done.
+A checkout with one broken file in it installs perfectly happily and then dies at the
+first import — which is how you get a daemon that quits on startup with a `SyntaxError`
+in a file nobody meant to edit. That is now a failure at install time, next to the file
+that caused it.
+
+Updating a checkout that has drifted — local edits, or commits of your own — is no
+longer a shrug and a warning. It says what is in the way and offers to put it aside
+(`git stash`) and match the ref. With nothing attached to ask, it stops instead:
+`--reset` to stash and match, `--keep-local` to install what is there as it is.
+
 `--dry-run` prints what it would do and changes nothing. `--help` lists the rest:
 `--dir`, `--ref`, `--source` (install from a checkout you already have), `--no-service`,
 and `--ssh` / `GUSTAV_TOKEN` for a fork you have made private.
@@ -112,6 +131,10 @@ the database, the adapters, the tools you approved, the backups. `--purge` delet
 too, after listing them and asking. Uninstalling a program should not silently delete a
 year of learning. `scripts/uninstall.sh` is also in the checkout, if you would rather
 read it before running it.
+
+It keeps the same kind of log, at `~/.local/state/gustav/uninstall-<date>.log`: what it
+removed, how big it was, and what it decided to leave alone. An uninstall is the worst
+possible moment to be unsure what just happened.
 
 ### From a checkout
 
