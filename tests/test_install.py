@@ -168,6 +168,26 @@ def test_a_client_install_produces_a_working_ai(tmp_path):
 
 
 @pytest.mark.slow
+def test_the_slow_stage_writes_down_everything_around_it(tmp_path, logs_go_somewhere_disposable):
+    """pip is the step that takes ten minutes and goes wrong on a machine you cannot see."""
+    result = run("--client", "--source", str(REPO), "--dir", str(tmp_path / "gustav"),
+                 env={"GUSTAV_BIN": str(tmp_path / "bin")}, timeout=900)
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = logs(logs_go_somewhere_disposable)[0].read_text(encoding="utf-8")
+
+    assert "the interpreter and the packaging tools it will use" in text
+    assert "room where the wheels are going" in text, "a full disk is the usual reason"
+    assert "Using pip" in text, "pip talks into the log at -v"
+    assert "files.pythonhosted.org" in text, "which wheel came from where"
+    assert "everything in the virtualenv now" in text and "gustav==" in text
+    assert "No broken requirements found" in text
+
+    # None of which belongs on the screen.
+    assert "files.pythonhosted.org" not in result.stdout
+    assert "packages," in result.stdout, "just the count and the size"
+
+
+@pytest.mark.slow
 def test_installing_again_updates_in_place(tmp_path):
     target = tmp_path / "gustav"
     bin_dir = tmp_path / "bin"

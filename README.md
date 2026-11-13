@@ -104,6 +104,14 @@ path is printed before anything happens. If something breaks, the end of that lo
 printed right there with it, so the reason is on the screen rather than two scrollbacks
 up. (`--log <path>` puts it somewhere else; the last ten are kept.)
 
+The slow step gets the most of it: before pip starts, the log takes down which
+interpreter and which pip, the index and proxy settings, and how much room is left where
+the wheels are going; pip then runs verbose, so every wheel it considered and the whole
+of any build that failed is in there; and afterwards the log holds `pip list` by version
+and what `pip check` made of it. The screen gets one line — `61 packages, 4.1 GiB`. On a
+server install it then asks torch what it can see, because a CUDA wheel that cannot
+reach the GPU is much easier to understand here than three screens into a hardware plan.
+
 After installing, it byte-compiles the source and runs `ai --help` before saying Done.
 A checkout with one broken file in it installs perfectly happily and then dies at the
 first import — which is how you get a daemon that quits on startup with a `SyntaxError`

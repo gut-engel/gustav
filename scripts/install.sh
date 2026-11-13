@@ -123,9 +123,20 @@ runv() {
   "$@" < /dev/null 2>&1 | tee /dev/fd/3
 }
 
-# The last thing the running command said, as one tidy line.
+# The last thing worth repeating out of what the running command said. pip -v writes
+# down everything it does, which is what the log is for and not what a one-line status
+# is for: this picks the last line that means something to a person, and falls back to
+# the last line of any kind.
 last_log_line() {
-  tail -c 8192 "$LOG" 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n 1
+  local text picked
+  text="$(tail -c 32768 "$LOG" 2>/dev/null | tr '\r' '\n')"
+  picked="$(printf '%s\n' "$text" | grep -E \
+    '^[[:space:]]*(Collecting|Downloading|Using cached|Obtaining|Building|Preparing|Processing|Installing|Successfully|Receiving|Resolving|Compressing|Counting|Cloning|error|ERROR|WARNING)' \
+    | tail -n 1 || true)"
+  if [ -z "$picked" ]; then
+    picked="$(printf '%s\n' "$text" | grep -v '^[[:space:]]*$' | tail -n 1 || true)"
+  fi
+  printf '%s' "${picked#"${picked%%[![:space:]]*}"}"
 }
 
 progress() {  # progress <seconds so far>
@@ -471,19 +482,51 @@ else
   run "$PYTHON" -m venv "$VENV" || fail "could not create a virtualenv in $VENV"
   say "  new virtualenv in $VENV"
 fi
-run_long "pip" "$VENV/bin/python" -m pip install --upgrade --disable-pip-version-check \
+
+# This is the step that takes ten minutes and the one that goes wrong on a machine
+# nobody can look at, so everything that decides its outcome is written down first:
+# which python, which pip, which index, what proxy, how much room is left.
+if [ "$DRY_RUN" = false ]; then
+  log "the interpreter and the packaging tools it will use:"
+  "$VENV/bin/python" -VV || true
+  "$VENV/bin/python" -m pip --version || true
+  log "the pip settings in this environment:"
+  # Credentials live in index URLs. They are masked here the same way they are
+  # everywhere else this script writes something down.
+  env | grep -E '^(PIP_|PYTHON|VIRTUAL_ENV|CUDA|LD_LIBRARY_PATH|(HTTP|HTTPS|NO)_PROXY|http_proxy|https_proxy)' \
+    | sed -E 's#://[^/@ ]*:[^/@ ]*@#://***@#g' | sort || log "  (none set)"
+  "$VENV/bin/python" -m pip config list || true
+  log "room where the wheels are going:"
+  df -Ph "$DIR" || true
+fi
+
+run_long "pip itself" "$VENV/bin/python" -m pip install --upgrade --disable-pip-version-check \
   --progress-bar off pip || fail "could not update pip inside the virtualenv"
 
+# -v so that the log holds the whole of it: every candidate considered, every wheel
+# downloaded, and — the one that matters — the entire output of a build that failed.
+# The screen is not any noisier for it; it shows the lines a person would have read.
 if [ "$MODE" = server ]; then
   say "  installing with the ML extras — this is the slow part, about 4 GiB of wheels"
   run_long "the wheels" "$VENV/bin/python" -m pip install --disable-pip-version-check \
-    --progress-bar off -e "$DIR[ml]" \
+    --progress-bar off -v -e "$DIR[ml]" \
     || fail "pip could not install the server packages (the whole attempt is in $LOG)"
 else
   say "  installing the client only: no torch, no CUDA, a few megabytes"
   run_long "the packages" "$VENV/bin/python" -m pip install --disable-pip-version-check \
-    --progress-bar off -e "$DIR" \
+    --progress-bar off -v -e "$DIR" \
     || fail "pip could not install the client packages (the whole attempt is in $LOG)"
+fi
+
+# And what it ended up with, by name and version. "It worked on mine" is answerable
+# from this and nothing else.
+if [ "$DRY_RUN" = false ]; then
+  log "everything in the virtualenv now:"
+  "$VENV/bin/python" -m pip list --format=freeze || true
+  log "pip's own opinion of those versions:"
+  "$VENV/bin/python" -m pip check || log "  (pip check is unhappy; see just above)"
+  installed="$("$VENV/bin/python" -m pip list --format=freeze 2>/dev/null | wc -l)"
+  say "  $installed packages, $(du -sh "$VENV" 2>/dev/null | cut -f1) in $VENV"
 fi
 
 # --- is what we installed actually sound? ------------------------------------
@@ -503,6 +546,20 @@ else
     fail "some of the source in $DIR does not compile — see the lines above.
        If you have edited files there, that is where to look; 'cd $DIR && git status'
        says which ones. Re-running with --reset puts them aside and installs $REF."
+  fi
+  if [ "$MODE" = server ]; then
+    # The whole point of the server install. If this says available=False, the daemon
+    # will plan for a GPU it cannot reach, and that is much easier to understand here
+    # than three screens into a hardware plan.
+    log "what torch can see:"
+    if torch_says="$("$VENV/bin/python" -c 'import torch; print(f"torch {torch.__version__}, CUDA {torch.version.cuda}, available={torch.cuda.is_available()}, devices={torch.cuda.device_count()}")')"; then
+      say "  $torch_says"
+      case "$torch_says" in
+        *available=False*) warn "  torch cannot reach the GPU. The driver, or a torch built without CUDA." ;;
+      esac
+    else
+      warn "  torch did not import — the log says why. The daemon will not run without it."
+    fi
   fi
   if "$VENV/bin/ai" --help >/dev/null 2>&1; then
     say "  'ai' runs"
