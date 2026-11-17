@@ -294,3 +294,77 @@ def test_the_settings_file_is_not_in_the_repository(repo_root):
     assert "config.yaml" in ignored
     # And the template it is written from still ships.
     assert (repo_root / "src" / "gustav" / "data" / "config.yaml").is_file()
+
+
+# --- the four minutes of nothing -----------------------------------------
+# Reported while watching a real update: after "Keeping your config.yaml" the screen
+# went blank for minutes. pip was working; `ai update` simply printed nothing until
+# everything had finished, so a slow install and a hung one looked exactly alike.
+def test_the_slow_step_says_what_it_is_doing_while_it_does_it(checkout, tmp_path):
+    from gustav.update import _run_watched, Transcript as T
+
+    log = tmp_path / "watched.log"
+    transcript = T(log)
+    said: list[str] = []
+    try:
+        done = _run_watched(
+            [
+                "python3", "-c",
+                "import sys, time\n"
+                "for n in range(3):\n"
+                "    print(f'Collecting thing-{n}'); sys.stdout.flush(); time.sleep(0.05)\n"
+                "print('Successfully installed thing-0 thing-1 thing-2')\n",
+            ],
+            transcript, said.append, what="pip",
+        )
+    finally:
+        transcript.close()
+
+    assert done.returncode == 0
+    assert "Collecting thing-0" in done.stdout, "the output is still returned whole"
+    assert said, "nothing was said while it ran"
+    assert any("Collecting" in line for line in said)
+    assert all(line.startswith("[0:0") for line in said), "each line carries the clock"
+    # And the log has it as it happened, which is what makes tail -f worth running.
+    assert "Collecting thing-1" in log.read_text(encoding="utf-8")
+
+
+def test_the_noise_from_pip_does_not_reach_the_screen(tmp_path):
+    """pip -v writes down everything it does. That is what the log is for."""
+    from gustav.update import _run_watched, Transcript as T
+
+    transcript = T(tmp_path / "noise.log")
+    said: list[str] = []
+    try:
+        _run_watched(
+            ["python3", "-c",
+             "print('Looking in indexes: https://pypi.org/simple')\n"
+             "print('  Using cached wheel from somewhere')\n"
+             "print('Collecting gustav')\n"],
+            transcript, said.append,
+        )
+    finally:
+        transcript.close()
+
+    joined = " ".join(said)
+    assert "Collecting gustav" in joined
+    assert "Looking in indexes" not in joined, "not worth interrupting anyone for"
+    # But all of it is in the log.
+    assert "Looking in indexes" in (tmp_path / "noise.log").read_text(encoding="utf-8")
+
+
+def test_a_secret_in_the_stream_is_masked_on_the_way_to_the_log(tmp_path):
+    from gustav.update import _run_watched, Transcript as T
+
+    transcript = T(tmp_path / "masked.log")
+    try:
+        _run_watched(
+            ["python3", "-c",
+             "print('Collecting from https://x-access-token:s3cr3t@github.com/a/b')"],
+            transcript, None,
+        )
+    finally:
+        transcript.close()
+    written = (tmp_path / "masked.log").read_text(encoding="utf-8")
+    assert "s3cr3t" not in written
+    assert "https://***@github.com" in written

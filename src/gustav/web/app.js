@@ -2004,7 +2004,9 @@ function loadVoice() {
     const nodes = [el("h2", "", "Talking to it")];
 
     nodes.push(stats([
-      ["ready", status.ready ? "yes" : "not yet"],
+      ["ready", status.ready
+        ? (status.ready_for_a_satellite ? "yes" : "yes, but not for a satellite")
+        : "no — see below"],
       ["listening with", `${status.stt.engine} @ ${status.stt.sample_rate} Hz`],
       ["speaking with", status.tts.engine],
       ["language", status.language],

@@ -922,3 +922,71 @@ def test_a_daemon_without_voice_is_told_apart_from_no_daemon(tmp_path):
     assert "the daemon is there, but it has no /voice" in result.stdout
     assert "voice.enabled" in result.stdout
     assert "could not reach it" not in result.stdout
+
+
+def test_it_finds_a_microphone_that_is_not_the_default(tmp_path):
+    """Reported from a Pi: the mic was card 1, arecord recorded the default, silence.
+
+    The installer printed "capture: card 1: Camera" and then wrote no input_device at
+    all, which is an install that looks perfect and hears nothing.
+    """
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    # An arecord that lists card 1 and refuses to record from anything else.
+    (fake / "arecord").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-l" ]; then\n'
+        "  echo 'card 1: Camera [Terra HD1080PC Camera], device 0: USB Audio [USB Audio]'\n"
+        "  exit 0\n"
+        "fi\n"
+        'case "$*" in *"plughw:1,0"*) exit 0 ;; esac\n'
+        "echo 'arecord: main:830: audio open error: No such file or directory' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (fake / "arecord").chmod(0o755)
+    (fake / "aplay").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake / "aplay").chmod(0o755)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    result = subprocess.run(
+        ["bash", str(SATELLITE), "--no-service", "--url", "http://example.invalid:8713",
+         "--source", str(REPO)],
+        capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+        env={**os.environ, "HOME": str(home), "GUSTAV_BIN": str(home / "bin"),
+             "PATH": f"{fake}:{os.environ['PATH']}"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "the default device records nothing" in result.stdout
+    assert "capture    plughw:1,0" in result.stdout
+    config = (home / ".config" / "gustav-satellite.conf").read_text(encoding="utf-8")
+    assert "input_device = plughw:1,0" in config, "and it is written down"
+
+
+def test_a_default_that_works_is_left_alone(tmp_path):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name in ("arecord", "aplay"):
+        (fake / name).write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-l" ]; then echo "card 0: Thing [Thing], device 0: x [x]"; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (fake / name).chmod(0o755)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    result = subprocess.run(
+        ["bash", str(SATELLITE), "--no-service", "--url", "http://example.invalid:8713",
+         "--source", str(REPO)],
+        capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+        env={**os.environ, "HOME": str(home), "GUSTAV_BIN": str(home / "bin"),
+             "PATH": f"{fake}:{os.environ['PATH']}"},
+    )
+    assert result.returncode == 0
+    assert "the default device, which records" in result.stdout
+    assert "input_device" not in (
+        home / ".config" / "gustav-satellite.conf"
+    ).read_text(encoding="utf-8")

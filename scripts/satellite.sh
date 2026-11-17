@@ -22,7 +22,7 @@ set -euo pipefail
 
 exec 3>&1 4>&2
 
-VERSION="2026-11-17.2"
+VERSION="2026-11-17.3"
 
 ARGV=("$@")
 URL="${GUSTAV_URL:-}"
@@ -146,12 +146,49 @@ else
   say "  sound      arecord and aplay are here"
 fi
 
-if [ "$DRY_RUN" != true ]; then
-  if ! arecord -l 2>/dev/null | grep -q card; then
+# Finding the microphone, rather than hoping it is the default one.
+#
+# On a Pi the default capture device is usually card 0, which is HDMI or nothing at
+# all, while the microphone is the USB thing on card 1. Printing "capture: card 1" and
+# then recording from the default — which is what this did — produces an install that
+# looks perfect and hears silence. So: try the default, and if that cannot record, try
+# each card arecord lists and keep the first that can.
+can_record() {  # can_record [device]
+  if [ -n "${1:-}" ]; then
+    arecord -q -D "$1" -d 1 -f S16_LE -c 1 -r 16000 -t raw /dev/null 2>/dev/null
+  else
+    arecord -q -d 1 -f S16_LE -c 1 -r 16000 -t raw /dev/null 2>/dev/null
+  fi
+}
+
+if [ "$DRY_RUN" != true ] && [ "$SKIP_SOUND_CHECK" != true ]; then
+  if ! arecord -l 2>/dev/null | grep -q '^card'; then
     warn "  arecord -l lists no capture device. A USB microphone is the usual fix;"
     warn "  the Raspberry Pi has no microphone input of its own."
+  elif [ -n "$INPUT" ]; then
+    if can_record "$INPUT"; then
+      say "  capture    $INPUT (as you asked)"
+    else
+      warn "  $INPUT will not record. These will:"
+      arecord -l 2>/dev/null | sed -n 's/^card \([0-9]*\):.*device \([0-9]*\):.*/    plughw:\1,\2/p' >&4
+    fi
+  elif can_record; then
+    say "  capture    the default device, which records"
   else
-    say "  capture    $(arecord -l 2>/dev/null | grep -m1 card | cut -c1-60)"
+    say "  capture    the default device records nothing; looking for one that does"
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      if can_record "$candidate"; then
+        INPUT="$candidate"
+        say "  capture    $candidate"
+        break
+      fi
+    done <<EOF
+$(arecord -l 2>/dev/null | sed -n 's/^card \([0-9]*\):.*device \([0-9]*\):.*/plughw:\1,\2/p')
+EOF
+    if [ -z "$INPUT" ]; then
+      warn "  nothing arecord lists would record. Check the cable, and:  arecord -l"
+    fi
   fi
 fi
 
@@ -330,6 +367,7 @@ if [ "$ON_PATH" != true ]; then
 fi
 RUN="gustav-satellite"
 [ "$ON_PATH" = true ] || RUN="$BIN_DIR/gustav-satellite"
+[ -n "$INPUT" ] && say "  the microphone is $INPUT; it is in $CONFIG"
 say "  $RUN --calibrate"
 say "      measure this room, then put the number in $CONFIG"
 say "  $RUN --say \"hello\""

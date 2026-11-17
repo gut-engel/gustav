@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -121,6 +122,13 @@ class Transcript:
                 text = _mask(stream)
                 self._handle.write(text if text.endswith("\n") else text + "\n")
         self._handle.write(f"  -> exit {done.returncode}\n")
+        self._handle.flush()
+
+    def write_raw(self, line: str) -> None:
+        """A line of somebody else's output, as it was written, flushed immediately."""
+        if self._handle is None:
+            return
+        self._handle.write(_mask(line if line.endswith("\n") else line + "\n"))
         self._handle.flush()
 
     def section(self, title: str) -> None:
@@ -270,6 +278,74 @@ def _machine(root: Path, transcript: Transcript) -> None:
         transcript.command(argv, done)
 
 
+#: Lines from pip worth repeating to someone watching. pip -v says everything it does
+#: — which is what the log is for and not what a one-line status is for.
+_WORTH_SAYING = re.compile(
+    r"^\s*(Collecting|Downloading|Using cached|Obtaining|Building|Preparing|Processing"
+    r"|Installing|Successfully|Requirement already|Uninstalling|error|ERROR|WARNING)",
+)
+
+
+def _run_watched(
+    argv: list[str],
+    transcript: Transcript,
+    progress: Callable[[str], None] | None,
+    *,
+    what: str = "",
+    timeout: float = 3600.0,
+) -> subprocess.CompletedProcess:
+    """Run something slow, writing its output down *as it happens*.
+
+    Two reasons, and the second is the one that was reported. The log becomes live, so
+    `tail -f` on it during an update shows something. And the caller gets each line as
+    it arrives, which is how a command that spends four minutes inside pip can say so
+    instead of looking identical to a hang.
+    """
+    transcript.write(f"$ {_mask(' '.join(argv))}")
+    started = time.monotonic()
+    collected: list[str] = []
+    process = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    last_said = 0.0
+    pending = ""
+
+    def shown(line: str, at: float) -> str:
+        return (f"[{int(at - started) // 60}:{int(at - started) % 60:02d}] "
+                f"{what + ': ' if what else ''}{line.strip()[:70]}")
+
+    try:
+        for line in process.stdout:          # type: ignore[union-attr]
+            collected.append(line)
+            transcript.write_raw(line)
+            if progress is None:
+                continue
+            now = time.monotonic()
+            # Not every line: pip -v produces thousands, and a status that scrolls is
+            # no more readable than silence. One worth repeating, at most twice a
+            # second — and whatever was suppressed last is shown at the end, so the
+            # line left on the screen is always the most recent thing that happened.
+            if not _WORTH_SAYING.match(line):
+                continue
+            if now - last_said > 0.5:
+                last_said = now
+                pending = ""
+                progress(shown(line, now))
+            else:
+                pending = line
+        if progress is not None and pending:
+            progress(shown(pending, time.monotonic()))
+    finally:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    output = "".join(collected)
+    transcript.write(f"  -> exit {process.returncode}")
+    return subprocess.CompletedProcess(argv, process.returncode, output, "")
+
+
 def _git(root: Path, *args: str, transcript: Transcript | None = None) -> subprocess.CompletedProcess:
     argv = ["git", "-C", str(root), *args]
     done = subprocess.run(argv, capture_output=True, text=True, timeout=300)
@@ -290,14 +366,21 @@ def run_update(
     restart: bool = True,
     dry_run: bool = False,
     transcript: Transcript | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> Update:
-    """Fetch, fast-forward, reinstall, verify, restart. In that order, and no further."""
+    """Fetch, fast-forward, reinstall, verify, restart. In that order, and no further.
+
+    ``progress`` is handed each line worth repeating from the slow step, so a caller
+    with a terminal can show that pip is working rather than leaving four minutes of
+    nothing on the screen.
+    """
     root = install_root(root)
     own = transcript is None
     transcript = transcript or Transcript()
     try:
         return _run(
-            root, ref, check_only, reset, reinstall, restart, dry_run, transcript
+            root, ref, check_only, reset, reinstall, restart, dry_run, transcript,
+            progress,
         )
     finally:
         if own:
@@ -313,6 +396,7 @@ def _run(
     restart: bool,
     dry_run: bool,
     transcript: Transcript,
+    progress: Callable[[str], None] | None = None,
 ) -> Update:
     started = time.monotonic()
     transcript.write(f"ai update {_version()} — {root}")
@@ -503,8 +587,7 @@ def _run(
             "--progress-bar", "off", "-v", "-e", f"{root}{_extras()}",
         ]
         at = time.monotonic()
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
-        transcript.command(argv, done)
+        done = _run_watched(argv, transcript, progress, what="pip")
         took = time.monotonic() - at
         if done.returncode != 0:
             said = (done.stderr or done.stdout or "").strip().splitlines()

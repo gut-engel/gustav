@@ -175,9 +175,34 @@ class VoiceService:
         stt_ok, stt_why = self.stt.ready()
         tts_ok, tts_why = self.tts.ready()
         socket_ok, socket_why = self.socket_ready()
+
+        # "auto" that fell back to the null engine is not ready, whatever the null
+        # engine says about itself. It reports ready because it is — at hearing what
+        # it is told to hear, which is a thing for tests and not for a room with a
+        # microphone in it. Saying "ready: yes" over a daemon that cannot hear is
+        # worse than saying nothing.
+        def asked_for(configured: str, engine_name: str) -> bool:
+            return engine_name != "null" or (configured or "auto").lower() == "null"
+
+        stt_real = asked_for(voice.stt.engine, self.stt.name)
+        tts_real = asked_for(voice.tts.engine, self.tts.name)
+        if not stt_real:
+            stt_ok, stt_why = False, (
+                "no recogniser is installed, so it would hear nothing: "
+                "pip install -e '.[voice]' on the server, then restart it"
+            )
+        if not tts_real:
+            tts_ok, tts_why = False, (
+                "no voice is installed, so it would say nothing out loud: "
+                "pip install -e '.[voice]' on the server, then restart it"
+            )
         return {
             "enabled": voice.enabled,
+            # Ready means a person could talk to it: hear, speak, and the socket the
+            # satellite uses. /voice/ask works without the last one, which is why it
+            # is reported separately rather than folded in here.
             "ready": bool(stt_ok and tts_ok),
+            "ready_for_a_satellite": bool(stt_ok and tts_ok and socket_ok),
             "warmed": self._warmed,
             "warm_ms": self.warm_ms,
             "language": voice.language,

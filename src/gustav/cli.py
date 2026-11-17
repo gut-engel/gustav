@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -1058,10 +1059,27 @@ def cmd_update(args: argparse.Namespace) -> int:
     from gustav.update import Transcript, UpdateError, run_update
 
     transcript = Transcript(Path(args.log).expanduser() if args.log else None)
+
+    # pip is minutes on a small machine, and until now it was minutes of nothing: the
+    # summary is printed when everything has finished, so a slow install and a hung one
+    # looked exactly alike. One line, rewritten in place on a terminal.
+    quiet = bool(getattr(args, "quiet", False))
+    terminal = sys.stdout.isatty()
+    width = shutil.get_terminal_size((100, 24)).columns
+
+    def progress(line: str) -> None:
+        if quiet:
+            return
+        if terminal:
+            print(f"\r  {line[: width - 4]:<{max(width - 4, 1)}}", end="", flush=True)
+        else:
+            print(f"  {line}", flush=True)
+
     try:
         result = run_update(
             args.directory,
             transcript=transcript,
+            progress=progress,
             ref=args.ref or "",
             check_only=args.check,
             reset=args.reset,
@@ -1070,10 +1088,15 @@ def cmd_update(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
         )
     except UpdateError as exc:
+        if terminal and not quiet:
+            print("\r" + " " * (width - 1), end="\r")
         print(str(exc), file=sys.stderr)
         return 1
     finally:
         transcript.close()
+
+    if terminal and not quiet:
+        print("\r" + " " * (width - 1), end="\r")   # take the status line back
 
     print(f"{result.root}  ({result.ref})")
     if result.behind:
@@ -1458,6 +1481,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-restart", action="store_true", help="leave the service alone")
     p.add_argument("--log", help="write the transcript here instead of ~/.local/state/gustav")
     p.add_argument("--dry-run", action="store_true", help="print what it would do")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="no progress line (the log is written in full either way)")
     p.set_defaults(local=True)
 
     p = sub.add_parser("chat", help="chat with the model (interactive if no message)")

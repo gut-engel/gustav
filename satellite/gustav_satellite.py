@@ -36,6 +36,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import socket
 import ssl
@@ -48,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "2026-11-17.1"
+VERSION = "2026-11-17.2"
 
 #: 20 ms of 16 kHz 16-bit mono. The unit everything here counts in.
 FRAME_MS = 20
@@ -143,6 +144,8 @@ class Microphone:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        #: What ALSA said, if arecord would not start at all.
+        self.failed = ""
         self.frames: queue.Queue[bytes] = queue.Queue(maxsize=200)
         self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
@@ -154,6 +157,14 @@ class Microphone:
         if self.settings.input_device:
             argv += ["-D", self.settings.input_device]
         self._process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # arecord fails in a few milliseconds when the device is wrong, and the
+        # complaint goes to a pipe nobody was reading. Catching it here turns "no
+        # audio arrived" into the line ALSA actually printed.
+        time.sleep(0.15)
+        if self._process.poll() is not None:
+            self.failed = (self._process.stderr.read() or b"").decode(
+                "utf-8", "replace").strip()
+            return
         self._thread = threading.Thread(target=self._pump, name="microphone", daemon=True)
         self._thread.start()
 
@@ -579,6 +590,11 @@ class Satellite:
             return 3
 
         self.mic.start()
+        if self.mic.failed:
+            say(f"the microphone would not open: {self.mic.failed}", error=True)
+            for device in capture_devices():
+                say(f"  try:  input_device = {device}   (in your config)", error=True)
+            return 4
         say("listening. Ctrl-C to stop.")
         backoff = 1.0
         try:
@@ -615,6 +631,22 @@ class Satellite:
 # ---------------------------------------------------------------------------
 
 
+def capture_devices() -> list[str]:
+    """Every capture device `arecord -l` knows, as something you can pass to -D."""
+    try:
+        listed = subprocess.run(
+            ["arecord", "-l"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in listed.splitlines():
+        match = re.match(r"^card (\d+):.*device (\d+):", line)
+        if match:
+            found.append(f"plughw:{match.group(1)},{match.group(2)}")
+    return found
+
+
 def calibrate(settings: Settings, seconds: float = 6.0) -> int:
     """Measure the room. Print the threshold to put in the config."""
     mic = Microphone(settings)
@@ -637,7 +669,19 @@ def calibrate(settings: Settings, seconds: float = 6.0) -> int:
     finally:
         mic.stop()
     if not quiet or not loud:
-        say("no audio arrived; is the microphone the default device?", error=True)
+        say("no audio arrived.", error=True)
+        if mic.failed:
+            say(f"  arecord said: {mic.failed}", error=True)
+        if settings.input_device:
+            say(f"  it was recording from {settings.input_device}.", error=True)
+        else:
+            say("  it was recording from the default device, which on a Pi is usually",
+                error=True)
+            say("  card 0 — HDMI, or nothing at all. The microphone is the other one.",
+                error=True)
+        for device in capture_devices():
+            say(f"  try:  gustav-satellite --calibrate --input {device}", error=True)
+        say("  then put it in the config:  input_device = <that>", error=True)
         return 1
     floor = sum(quiet) / len(quiet)
     peak = sorted(loud)[int(len(loud) * 0.9)]

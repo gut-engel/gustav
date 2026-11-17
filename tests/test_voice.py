@@ -633,3 +633,29 @@ async def test_changing_the_voice_rebuilds_the_engines(daemon):
     daemon.set_voice_settings({"language": "it"})
     assert daemon.voice is not first, "the next turn uses the new settings"
     assert daemon.voice.status()["language"] == "it"
+
+
+def test_auto_that_fell_back_to_nothing_does_not_claim_to_be_ready(project):
+    """Reported from the panel: "READY: yes" over a daemon that cannot hear a word."""
+    config, paths = load_config(project / "config.yaml")
+    config.voice.enabled = True
+    config.voice.stt.engine = "auto"
+    config.voice.tts.engine = "auto"
+    service = VoiceService(config, paths, ask=None)
+    found = service.status()
+
+    if found["stt"]["engine"] == "null":        # i.e. nothing is installed here
+        assert found["ready"] is False
+        assert "pip install -e '.[voice]'" in found["stt"]["detail"]
+        assert "pip install -e '.[voice]'" in found["tts"]["detail"]
+
+
+def test_a_null_engine_that_was_asked_for_is_fine(project):
+    """The tests ask for it by name, and that is a working configuration."""
+    config, paths = load_config(project / "config.yaml")
+    config.voice.enabled = True
+    config.voice.stt.engine = "null"
+    config.voice.tts.engine = "null"
+    found = VoiceService(config, paths, ask=None).status()
+    assert found["ready"] is True
+    assert found["ready_for_a_satellite"] == found["socket"]["ok"]
