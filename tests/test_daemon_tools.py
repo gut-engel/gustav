@@ -185,3 +185,57 @@ async def test_tools_are_in_the_backup_set(daemon, client):
     propose(daemon)
     result = daemon.create_backup("manual")
     assert "tools" in json.dumps(result)
+
+
+# --- asking for one from the chat box ------------------------------------
+# "make me a tool for that" is said in the middle of a conversation, to a model that
+# cannot file anything itself. /tool is the path that does not depend on the model
+# understanding the request — it never reaches the model at all.
+async def test_asking_for_a_tool_in_the_chat_box_queues_it(daemon, client):
+    answer = (
+        await client.post(
+            "/chat", json={"message": "/tool raise a number to a large power exactly",
+                           "stream": False}
+        )
+    ).json()
+    assert answer["command"] == "tool_requested"
+    assert "raise a number to a large power exactly" in answer["reply"]
+
+    listing = (await client.get("/tools")).json()
+    assert [r["text"] for r in listing["requests"]] == [
+        "raise a number to a large power exactly"
+    ]
+    assert daemon.journal.pending_work_count() >= 1
+
+
+async def test_the_bare_command_says_what_to_type(daemon, client):
+    answer = (await client.post("/chat", json={"message": "/tool", "stream": False})).json()
+    assert answer["command"] == "tool_help"
+    assert "/tool convert a unix timestamp" in answer["reply"]
+
+
+async def test_the_chat_box_can_ask_what_it_can_call(daemon, client):
+    propose(daemon)
+    daemon.review_tool("add_numbers", approve=True, by="simon")
+    answer = (await client.post("/chat", json={"message": "/tools", "stream": False})).json()
+    assert "add_numbers — Add two numbers together" in answer["reply"]
+    assert "/tool <what it should do>" in answer["reply"]
+
+
+async def test_what_it_says_it_can_call_is_what_it_may_call(daemon):
+    """The prompt's list and the approval table are the same fact, twice."""
+    propose(daemon)
+    assert daemon.capabilities().callable_tools == ()
+    assert daemon.capabilities().pending_tools[0].name == "add_numbers"
+
+    daemon.review_tool("add_numbers", approve=True, by="simon")
+    after = daemon.capabilities()
+    assert [tool.name for tool in after.callable_tools] == ["add_numbers"]
+    assert after.pending_tools == ()
+
+
+async def test_a_requested_tool_is_in_what_the_model_is_told(daemon):
+    daemon.request_tool("convert between units")
+    from gustav.wake.capabilities import system_prompt
+
+    assert "convert between units" in system_prompt(daemon.capabilities())

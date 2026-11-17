@@ -2,73 +2,124 @@
 <html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
 <title>gustav</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9679;</text></svg>">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
+<!-- Everything below is empty on purpose. The page is three files served by the daemon
+     with no build step and no framework, and every piece of text in it comes from the
+     same HTTP API the `ai` command uses — so the markup is the shape, and app.js is the
+     only thing that ever puts words in it. Nothing is inserted as HTML. -->
+
 <!-- the sign-in screen; shown when /auth/me says we are nobody -->
-<div id="login" class="hidden">
+<div id="login" hidden>
   <form id="login-form" autocomplete="on">
+    <div class="mark" id="login-mark" aria-hidden="true"></div>
     <h1 id="login-title">gustav</h1>
-    <p class="faint" style="margin:0 0 .4rem">Sign in to this daemon.</p>
+    <p class="sub">Sign in to this daemon.</p>
     <label>Name <input name="name" autocomplete="username" required autofocus></label>
     <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
-    <p class="error" id="login-error"></p>
-    <button class="btn primary" type="submit">Sign in</button>
-    <p class="faint" style="margin:.2rem 0 0;font-size:.78rem">
-      The owner signs in over the Unix socket without a password; accounts are for the
+    <p class="error" id="login-error" role="alert"></p>
+    <button class="btn primary block" type="submit">Sign in</button>
+    <p class="fine">
+      The owner signs in over the Unix socket without a password. Accounts are for the
       network listener.
     </p>
   </form>
 </div>
 
-<div id="app" class="hidden">
-  <aside id="sidebar">
-    <div class="brand">
-      <b id="brand-name">gustav</b>
-      <span id="brand-state">…</span>
+<div id="app" hidden>
+  <!-- the sidebar: chats, then the owner's workspace, then who you are -->
+  <aside id="sidebar" aria-label="Chats and workspace">
+    <div class="side-head">
+      <button class="icon" id="collapse" title="Hide the sidebar" aria-label="Hide the sidebar"></button>
+      <span class="brand"><span class="mark" id="brand-mark" aria-hidden="true"></span><b id="brand-name">gustav</b></span>
+      <button class="icon" id="new-chat" title="New chat (Ctrl+Shift+O)" aria-label="New chat"></button>
     </div>
-    <nav class="nav" id="nav">
-      <button data-view="chat" aria-current="true">Chats</button>
-      <button data-view="facts" class="owner-only">Facts</button>
-      <button data-view="skills" class="owner-only">Skills</button>
-      <button data-view="tools" class="owner-only">Tools</button>
-      <button data-view="system" class="owner-only">System</button>
-    </nav>
-    <div class="chats" id="chat-list"></div>
+
+    <div class="side-search">
+      <label class="search" id="search-wrap">
+        <span class="search-icon" aria-hidden="true"></span>
+        <input id="search" type="search" placeholder="Search chats" autocomplete="off"
+               aria-label="Search chats">
+      </label>
+    </div>
+
+    <div class="side-scroll">
+      <div id="chat-list" role="list"></div>
+
+      <nav class="workspace owner-only" id="workspace" aria-label="Workspace" hidden>
+        <p class="side-label">Workspace</p>
+        <button data-view="facts"></button>
+        <button data-view="skills"></button>
+        <button data-view="tools"></button>
+        <button data-view="system"></button>
+      </nav>
+    </div>
+
     <div class="side-foot">
-      <span id="who" class="muted">…</span>
-      <button id="new-chat" title="New chat">+ New</button>
-      <button id="logout" class="hidden">Sign out</button>
+      <button id="me" class="me" aria-haspopup="true" aria-expanded="false">
+        <span class="avatar" id="me-avatar" aria-hidden="true"></span>
+        <span class="me-text"><b id="me-name">…</b><span id="me-via" class="fine"></span></span>
+        <span class="chev" aria-hidden="true"></span>
+      </button>
+      <div id="me-menu" class="menu" role="menu" hidden></div>
     </div>
   </aside>
 
+  <div id="scrim" hidden></div>
+
   <main id="main">
+    <header id="topbar">
+      <button class="icon" id="menu" title="Show the sidebar" aria-label="Show the sidebar"></button>
+      <div class="crumbs">
+        <b id="chat-title">New chat</b>
+        <span id="chat-sub" class="fine"></span>
+      </div>
+      <span class="spacer"></span>
+      <button class="state" id="state-chip" title="What the daemon is doing">
+        <i class="dot" aria-hidden="true"></i><span id="state-text">…</span>
+      </button>
+      <button class="icon" id="theme" title="Light, dark, or whatever the system says"
+              aria-label="Change the theme"></button>
+    </header>
+
+    <!-- a model that will not load is the one thing worth interrupting the page for -->
+    <div id="banner" class="banner" role="status" hidden></div>
+
     <!-- chat -->
-    <section id="view-chat" class="view" style="display:flex;flex-direction:column;min-height:0;flex:1">
+    <section id="view-chat" class="view">
       <div class="scroll" id="thread-scroll">
         <div class="thread" id="thread"></div>
       </div>
       <div class="composer">
-        <div class="composer-inner">
-          <button class="btn menu-toggle" id="menu" title="Chats" aria-label="Chats">☰</button>
-          <textarea id="input" rows="1" placeholder="Say something, or /help for commands"></textarea>
-          <button class="btn primary" id="send">Send</button>
-        </div>
-        <p class="hint" id="hint">Enter sends · Shift+Enter is a newline · /good /bad /correct … teach it overnight</p>
+        <form class="box" id="composer-form">
+          <textarea id="input" rows="1" enterkeyhint="send"
+                    placeholder="Ask anything, or /help for the commands"></textarea>
+          <div class="box-foot">
+            <span class="fine" id="hint">Enter sends · Shift+Enter is a newline · /good /bad /correct teach it overnight</span>
+            <span class="spacer"></span>
+            <button class="send" id="send" type="submit" title="Send" aria-label="Send"></button>
+          </div>
+        </form>
+        <button class="btn stop" id="stop" hidden>Stop generating</button>
       </div>
     </section>
 
-    <!-- panels -->
-    <section id="view-facts" class="view scroll hidden"><div class="panel" id="facts-panel"></div></section>
-    <section id="view-skills" class="view scroll hidden"><div class="panel" id="skills-panel"></div></section>
-    <section id="view-tools" class="view scroll hidden"><div class="panel" id="tools-panel"></div></section>
-    <section id="view-system" class="view scroll hidden"><div class="panel" id="system-panel"></div></section>
+    <!-- the owner's panels -->
+    <section id="view-facts" class="view scroll" hidden><div class="panel" id="facts-panel"></div></section>
+    <section id="view-skills" class="view scroll" hidden><div class="panel" id="skills-panel"></div></section>
+    <section id="view-tools" class="view scroll" hidden><div class="panel" id="tools-panel"></div></section>
+    <section id="view-system" class="view scroll" hidden><div class="panel" id="system-panel"></div></section>
   </main>
 </div>
+
+<div id="toasts" aria-live="polite"></div>
+<div id="modal" class="modal" hidden></div>
 
 <script src="app.js"></script>
 </body>

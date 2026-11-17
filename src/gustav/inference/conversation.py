@@ -11,13 +11,22 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from gustav.wake.capabilities import Capabilities
+from gustav.wake.capabilities import system_prompt as _build_prompt
+
+
+def _stable_prompt() -> str:
+    return _build_prompt(Capabilities(), live=False)
+
 Message = dict[str, str]
 TokenCounter = Callable[[str], int]
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are Gustav, a local assistant that learns from the conversations it has. "
-    "Answer precisely and admit what you do not know."
-)
+#: The prompt used where there is no daemon to ask — the training set builder, and
+#: anything that only needs a conversation to have a shape. The live one is built per
+#: answer by `gustav.wake.capabilities`, which knows which tools exist this minute;
+#: this is the same text with the volatile half left out, so what the model is trained
+#: against and what it is asked against do not drift apart.
+DEFAULT_SYSTEM_PROMPT = _stable_prompt()
 
 
 @dataclass

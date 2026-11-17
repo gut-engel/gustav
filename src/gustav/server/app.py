@@ -155,6 +155,10 @@ class NewChat(BaseModel):
     title: str = ""
 
 
+class RenameChat(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
 class Credentials(BaseModel):
     name: str = Field(min_length=1)
     password: str = Field(min_length=1)
@@ -452,6 +456,21 @@ def create_app(daemon: "Daemon") -> FastAPI:
         if result is None:
             raise HTTPException(status_code=400, detail=f"{command} is not a command")
         return {"reply": result.reply, "action": result.action}
+
+    @app.post("/chats/{chat_id}/rename", dependencies=account)
+    async def rename_chat(chat_id: int, req: RenameChat, request: Request) -> dict[str, Any]:
+        """A chat keeps the first thing you said to it until you say otherwise.
+
+        The store has always been able to do this — it is how a new chat gets its title
+        in the first place. The interface could not ask for it, which is why a list of
+        twenty conversations all called "hey, quick question" was the normal state of
+        the sidebar.
+        """
+        chats, identity = chats_for(request)
+        try:
+            return chats.rename(chat_id, req.title, user_id=identity.user_id).to_dict()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.delete("/chats/{chat_id}", dependencies=account)
     async def archive_chat(chat_id: int, request: Request) -> dict[str, Any]:

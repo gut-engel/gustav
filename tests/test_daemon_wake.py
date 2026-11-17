@@ -250,3 +250,52 @@ async def test_a_pull_that_leaves_a_hole_is_not_reported_as_done(client, daemon,
     assert any(
         event["kind"] == "model.pull.incomplete" for event in daemon.events.recent(limit=10)
     ), "and it is in the events, at error level"
+
+
+# --- when the GPU is the reason there is no answer ------------------------
+async def test_a_driver_error_reaches_the_chat_box_as_a_sentence(daemon, client, monkeypatch):
+    """What someone sees is the complaint; what they need is the next step.
+
+    The reported case: every question came back as a RuntimeError with a URL in it and
+    no indication that this machine has a command for exactly this.
+    """
+    async def too_old():
+        raise RuntimeError(
+            "The NVIDIA driver on your system is too old (found version 12040). Please "
+            "update your GPU driver by downloading and installing a new version."
+        )
+
+    await daemon.responder.unload()
+    monkeypatch.setattr(daemon.responder, "load", too_old)
+
+    response = await client.post("/chat", json={"message": "hello", "stream": False})
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail.startswith("I cannot answer right now:")
+    assert "ai doctor" in detail
+    assert "CUDA up to 12.4" in detail
+    assert "Traceback" not in detail
+
+    # And the whole of it is still where it belongs.
+    status = (await client.get("/status")).json()
+    assert "12040" in status["load_error"]
+    assert "ai doctor" in status["load_help"]
+
+
+async def test_a_failure_that_is_not_about_the_gpu_is_passed_through_as_it_was(
+    daemon, client, monkeypatch
+):
+    """No guessing: an error this module does not recognise gets no advice attached."""
+    async def missing():
+        raise FileNotFoundError("model.safetensors is not in models/qwen3-4b")
+
+    await daemon.responder.unload()
+    monkeypatch.setattr(daemon.responder, "load", missing)
+
+    response = await client.post("/chat", json={"message": "hello", "stream": False})
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "the model is not available" in detail
+    assert "model.safetensors" in detail
+    assert "ai doctor" not in detail
+    assert (await client.get("/status")).json()["load_help"] is None

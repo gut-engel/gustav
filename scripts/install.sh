@@ -53,7 +53,7 @@ ask() {  # ask <variable> <prompt>
 # Bumped by hand when this script changes. raw.githubusercontent.com serves a cached
 # copy for five minutes, so the first question about any install is which version of
 # this file actually ran — and the answer should be in the paste, not guesswork.
-VERSION="2026-11-13.5"
+VERSION="2026-11-17.1"
 
 ARGV=("$@")
 REPO_SLUG="${GUSTAV_REPO:-gut-engel/gustav}"
@@ -69,6 +69,8 @@ WITH_SERVICE=""    # yes | no, asked if neither flag is given
 RESET=""           # yes | no, asked if the checkout cannot be fast-forwarded
 DRY_RUN=false
 QUIET=false
+INSTALL_DRIVER=""      # yes | no, only ever asked when the driver is the problem
+DRIVER_INSTALLED=false
 PYTHON="${GUSTAV_PYTHON:-}"
 BIN_DIR="${GUSTAV_BIN:-$HOME/.local/bin}"
 
@@ -190,6 +192,56 @@ run_long() {  # run_long <what> <command...>
   return "$rc"
 }
 
+# The installer asks for no privileges of its own: gustav wants your GPU, your files
+# and your home directory, and a daemon running as root has none of those. A driver is
+# the one exception that cannot be argued with — it is a kernel module, and the kernel
+# does not care whose home directory this is. So sudo is mentioned in exactly one place,
+# it is asked for or passed on the command line, and the thing it runs is a separate
+# script that installs a driver and touches nothing of gustav's.
+offer_driver_install() {
+  local script="$DIR/scripts/driver.sh"
+  local oneliner="curl -fsSL https://raw.githubusercontent.com/$REPO_SLUG/$REF/scripts/driver.sh | sudo bash"
+  if [ "$INSTALL_DRIVER" = no ]; then
+    warn "  A current NVIDIA driver fixes this for good:  bash $script"
+    warn "  (--no-install-driver, so this is as far as it goes.)"
+    return 0
+  fi
+  warn "  A current NVIDIA driver fixes this for good, and that needs root — which"
+  warn "  nothing else in this installer does."
+  if [ ! -f "$script" ]; then
+    warn "  scripts/driver.sh is not in this checkout. The one-liner is:"
+    warn "      $oneliner"
+    return 0
+  fi
+  if [ "$INSTALL_DRIVER" != yes ]; then
+    if asking; then
+      ask answer "  Install the current NVIDIA driver now? (sudo, then a reboot) [y/N]: "
+      case "$answer" in
+        [yY]*) ;;
+        *) warn "  carrying on without it. When you are ready:  bash $script"
+           return 0 ;;
+      esac
+    else
+      warn "  Nothing is attached to ask. Either run it yourself:"
+      warn "      bash $script"
+      warn "  or pass --install-driver to this installer."
+      return 0
+    fi
+  fi
+  say ""
+  say "  handing over to scripts/driver.sh — everything it does is in its own log"
+  if runv bash "$script" --yes; then
+    DRIVER_INSTALLED=true
+    say "  the driver is installed. It takes effect on the next reboot and not before:"
+    say "  the running kernel keeps the module it booted with."
+  else
+    # Not fatal. The install that is already underway is still worth finishing, and
+    # the GPU half of it can be put right afterwards without doing any of this again.
+    warn "  the driver installer did not finish; its log says why. The rest of this"
+    warn "  install carries on, and 'ai doctor' picks the thread up afterwards."
+  fi
+}
+
 on_exit() {
   local rc=$?
   if [ "$LOG_READY" != true ]; then exit "$rc"; fi
@@ -226,6 +278,10 @@ Usage: install.sh [--server | --client] [options]
                       install (or skip) the systemd user service, server only
   --reset             if the checkout has local changes: stash them and match the ref
   --keep-local        the opposite: install what is in the checkout, changes and all
+  --install-driver    if the driver turns out to be too old for any usable torch,
+                      install the current one without asking. This is the only
+                      part of the install that needs sudo; see scripts/driver.sh
+  --no-install-driver never offer to; say what to run and carry on
   --python <path>     interpreter to build the virtualenv with
   --log <path>        where to write the log (default: $logdefault)
   --version           print the version of this script and stop
@@ -253,6 +309,8 @@ while [ $# -gt 0 ]; do
     --ssh)        USE_SSH=true; shift ;;
     --service)    WITH_SERVICE=yes; shift ;;
     --no-service) WITH_SERVICE=no; shift ;;
+    --install-driver)    INSTALL_DRIVER=yes; shift ;;
+    --no-install-driver) INSTALL_DRIVER=no; shift ;;
     --reset)      RESET=yes; shift ;;
     --keep-local) RESET=no; shift ;;
     --python)     PYTHON="${2:-}"; shift 2 ;;
@@ -356,7 +414,15 @@ if [ "$MODE" = server ]; then
     say "  gpu        $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
     # The number in the nvidia-smi header is the newest CUDA the *driver* can run, and
     # it is the one thing that decides which torch is allowed to exist on this machine.
-    DRIVER_CUDA="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+    # Current drivers renamed this field: `nvidia-smi --version` says "CUDA UMD
+    # version", and where the old "CUDA version" still appears it now holds the word
+    # Deprecated instead of a number. Both spellings, both places, digits only — a
+    # driver whose CUDA could not be read is a machine that gets whatever PyPI has.
+    DRIVER_CUDA="$({ nvidia-smi --version; nvidia-smi; } 2>/dev/null | sed -n \
+      -e 's/.*CUDA UMD [Vv]ersion *: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+      -e 's/.*CUDA [Vv]ersion *: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+      -e 's/.*CUDA UMD Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+      -e 's/.*CUDA Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
     if [ -n "$DRIVER_CUDA" ]; then
       say "  driver     supports CUDA up to $DRIVER_CUDA"
     else
@@ -546,101 +612,65 @@ run_long "pip itself" "$VENV/bin/python" -m pip install --upgrade --disable-pip-
 # downloaded, and — the one that matters — the entire output of a build that failed.
 # The screen is not any noisier for it; it shows the lines a person would have read.
 # A torch built for CUDA 13 does not run on a CUDA 12 driver: it installs, it imports,
-# and torch.cuda.is_available() is quietly False. PyPI only carries one build — the
-# newest — so the machine with the older driver has to be pointed at the right channel
-# of download.pytorch.org, and told plainly when no channel there can satisfy it. Asking
-# this now costs a few seconds; finding out afterwards costs the whole download.
+# and torch.cuda.is_available() is quietly False — or, on the unlucky machines, it
+# raises "the NVIDIA driver on your system is too old" at the first question anyone
+# asks. PyPI only carries one build — the newest — so the machine with the older driver
+# has to be pointed at the right channel of download.pytorch.org, and told plainly when
+# no channel there can satisfy it. Asking this now costs a few seconds; finding out
+# afterwards costs the whole download.
+#
+# Which channel that is lives in the package, in gustav/hw/driver.py, not in a heredoc
+# in here: `ai doctor` needs the same answer on the same machine a month later, and a
+# rule that exists twice is a rule that will disagree with itself. The module is
+# stdlib-only for exactly this call — nothing is installed yet when it runs.
 TORCH_CHANNEL=""
-if [ "$MODE" = server ] && [ -n "$DRIVER_CUDA" ] && [ "$DRIVER_CUDA" != "${DRIVER_CUDA%%.*}" ] \
-   && [ "$DRY_RUN" = true ]; then
+PICKER="$DIR/src/gustav/hw/driver.py"
+if [ "$MODE" = server ] && [ -z "$DRIVER_CUDA" ]; then
+  warn "  nothing said which CUDA this driver runs, so torch cannot be matched to it."
+  warn "  Installing whatever PyPI offers; the check after the install says if it works."
+elif [ "$MODE" = server ] && [ "$DRY_RUN" = true ]; then
+  # Before the picker is looked for: a dry run never copied the checkout, so it is not
+  # there to look for, and "would ask" is the honest thing to say either way.
   say "  would ask download.pytorch.org for a torch built for CUDA $DRIVER_CUDA"
-elif [ "$MODE" = server ] && [ -n "$DRIVER_CUDA" ] && [ "$DRIVER_CUDA" != "${DRIVER_CUDA%%.*}" ]; then
-  say "  looking for a torch built for CUDA ${DRIVER_CUDA%%.*} (what your driver runs)"
+elif [ "$MODE" = server ] && [ ! -f "$PICKER" ]; then
+  warn "  $PICKER is not in this checkout, so torch cannot be matched to the driver"
+elif [ "$MODE" = server ]; then
+  say "  looking for a torch built for CUDA $DRIVER_CUDA (what your driver runs)"
   torch_floor="$(sed -n 's/.*"torch>=\([0-9][0-9.]*\)".*/\1/p' "$DIR/pyproject.toml" | head -1)"
   log "torch requirement in pyproject: >=${torch_floor:-any}"
-  if torch_pick="$("$PYTHON" - "${DRIVER_CUDA%%.*}" "${DRIVER_CUDA##*.}" "${torch_floor:-0}" <<'PICK'
-import sys, urllib.request, re
-
-major, driver_minor, floor = sys.argv[1], int(sys.argv[2]), tuple(
-    int(n) for n in sys.argv[3].split(".") if n.isdigit()
-)
-
-
-def versions(channel):
-    """What torch versions download.pytorch.org has for this CUDA channel."""
-    url = f"https://download.pytorch.org/whl/{channel}/torch/"
-    try:
-        with urllib.request.urlopen(url, timeout=15) as response:
-            page = response.read().decode("utf-8", "replace")
-    except Exception as why:                      # a channel that was never built
-        print(f"  {channel}: {why}", file=sys.stderr)
-        return []
-    found = {tuple(int(n) for n in v.split("."))
-             for v in re.findall(r"torch-(\d+\.\d+\.\d+)%2B" + channel + "-", page)}
-    if found:
-        print(f"  {channel}: up to {'.'.join(str(n) for n in max(found))}", file=sys.stderr)
-    return sorted(found)
-
-
-best = None
-# Built for no more CUDA than the driver has: always safe. Newest first, because a
-# newer minor within the same major is the better build when it is allowed at all.
-# Only if nothing there is new enough do we consider the minors above the driver's,
-# which work by CUDA's minor-version compatibility and are not guaranteed to.
-for pass_name, minors in (("at or below the driver", range(driver_minor, -1, -1)),
-                          ("above the driver", range(9, driver_minor, -1))):
-    for minor in minors:
-        channel = f"cu{major}{minor}"
-        have = versions(channel)
-        if not have:
-            continue
-        if best is None or have[-1] > best[1]:
-            best = (channel, have[-1])
-        if have[-1] >= floor:
-            print(f"{channel} {'.'.join(str(n) for n in have[-1])} {pass_name}")
-            sys.exit(0)
-
-if best:
-    print(f"none {best[0]} {'.'.join(str(n) for n in best[1])}")
-sys.exit(1)
-PICK
-  )"; then
-    set -- $torch_pick
-    TORCH_CHANNEL="$1"
-    say "  torch $2 from $TORCH_CHANNEL"
-    if [ "$3 $4" = "above the" ]; then
-      warn "  $TORCH_CHANNEL is newer than your driver's CUDA $DRIVER_CUDA. It should still run"
-      warn "  (CUDA is compatible across minor versions), but it is the first thing to"
-      warn "  suspect if the daemon says it cannot see the GPU."
-    fi
-  else
-    case "$torch_pick" in
-      none*)
-        set -- $torch_pick
-        warn "  no torch this machine can run satisfies gustav's torch>=$torch_floor."
-        warn "  Your driver supports CUDA $DRIVER_CUDA; the newest torch built for CUDA"
-        warn "  ${DRIVER_CUDA%%.*} is $3 (channel $2). PyPI's torch is built for a newer CUDA, so it"
-        warn "  will install, import, and quietly report no GPU."
-        warn "  Either update the NVIDIA driver until nvidia-smi says CUDA $(( ${DRIVER_CUDA%%.*} + 1 )).x,"
-        warn "  or install $3 by hand and loosen torch>=$torch_floor in pyproject.toml."
-        if asking; then
-          ask answer "  Install anyway, knowing the GPU will not be used? [y/N]: "
-          case "$answer" in
-            [yY]*) ;;
-            *) die "stopped before downloading 4 GiB of wheels this machine cannot run" ;;
-          esac
-        else
-          warn "  carrying on; the check after the install will say the same thing again."
-        fi
-        ;;
-      *)
-        # No answer is not the same as a bad answer: the index can be unreachable, slow,
-        # or rate-limiting, and none of that is a reason to stop someone's install.
-        warn "  could not ask download.pytorch.org which torch fits — carrying on with"
-        warn "  whatever PyPI offers. The check after the install says whether it works."
-        ;;
-    esac
-  fi
+  pick_rc=0
+  # -P: the module lives next to a types.py of its own, and a script's directory goes
+  # first on the import path. Without it the stdlib's `types` is shadowed and python
+  # dies on `import re` before reaching anything of ours.
+  torch_pick="$("$PYTHON" -P "$PICKER" pick-torch \
+                  --driver-cuda "$DRIVER_CUDA" --floor "${torch_floor:-0}")" || pick_rc=$?
+  log "picker said: ${torch_pick:-<nothing>} (exit $pick_rc)"
+  # cu128 2.16.1 above ok  ->  channel, version, within|above the driver, ok|too-old
+  set -- ${torch_pick:-}
+  case "$pick_rc" in
+    0)
+      TORCH_CHANNEL="$1"
+      say "  torch $2 from $TORCH_CHANNEL"
+      if [ "${3:-}" = above ]; then
+        warn "  $TORCH_CHANNEL is newer than your driver's CUDA $DRIVER_CUDA. It should still run"
+        warn "  (CUDA is compatible across minor versions), but it is the first thing to"
+        warn "  suspect if the daemon says it cannot see the GPU."
+      fi
+      ;;
+    2)
+      warn "  no torch this machine can run satisfies gustav's torch>=${torch_floor:-any}."
+      warn "  Your driver supports CUDA $DRIVER_CUDA; the newest torch built for a CUDA it"
+      warn "  runs is $2 (channel $1). PyPI's torch is built for a newer CUDA, so it will"
+      warn "  install, import, and then refuse to answer anything."
+      offer_driver_install
+      ;;
+    *)
+      # No answer is not the same as a bad answer: the index can be unreachable, slow,
+      # or rate-limiting, and none of that is a reason to stop someone's install.
+      warn "  could not ask download.pytorch.org which torch fits — carrying on with"
+      warn "  whatever PyPI offers. The check after the install says whether it works."
+      ;;
+  esac
 fi
 
 if [ "$MODE" = server ]; then
@@ -703,9 +733,11 @@ else
           warn "  torch cannot reach the GPU, so the daemon would run on the CPU."
           if [ -n "$DRIVER_CUDA" ]; then
             warn "  torch above says which CUDA it was built for; your driver runs CUDA $DRIVER_CUDA."
-            warn "  If those majors differ, no pip flag fixes it: update the NVIDIA driver, or"
-            warn "  install a torch from https://download.pytorch.org/whl/cu<major><minor>."
           fi
+          warn "  'ai doctor' says which of the two halves is wrong and fixes either:"
+          warn "      ai doctor                  # what is wrong, and both ways out"
+          warn "      ai doctor --fix-torch      # a torch this driver can run (no root)"
+          warn "      ai doctor --install-driver # the current driver (sudo, one reboot)"
           ;;
       esac
     else
@@ -781,7 +813,13 @@ fi
 if [ "$QUIET" != true ]; then printf '\n\033[1mDone\033[0m\n' >&3; fi
 log "=== done ==="
 if [ "$MODE" = server ]; then
+  if [ "$DRIVER_INSTALLED" = true ]; then
+    say "  Reboot first. A new driver was installed, and the running kernel is still"
+    say "  using the old module — nothing below will see the GPU until you do."
+    say ""
+  fi
   say "  cd $DIR"
+  say "  ai doctor                  # is the GPU usable? (it says what to do if not)"
   say "  ai plan-hardware -v        # what it would run here, and why"
   say "  ai model pull <model>      # the weights the plan chose (uses the network)"
   if [ "$WITH_SERVICE" = yes ]; then

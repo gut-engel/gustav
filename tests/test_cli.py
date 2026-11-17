@@ -280,3 +280,48 @@ def test_release_gpu_is_honest_when_nothing_is_loaded(running, project, repo_roo
     result = ai(project, "release-gpu", repo_root=repo_root)
     assert result.returncode == 0
     assert "already free" in result.stdout or "released" in result.stdout
+
+
+# --- the doctor (no daemon needed) ---------------------------------------
+def test_doctor_is_in_the_command_list():
+    names = set(build_parser()._subparsers._group_actions[0].choices)
+    assert "doctor" in names
+
+
+def test_doctor_says_what_is_wrong_and_both_ways_out(project, repo_root, monkeypatch):
+    """The command the chat box and the installer both point people at."""
+    from gustav.hw import driver
+
+    result = ai(project, "doctor", "--offline", "--no-torch", repo_root=repo_root)
+    # 0 when the GPU is usable here, 1 when it is not — either is a real answer, and
+    # on a machine with no NVIDIA card at all it is the second.
+    assert result.returncode in (0, 1), result.stderr
+    assert "machine " in result.stdout
+    if result.returncode == 1:
+        assert "ai doctor --fix-torch" in result.stdout
+        assert "ai doctor --install-driver" in result.stdout
+    assert driver.detect_platform().system == "Linux"
+
+
+def test_doctor_will_not_install_a_driver_without_being_told_twice(project, repo_root):
+    """--dry-run must reach the script and still change nothing."""
+    result = ai(project, "doctor", "--offline", "--no-torch", "--install-driver",
+                "--dry-run", "--yes", repo_root=repo_root)
+    assert "driver.sh" in result.stdout + result.stderr
+
+
+def test_doctor_refuses_to_pick_a_torch_without_knowing_the_driver(project, repo_root,
+                                                                   monkeypatch, tmp_path):
+    """With no nvidia-smi there is nothing to match a wheel against."""
+    empty = tmp_path / "bin"
+    empty.mkdir()
+    result = subprocess.run(
+        [sys.executable, "-m", "gustav.cli", "doctor", "--offline", "--no-torch",
+         "--fix-torch", "--yes"],
+        cwd=project,
+        env={"PATH": str(empty), "PYTHONPATH": str(repo_root / "src"),
+             "HOME": str(tmp_path)},
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 1
+    assert "nvidia-smi is missing" in result.stderr

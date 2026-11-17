@@ -171,6 +171,8 @@ def _print_status(status: dict[str, Any]) -> None:
         lines.append(f"last backup      {backup or 'none yet'}")
     if status.get("load_error"):
         lines.append(f"  ! the model is not loaded: {status['load_error'].splitlines()[0]}")
+        if status.get("load_help"):
+            lines.append(f"    {status['load_help']}")
     if status["failed_steps"]:
         lines.append("failed steps")
         for step in status["failed_steps"]:
@@ -1100,6 +1102,210 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Why the GPU is not being used, and which of the two cures this machine needs.
+
+    The error that sends people here arrives in the chat box, not in a terminal:
+
+        RuntimeError: The NVIDIA driver on your system is too old (found version 12040)
+
+    It means torch was built against a newer CUDA than the driver can run, and it has
+    exactly two cures — a torch that matches the driver, or a driver that matches the
+    torch. This says which, in that order, because the first is a download and the
+    second is root and a reboot. Both are offered as flags, so nobody has to retype a
+    command out of a paragraph.
+    """
+    from gustav.hw import driver as gpu
+
+    load_error = ""
+    if not args.offline:
+        # The daemon is holding the error that actually stopped someone's question.
+        # Whatever this process can work out about torch is second best to that.
+        try:
+            endpoint = _endpoint(args)
+            probe = Client(_resolve_socket(args), base_url=endpoint.url, token=endpoint.token)
+            try:
+                status = probe.get("/status")
+                load_error = status.get("load_error") or ""
+                if load_error:
+                    print(f"the daemon says it cannot load the model:\n  {load_error}\n")
+            finally:
+                probe.close()
+        except Exception:  # noqa: BLE001 - no daemon is the normal case for this command
+            pass
+
+    facts = gpu.collect(load_error=load_error, torch=not args.no_torch)
+    found = gpu.diagnose(facts)
+    print("\n".join(found.lines()))
+
+    if args.install_driver:
+        print()
+        return _install_driver(args, found)
+    if args.fix_torch:
+        print()
+        return _fix_torch(args, found)
+    if not found.ok and found.routes:
+        # Name the routes this machine actually has, not both of them by reflex.
+        offered = [
+            command
+            for route in found.routes
+            for command in route.commands
+            if command.startswith("ai doctor --")
+        ]
+        if offered:
+            print()
+            print(f"  {' or '.join(offered)} does it for you.")
+    return 0 if found.ok else 1
+
+
+def _driver_script() -> Path | None:
+    """``scripts/driver.sh`` in the checkout this ``ai`` runs from, if it is there.
+
+    An editable install — which is what the installer makes — has the whole repository
+    three directories up from this file. A wheel does not carry the scripts, and then
+    the one-liner is the honest answer.
+    """
+    candidate = Path(__file__).resolve().parents[2] / "scripts" / "driver.sh"
+    return candidate if candidate.is_file() else None
+
+
+def _confirm(question: str, *, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(f"{question} — nothing is attached to answer with; pass --yes if you meant it",
+              file=sys.stderr)
+        return False
+    try:
+        return input(f"{question} [y/N]: ").strip().lower().startswith("y")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _install_driver(args: argparse.Namespace, found) -> int:
+    """Hand over to scripts/driver.sh, which is the only thing here that wants sudo."""
+    import subprocess
+
+    script = _driver_script()
+    if script is None:
+        print(
+            "This 'ai' was installed from a wheel, which does not carry the scripts.\n"
+            "The driver installer is one line:\n\n"
+            "    curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/"
+            "scripts/driver.sh | sudo bash\n",
+            file=sys.stderr,
+        )
+        return 1
+    if found.facts.platform.system != "Linux":
+        print(f"not on this platform: {found.headline}", file=sys.stderr)
+        return 1
+
+    argv = ["sudo", "bash", str(script)]
+    if args.toolkit:
+        argv.append("--toolkit")
+    if args.yes:
+        argv.append("--yes")
+    if args.dry_run:
+        argv.append("--dry-run")
+    print(f"running {' '.join(argv)}")
+    print("  it asks for your password, writes down everything it does, and does not")
+    print("  touch anything of gustav's. A reboot follows; nothing changes before it.")
+    if not args.dry_run and not _confirm("  Go ahead?", assume_yes=args.yes):
+        print("nothing was changed")
+        return 1
+    # Not captured: it is a long, interactive, root thing with its own log and its own
+    # progress. Wrapping that in a pipe would hide both.
+    return subprocess.call(argv)
+
+
+def _fix_torch(args: argparse.Namespace, found) -> int:
+    """Install the newest torch this driver can actually run, into this virtualenv."""
+    import subprocess
+
+    from gustav.hw import driver as gpu
+
+    facts = found.facts
+    driver_cuda = facts.driver_cuda or (
+        found.problem.driver_cuda if found.problem else None
+    )
+    if not driver_cuda:
+        print(
+            "Nothing here says which CUDA this driver supports — nvidia-smi is missing "
+            "or would not answer — so there is no way to choose a torch for it. Install "
+            "a driver first: ai doctor --install-driver",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"asking download.pytorch.org what it has for a CUDA {gpu.format_cuda(driver_cuda)} driver")
+    pick = gpu.pick_torch_channel(driver_cuda, facts.torch_floor)
+    if pick is None:
+        print(
+            f"download.pytorch.org publishes no torch for CUDA "
+            f"{gpu.format_cuda(driver_cuda)} at all. The driver is the thing that has to "
+            f"move: ai doctor --install-driver",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"  {pick.describe()}")
+    if pick.above_driver:
+        print(
+            f"  note: {pick.channel} is built for a newer CUDA than this driver's "
+            f"{gpu.format_cuda(driver_cuda)}. It should still run — CUDA is compatible "
+            f"across minor versions — but it is the first thing to suspect afterwards."
+        )
+    if not pick.satisfies_floor:
+        print(
+            f"  it is older than the torch>={gpu.format_cuda(facts.torch_floor)} gustav "
+            f"asks for, which is the other half of this problem: no published build "
+            f"both runs on this driver and is new enough.",
+            file=sys.stderr,
+        )
+        if not args.force:
+            print(
+                "  Installing it anyway would leave pip's dependencies unsatisfied. "
+                "Either update the driver (ai doctor --install-driver) or pass --force "
+                "to install it and find out.",
+                file=sys.stderr,
+            )
+            return 1
+
+    argv = [
+        sys.executable, "-m", "pip", "install", "--upgrade",
+        "--index-url", pick.index_url, "torch",
+    ]
+    print(f"\n  {' '.join(argv)}")
+    print("  about two gigabytes, into the virtualenv this 'ai' runs from.")
+    if args.dry_run:
+        print("  (dry run: nothing was installed)")
+        return 0
+    if not _confirm("  Go ahead?", assume_yes=args.yes):
+        print("nothing was installed")
+        return 1
+    if subprocess.call(argv) != 0:
+        print("pip did not finish; nothing was changed in the daemon", file=sys.stderr)
+        return 1
+
+    # The point of the exercise, asked rather than assumed.
+    after = subprocess.run(
+        [sys.executable, "-c",
+         "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"],
+        capture_output=True, text=True,
+    )
+    print(f"\n  {(after.stdout or after.stderr).strip()}")
+    if "True" not in after.stdout:
+        print(
+            "torch still cannot reach the GPU. Run 'ai doctor' again: with this torch "
+            "installed it has a different answer.",
+            file=sys.stderr,
+        )
+        return 1
+    print("\n  the GPU is usable. Restart the daemon so it loads the model again:")
+    print("      systemctl --user restart gustav     # or 'ai stop' and 'ai start'")
+    return 0
+
+
 def cmd_service(args: argparse.Namespace) -> int:
     from gustav import service
 
@@ -1210,6 +1416,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--python", help="interpreter for the unit (default: this one)")
     p.add_argument("--force", action="store_true", help="replace an existing unit")
     p.add_argument("--dry-run", action="store_true", help="print the unit instead")
+    p.set_defaults(local=True)
+
+    p = sub.add_parser(
+        "doctor",
+        help="why the GPU is not being used, and how to fix it",
+        description="Diagnose the driver, CUDA and torch on this machine, and fix either half.",
+    )
+    p.add_argument("--fix-torch", action="store_true",
+                   help="install the newest torch this driver can run (no root)")
+    p.add_argument("--install-driver", action="store_true",
+                   help="install the current NVIDIA driver (needs sudo, then a reboot)")
+    p.add_argument("--toolkit", action="store_true",
+                   help="with --install-driver: the full CUDA toolkit as well (~4 GiB)")
+    p.add_argument("--no-torch", action="store_true",
+                   help="do not import torch (faster, and says less)")
+    p.add_argument("--offline", action="store_true", help="do not ask the daemon anything")
+    p.add_argument("--force", action="store_true",
+                   help="with --fix-torch: install a build older than gustav asks for")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask before changing anything")
+    p.add_argument("--dry-run", action="store_true", help="say what it would do, change nothing")
     p.set_defaults(local=True)
 
     p = sub.add_parser("update", help="update this install: source, package, service")
@@ -1575,6 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
             "init": cmd_init,
             "service": cmd_service,
             "update": cmd_update,
+            "doctor": cmd_doctor,
             "login": cmd_login,
             "logout": cmd_logout,
         }

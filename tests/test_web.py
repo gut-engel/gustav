@@ -335,3 +335,66 @@ async def test_the_controls_on_the_system_panel_exist(owner):
     toggled = await owner.post("/control/learning", json={"paused": True})
     assert toggled.status_code == 200
     await owner.post("/control/learning", json={"paused": False})
+
+
+# --- the page and the markup agree ----------------------------------------
+async def test_every_element_the_script_reaches_for_is_in_the_page():
+    """No framework means no compiler: a renamed id is a page that silently stops.
+
+    `$("#send")` on an element that is not there returns null and the listener that
+    was going to be attached to it never is, with no error anyone sees.
+    """
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    script = (WEB / "app.js").read_text(encoding="utf-8")
+    wanted = set(re.findall(r'\$\("#([a-z0-9-]+)"\)', script))
+    present = set(re.findall(r'id="([a-z0-9-]+)"', html))
+    assert wanted, "the selectors are written some other way now"
+    assert wanted <= present, f"not in index.html: {sorted(wanted - present)}"
+
+
+async def test_the_page_carries_its_own_icons():
+    """Not a webfont and not an icon CDN: it has to work with the cable out."""
+    script = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "createElementNS" in script
+    for name in ("menu", "send", "copy", "trash", "alert"):
+        assert f"{name}:" in script
+
+
+# --- renaming a chat ------------------------------------------------------
+async def test_a_chat_can_be_renamed(owner):
+    chat = (await owner.post("/chats", json={"title": ""})).json()
+    renamed = await owner.post(f"/chats/{chat['id']}/rename", json={"title": "the GPU one"})
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "the GPU one"
+    listed = (await owner.get("/chats")).json()["chats"]
+    assert [c["title"] for c in listed if c["id"] == chat["id"]] == ["the GPU one"]
+
+
+async def test_renaming_a_chat_that_is_not_yours_is_a_404(daemon):
+    accounts = Accounts(daemon.db)
+    accounts.create("ana", "a-good-password", role="user")
+    async with client(daemon, tcp=False) as owner_http:
+        mine = (await owner_http.post("/chats", json={"title": "mine"})).json()
+    async with client(daemon) as theirs:
+        await theirs.post("/auth/login", json={"name": "ana", "password": "a-good-password"})
+        response = await theirs.post(f"/chats/{mine['id']}/rename", json={"title": "hers"})
+    assert response.status_code == 404
+
+
+async def test_an_empty_title_is_refused(owner):
+    chat = (await owner.post("/chats", json={"title": ""})).json()
+    assert (await owner.post(f"/chats/{chat['id']}/rename", json={"title": ""})).status_code == 422
+
+
+# --- what the banner reads ------------------------------------------------
+async def test_status_carries_both_the_error_and_what_to_do_about_it(owner, daemon):
+    """The page shows the first line of one and the whole of the other."""
+    daemon.load_error = (
+        "RuntimeError: The NVIDIA driver on your system is too old (found version 12040)."
+    )
+    from gustav.hw import driver
+
+    daemon.load_help = driver.help_for(daemon.load_error)
+    payload = (await owner.get("/status")).json()
+    assert "12040" in payload["load_error"]
+    assert "ai doctor" in payload["load_help"]

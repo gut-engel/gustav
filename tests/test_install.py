@@ -130,8 +130,15 @@ def test_it_refuses_to_install_over_something_else(tmp_path):
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(900)
 def test_a_client_install_produces_a_working_ai(tmp_path):
-    """The whole point: one command, and `ai` works."""
+    """The whole point: one command, and `ai` works.
+
+    It builds a virtualenv and installs the package from PyPI for real, which is four
+    minutes on an ordinary connection — well past the 120s this suite's default
+    timeout allows. The subprocess already had its own 900s limit; this makes pytest
+    agree with it instead of killing a test that was working.
+    """
     target = tmp_path / "gustav"
     bin_dir = tmp_path / "bin"
     result = run(
@@ -168,8 +175,13 @@ def test_a_client_install_produces_a_working_ai(tmp_path):
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(900)
 def test_the_slow_stage_writes_down_everything_around_it(tmp_path, logs_go_somewhere_disposable):
-    """pip is the step that takes ten minutes and goes wrong on a machine you cannot see."""
+    """pip is the step that takes ten minutes and goes wrong on a machine you cannot see.
+
+    Which is also why it needs its own timeout: it installs for real, so on a cold pip
+    cache it is minutes, and the suite's 120s default was killing a working test.
+    """
     result = run("--client", "--source", str(REPO), "--dir", str(tmp_path / "gustav"),
                  env={"GUSTAV_BIN": str(tmp_path / "bin")}, timeout=900)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -188,6 +200,7 @@ def test_the_slow_stage_writes_down_everything_around_it(tmp_path, logs_go_somew
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(900)   # two real installs, back to back
 def test_installing_again_updates_in_place(tmp_path):
     target = tmp_path / "gustav"
     bin_dir = tmp_path / "bin"
@@ -539,3 +552,138 @@ def test_the_uninstaller_also_works_as_a_one_liner(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (tmp_path / ".venv").exists()
     assert (tmp_path / "var").exists()
+
+
+# ---------------------------------------------------------------------------
+# the driver installer
+#
+# It is the only thing in the project that asks for root, so what is tested is mostly
+# what it refuses to do. Every distribution is faked through two environment variables
+# the script reads for exactly this reason: one machine cannot be six distributions,
+# and the per-distribution choice *is* the content of the script.
+# ---------------------------------------------------------------------------
+DRIVER = REPO / "scripts" / "driver.sh"
+
+OS_RELEASES = {
+    "ubuntu": 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04"\n',
+    "debian": 'ID=debian\nVERSION_ID="12"\nPRETTY_NAME="Debian 12"\n',
+    "fedora": 'ID=fedora\nVERSION_ID=41\nPRETTY_NAME="Fedora Linux 41"\n',
+    "rocky": 'ID="rocky"\nID_LIKE="rhel centos"\nVERSION_ID="9.4"\nPRETTY_NAME="Rocky 9.4"\n',
+    "arch": 'ID=arch\nPRETTY_NAME="Arch Linux"\n',
+    "suse": 'ID="opensuse-tumbleweed"\nID_LIKE="opensuse suse"\nVERSION_ID="20261115"\n',
+    "void": 'ID=void\nPRETTY_NAME="void"\n',
+}
+
+
+def driver_run(*args: str, distro: str = "ubuntu", env: dict | None = None,
+               tmp_path: Path | None = None, timeout: int = 120):
+    """The driver installer, told which machine it is standing on."""
+    release = tmp_path / f"os-release-{distro}"
+    release.write_text(OS_RELEASES[distro], encoding="utf-8")
+    return subprocess.run(
+        ["bash", str(DRIVER), *args],
+        capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, "GUSTAV_OS_RELEASE": str(release), **(env or {})},
+    )
+
+
+def test_the_driver_installer_is_valid_and_explains_itself():
+    assert subprocess.run(["bash", "-n", str(DRIVER)], capture_output=True).returncode == 0
+    help_text = subprocess.run(
+        ["bash", str(DRIVER), "--help"], capture_output=True, text=True
+    ).stdout
+    assert "--toolkit" in help_text
+    assert "--dry-run" in help_text
+    assert subprocess.run(
+        ["bash", str(DRIVER), "--version"], capture_output=True, text=True
+    ).stdout.startswith("driver.sh 20")
+
+
+@pytest.mark.parametrize(
+    ("distro", "expected"),
+    [
+        ("ubuntu", "cuda-drivers"),
+        ("debian", "cuda-drivers"),
+        ("fedora", "akmod-nvidia"),
+        ("rocky", "cuda-drivers"),
+        ("arch", "pacman -S"),
+        ("suse", "nvidia-video-G06"),
+        ("void", "NVIDIA-Linux-x86_64"),
+    ],
+)
+def test_each_distribution_gets_the_driver_its_maintainers_ship(distro, expected, tmp_path):
+    result = driver_run("--dry-run", "--yes", distro=distro, tmp_path=tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert expected in result.stdout
+
+
+def test_a_dry_run_changes_nothing_and_says_everything(tmp_path):
+    result = driver_run("--dry-run", "--yes", tmp_path=tmp_path)
+    assert result.returncode == 0
+    assert "would run: sudo apt-get" in result.stdout
+    # Both routes, because a real run only learns which applies when it gets there.
+    assert "ubuntu2404" in result.stdout
+    assert "ubuntu-drivers install" in result.stdout
+    assert "nothing was changed" in result.stdout.lower() or "nothing to check" in result.stdout
+
+
+def test_the_toolkit_is_opt_in(tmp_path):
+    without = driver_run("--dry-run", "--yes", tmp_path=tmp_path).stdout
+    with_it = driver_run("--dry-run", "--yes", "--toolkit", tmp_path=tmp_path).stdout
+    assert "cuda-toolkit" not in without
+    assert "not the CUDA toolkit" in without
+    assert "cuda-toolkit" in with_it
+
+
+def test_it_refuses_on_macos_and_says_what_does_work(tmp_path):
+    result = driver_run("--dry-run", "--yes", env={"GUSTAV_FAKE_SYSTEM": "Darwin"},
+                        tmp_path=tmp_path)
+    assert result.returncode != 0
+    assert "no NVIDIA driver for macOS" in result.stderr
+    assert "--client" in result.stderr, "the thing that does work on that machine"
+
+
+def test_it_refuses_under_wsl_where_the_driver_belongs_to_windows(tmp_path):
+    result = driver_run(
+        "--dry-run", "--yes",
+        env={"GUSTAV_FAKE_KERNEL": "5.15.153.1-microsoft-standard-WSL2"},
+        tmp_path=tmp_path,
+    )
+    assert result.returncode != 0
+    assert "this is WSL" in result.stderr
+    assert "winget" in result.stderr
+    assert "wsl --shutdown" in result.stderr
+
+
+def test_it_will_not_install_a_driver_with_nothing_to_confirm_with(tmp_path):
+    """Not a dry run, no --yes, no terminal: it must stop before touching anything."""
+    result = driver_run("--log", str(tmp_path / "d.log"), tmp_path=tmp_path)
+    assert result.returncode != 0
+    assert "--yes" in result.stderr or "--dry-run" in result.stderr
+    assert "apt-get install" not in (tmp_path / "d.log").read_text(encoding="utf-8")
+
+
+def test_it_writes_down_what_it_did(tmp_path):
+    log = tmp_path / "driver.log"
+    driver_run("--dry-run", "--yes", "--log", str(log), tmp_path=tmp_path)
+    text = log.read_text(encoding="utf-8")
+    assert "driver.sh 20" in text
+    assert "step 1/5" in text
+    assert "nvidia repository path would be ubuntu2404" in text
+
+
+def test_the_script_and_the_module_agree_on_every_family():
+    """Two copies of the same knowledge; this is the thread that ties them together."""
+    from gustav.hw import driver as module
+
+    script = DRIVER.read_text(encoding="utf-8")
+    for release in ("ubuntu", "fedora", "rocky", "arch", "suse"):
+        platform = module.detect_platform(
+            system="Linux", os_release=OS_RELEASES[release], kernel="6.8.0-generic",
+            container="", secure_boot=False,
+        )
+        recipe = module.driver_recipe(platform)
+        assert f"install_{recipe.family}()" in script, recipe.family
+        assert recipe.tool and recipe.tool in script, (
+            f"{recipe.family}: ai doctor says {recipe.tool}, driver.sh does not use it"
+        )

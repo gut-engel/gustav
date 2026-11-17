@@ -1,11 +1,18 @@
-"""Chat commands: /forget, /good, /bad, /correct, /clear, /help.
+"""Chat commands: /forget, /good, /bad, /correct, /clear, /tool, /tools, /help.
 
 These are the user's direct control over what the system learns, so they are handled
 before the model ever sees the message and they never need the GPU.
+
+``/tool`` is the odd one out: it does not change what was learned, it changes what the
+system *is*. It is here rather than in the model's hands because "write me a tool for
+that" is a thing people say in the middle of a sentence, and a request that depends on
+the model recognising it would be a request that works four times out of five. Typed as
+a command it is recorded, every time, in the same queue the night reads.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +26,8 @@ HELP = """Commands
   /correct <answer>     this is what you should have said — highest-priority training data
   /forget [all]         never train on the last exchange (or this whole session)
   /clear                start a fresh conversation (history is kept in the log)
+  /tool <what it does>  have a tool written for it tonight, for you to read and approve
+  /tools                what it can call now, what is waiting to be read
   /help                 this list
 Anything else is sent to the model."""
 
@@ -49,12 +58,24 @@ def parse(message: str) -> ParsedCommand | None:
 class CommandHandler:
     """Applies a command to the store. Returns None for anything that is not a command."""
 
-    KNOWN = ("good", "bad", "correct", "forget", "clear", "help")
+    KNOWN = ("good", "bad", "correct", "forget", "clear", "tool", "tools", "help")
 
-    def __init__(self, db: Database, journal: Journal, events: Events):
+    def __init__(
+        self,
+        db: Database,
+        journal: Journal,
+        events: Events,
+        *,
+        request_tool: Callable[[str], dict[str, Any]] | None = None,
+        describe_tools: Callable[[], list[str]] | None = None,
+    ):
         self.db = db
         self.journal = journal
         self.events = events
+        #: Both are the daemon's, and both are optional: a handler built for a test
+        #: has no tool store behind it and says so rather than pretending.
+        self.request_tool = request_tool
+        self.describe_tools = describe_tools
 
     def handle(self, session_id: int, message: str) -> CommandResult | None:
         command = parse(message)
@@ -69,6 +90,44 @@ class CommandHandler:
     # --- the commands ---------------------------------------------------
     def _help(self, session_id: int, argument: str) -> CommandResult:
         return CommandResult(reply=HELP, action="help")
+
+    def _tool(self, session_id: int, argument: str) -> CommandResult:
+        """Ask for a tool. The night writes it; you read it; then it may run."""
+        if not argument.strip():
+            return CommandResult(
+                reply=(
+                    "Say what the tool should do, in a sentence:\n"
+                    "  /tool raise a number to a large power exactly\n"
+                    "  /tool convert a unix timestamp to my timezone\n"
+                    "It is written tonight, in a sandbox, and waits for you to read it."
+                ),
+                action="tool_help",
+            )
+        if self.request_tool is None:
+            return CommandResult(
+                reply="this daemon cannot take tool requests (tools are switched off)",
+                action="tool_unavailable",
+            )
+        try:
+            result = self.request_tool(argument)
+        except Exception as exc:  # noqa: BLE001 - a refusal is an answer, not a crash
+            return CommandResult(reply=f"that was not recorded: {exc}", action="tool_failed")
+        return CommandResult(
+            reply=(
+                f"Asked for (request #{result.get('request', '?')}): {argument}\n"
+                "It is written in tonight's run, checked in a sandbox, and then waits "
+                "in `ai tools` for you to read the source before it can run."
+            ),
+            action="tool_requested",
+            data=result,
+        )
+
+    def _tools(self, session_id: int, argument: str) -> CommandResult:
+        """What it can call right now — the same list the model is told about."""
+        if self.describe_tools is None:
+            return CommandResult(reply="tools are not available here", action="tools")
+        lines = self.describe_tools()
+        return CommandResult(reply="\n".join(lines) or "no tools", action="tools")
 
     def _clear(self, session_id: int, argument: str) -> CommandResult:
         return CommandResult(

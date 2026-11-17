@@ -18,7 +18,7 @@
 # Nothing here touches the database, the adapters, the weights or your config.
 set -euo pipefail
 
-VERSION="2026-11-13.5"
+VERSION="2026-11-17.1"
 
 exec 3>&1 4>&2
 

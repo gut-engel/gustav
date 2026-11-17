@@ -350,3 +350,59 @@ async def test_summarising_can_be_switched_off(harness_factory):
     await harness.respond(session_id=1, message="hello", history=await _long_history())
     systems = [m["content"] for m in backend.prompts[-1] if m["role"] == "system"]
     assert not any(s.startswith("Earlier context:") for s in systems)
+
+
+# --- what the model is actually told -------------------------------------
+async def test_the_model_is_told_what_it_is_and_what_renders_it(harness, backend):
+    """Without this the model answers as the generic assistant it was trained to be."""
+    await harness.load()
+    await harness.respond(session_id=1, message="hello", history=[])
+    system = backend.prompts[-1][0]
+    assert system["role"] == "system"
+    assert "You are Gustav" in system["content"]
+    assert "never say that you cannot be extended" in system["content"]
+    assert "Do not use LaTeX" in system["content"]
+
+
+async def test_an_approved_tool_reaches_the_prompt_in_words_as_well_as_schema(
+    harness, backend, db, paths
+):
+    from gustav.tools.review import check
+    from gustav.tools.spec import ToolSpec
+    from gustav.tools.store import ToolStore
+
+    spec = ToolSpec(
+        name="bigpow",
+        description="raise a number to a large power exactly",
+        source="def run(base, power):\n    return base ** power",
+        parameters={
+            "type": "object",
+            "properties": {
+                "base": {"type": "number", "description": "the base"},
+                "power": {"type": "number", "description": "the exponent"},
+            },
+            "required": ["base", "power"],
+        },
+        examples=({"arguments": {"base": 2, "power": 10}, "expect": 1024},),
+    )
+    store = ToolStore(db, paths.tools)
+    store.propose(spec, check(spec, harness.config.tools))
+    store.approve("bigpow", by="simon")
+    harness.forget_capabilities()
+
+    await harness.load()
+    await harness.respond(session_id=1, message="2 to the power of 4096?", history=[])
+    system = backend.prompts[-1][0]["content"]
+    assert "bigpow — raise a number to a large power exactly" in system
+    # And the schema went too, which is the half the model calls with.
+    assert backend.offered_tools[-1] == ["bigpow"]
+
+
+async def test_the_prompt_is_not_rebuilt_for_every_turn_of_a_conversation(harness, backend):
+    await harness.load()
+    await harness.respond(session_id=1, message="one", history=[])
+    first = harness.capabilities()
+    await harness.respond(session_id=1, message="two", history=[])
+    assert harness.capabilities() is first, "the tool table was read twice in one burst"
+    harness.forget_capabilities()
+    assert harness.capabilities() is not first

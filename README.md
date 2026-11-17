@@ -144,7 +144,15 @@ download.pytorch.org for a torch built for that CUDA — **before** downloading 
 gigabytes of one that cannot run here. PyPI only carries the newest build, so a machine
 with an older driver silently gets a torch whose `torch.cuda.is_available()` is `False`;
 when no published build can satisfy gustav's `torch>=` floor, it says so, with the
-newest version that *would* work, and asks before going ahead anyway.
+newest version that *would* work, and offers to install a current NVIDIA driver
+(`--install-driver` to skip the question, `--no-install-driver` to never be asked).
+That is the only part of any of this that wants sudo, it is a separate script, and
+[When the GPU is the problem](#when-the-gpu-is-the-problem) is what it does.
+
+Which torch fits which driver is decided in `gustav/hw/driver.py`, not in the shell
+script, because `ai doctor` has to give the same answer on the same machine a month
+later — and a rule that exists twice is a rule that will disagree with itself. The
+module is stdlib-only for exactly that call: nothing is installed yet when it runs.
 
 After installing, it byte-compiles the source and runs `ai --help` before saying Done.
 A checkout with one broken file in it installs perfectly happily and then dies at the
@@ -170,6 +178,76 @@ longer a shrug and a warning. It says what is in the way and offers to put it as
 `--dry-run` prints what it would do and changes nothing. `--help` lists the rest:
 `--dir`, `--ref`, `--source` (install from a checkout you already have), `--no-service`,
 and `--ssh` / `GUSTAV_TOKEN` for a fork you have made private.
+
+### When the GPU is the problem
+
+The one failure that arrives in the chat box instead of a terminal:
+
+```
+RuntimeError: the model is not available, so I cannot answer: RuntimeError: The NVIDIA
+driver on your system is too old (found version 12040). Please update your GPU driver…
+```
+
+`12040` is how CUDA writes 12.4. It means the torch in the virtualenv was built against
+a newer CUDA than this driver can run, and it has exactly two cures. **`ai doctor`**
+says which one this machine needs, and runs either:
+
+```bash
+ai doctor                   # what is wrong, and both ways out, with the commands
+ai doctor --fix-torch       # a torch built for this driver — no root, no reboot
+ai doctor --install-driver  # the current NVIDIA driver — sudo, and one reboot
+```
+
+The cheap cure is first on purpose: every torch wheel carries its own CUDA runtime, so
+a build that matches the driver needs nothing but the download, and it cannot break the
+machine you also game on. `--fix-torch` asks download.pytorch.org which build this
+driver can run, refuses rather than installing one that would import and quietly report
+no GPU, and asks torch whether it can see the card afterwards instead of assuming.
+
+The real cure is a current driver, and that is the one thing here that needs root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/driver.sh | sudo bash
+```
+
+`scripts/driver.sh` is separate from the installer for that reason alone — the
+installer puts a daemon in your home directory and never needs more than you, while a
+kernel module needs the kernel. It touches nothing of gustav's: no checkout, no
+virtualenv, no weights, no config. What it installs is whatever that distribution's own
+maintainers ship:
+
+| | |
+|---|---|
+| Debian, Ubuntu and kin | NVIDIA's CUDA repository and `cuda-drivers`, falling back to `ubuntu-drivers` / the distribution's own when the repository has nothing for that release |
+| Fedora | RPM Fusion's `akmod-nvidia`, built here and now rather than at the next boot |
+| RHEL, Rocky, Alma, Oracle, Amazon | NVIDIA's CUDA repository, with the distribution's module stream disabled first — without that the install succeeds and nothing changes |
+| Arch and kin | `nvidia-open-dkms` on Turing and newer, `nvidia-dkms` on anything older, and headers for *every* kernel you boot |
+| openSUSE | NVIDIA's own repository and the G06 driver |
+| anything else | NVIDIA's `.run` installer, newest version, with `--dkms` |
+
+And what it refuses to do, which matters as much:
+
+* **macOS** has had no NVIDIA driver since 10.13 and none at all on Apple silicon. It
+  says so and points at `--client`, which is the thing that works on that machine;
+* **WSL** gets its driver from Windows through `/dev/dxg`. Installing a Linux one in
+  there replaces `libcuda.so` with one that has no GPU behind it and breaks what did
+  work, so it stops and gives you the `winget` line for the Windows side;
+* **a container** shares the host's kernel and therefore the host's driver;
+* **a machine with no NVIDIA card** that `lspci` can see — because installing an NVIDIA
+  driver there can replace the driver currently painting your screen.
+
+**Secure Boot** is checked before anything is built, not after: a module compiled on
+your machine is unsigned, the firmware refuses to load it, and the symptom is an
+install that looked perfect followed by `no devices were found`. It says so, and asks.
+
+The CUDA *toolkit* — `nvcc`, the headers, four more gigabytes — is not installed unless
+you pass `--toolkit`. Nothing gustav does needs the compiler; every torch wheel brings
+its own runtime.
+
+`--dry-run` prints every command it would run and changes nothing, `--yes` skips the
+question, and everything it does goes to `~/.local/state/gustav/driver-<date>.log`
+beside the installer's. Afterwards: reboot. The running kernel keeps the module it
+booted with, so `nvidia-smi` goes on reporting the old driver until you do.
 
 ### Taking it off again
 
@@ -267,13 +345,25 @@ web:
 ```
 
 Restart, open `http://your-server:8713/`, and sign in with an account you made with
-`ai user add`. What you get:
+`ai user add`. It is laid out the way every chat interface has been laid out since
+OpenWebUI settled the question — a collapsing sidebar of conversations, a quiet top
+bar, a centred column of messages, a rounded composer that grows as you type — because
+learning where things are is not the interesting part of a local AI. The colours are
+gustav's own, and the same ones the morning report is written in. What you get:
 
-* **chats** down the left, each named after the first thing you said in it. New chat,
-  archive (which hides it — the turns stay, because they are what the night learns
-  from), and the whole thread when you come back to it;
-* **the answer as it is written**, streamed over the same SSE the terminal uses. The
-  footer of each answer carries tokens/s, latency and which adapter version produced it;
+* **chats** down the left, grouped by when you last touched them and searchable, each
+  named after the first thing you said in it. New chat, rename, archive (which hides it
+  — the turns stay, because they are what the night learns from), and the whole thread
+  when you come back to it;
+* **the answer as it is written**, streamed over the same SSE the terminal uses, and
+  **rendered as Markdown**: headings, lists, emphasis, `inline code`, and fenced code
+  blocks with a copy button. (The model is told this, which is why it stopped writing
+  LaTeX at a page that cannot render it.) The footer of each answer carries tokens/s,
+  latency and which adapter version produced it, with copy beside them;
+* **stop generating**, which aborts the stream rather than waiting it out;
+* **a banner when the model is not loaded**, carrying the daemon's own reason and the
+  command that fixes it — the GPU failing is the one thing worth interrupting the page
+  for, and an owner should not have to go to a terminal to find out what happened;
 * **👍 👎 correct…** under the latest answer. They are the same `/good`, `/bad`,
   `/correct` commands the terminal has, applied to the most recent exchange exactly as
   typing them at a prompt would, and they land in the same table — so a thumb in the
@@ -282,18 +372,28 @@ Restart, open `http://your-server:8713/`, and sign in with an account you made w
 * **facts and skills** — what it believes about you and where it is measurably weak;
 * **tools** — the list, the status, and *the source*, so the thing you are approving is
   the thing you read. Approve and reject are right there, and you can ask for a new tool
-  in a sentence;
+  in a sentence (the same queue `/tool` writes to);
 * **system** — state, model, uptime, sleep/wake, pause learning, release the GPU, and
   whatever is waiting for a decision.
 
 The last three are owner-only and hidden entirely from a plain account's browser —
 `owner_panels: false` hides them from everyone, for a machine where the browser is only
-ever meant to be a chat window.
+ever meant to be a chat window. Each has its own URL (`#system`), so a panel can be
+reloaded or bookmarked.
 
-Three things worth knowing about how it is built:
+Smaller things, in the order people notice them missing: dark and light with a toggle
+that remembers (and `auto`, which follows the system); Enter sends and Shift+Enter does
+not; Ctrl+Shift+O for a new chat and Ctrl+K for the search box; a sidebar that becomes
+an overlay on a phone; toasts and a proper dialog instead of `alert()` and `prompt()`.
+
+Four things worth knowing about how it is built:
 
 * **nothing is ever inserted as HTML.** Model output, stored turns and other accounts'
-  text all go through `textContent`, so a conversation cannot script the page;
+  text all go through `textContent`, so a conversation cannot script the page. The
+  Markdown renderer is a DOM builder for that reason, not a string templater, and a
+  link is only ever made from `http(s)` or a path on this server;
+* **the icons are path data in the file.** No icon pack and no webfont, for the same
+  reason as the next point;
 * **nothing is fetched from anyone else.** No CDN, no framework, no fonts — an assistant
   that is meant to work with the network unplugged should not need someone else's server
   to render its own interface;
@@ -393,6 +493,42 @@ min-p, repetition penalty), the stop sequences and the KV handling are this proj
   and a single over-long message is trimmed in the middle rather than cut off.
   `wake.summarise_history: false` goes back to simply dropping them.
 
+### It is told what it is, and what it can do
+
+A model that has never been told what it is attached to answers as the generic
+assistant it was trained to be. Asked for a tool it says it has none and cannot make
+one — on a machine whose entire point is that it writes tools for itself overnight —
+and asked for maths it writes LaTeX at a page that renders `$` as `$`.
+
+So the system prompt is not a constant. It is built for every answer out of what is
+true at that moment, in `gustav/wake/capabilities.py`:
+
+* **the tools it can call right now**, by name and by what they do — the same list the
+  schemas are built from, so what it is told and what it may do cannot disagree;
+* **the ones already written and waiting for you to read them**, and the ones already
+  asked for, so it does not offer to queue something twice;
+* **that it can be extended at all** — that when something is beyond it, the honest
+  answer is "I cannot do that reliably, type `/tool …` and it is written tonight",
+  never "I can only assist with simpler tasks";
+* **what renders its answer** — Markdown, fenced code blocks, and no LaTeX;
+* **what tonight does with this conversation**, which is the one piece of context that
+  makes "I am not sure" the cheaper answer than a confident guess.
+
+Every claim in it is switched off when the thing it claims is switched off:
+`tools.enabled: false` and the prompt stops mentioning tools, `allow_authoring: false`
+and it stops offering to have one written, learning paused and it stops promising
+tonight. A prompt that promises what the daemon refuses to do is worse than one that
+promises nothing.
+
+The half that changes overnight — the list of tools — is left out of the prompt the
+*training* set is built with, so the adapter is trained against the same words it is
+asked against, minus a list that would be wrong by the time it is used.
+
+It is also sized to the window it has to fit in. The full version is around 420 tokens;
+on the 4 GB profile the whole window is 2048, so below 4096 it switches to a short form
+that keeps every claim that changes what the model will *do* — the tools, `/tool`, and
+what renders the answer — and drops the explanation of why.
+
 Commands are handled before the model sees anything, and they are your control over what
 the system learns:
 
@@ -401,7 +537,14 @@ the system learns:
 | `/good`, `/bad` | becomes a preference pair |
 | `/correct <answer>` | highest-priority training data (weighted 10x against a thumb) |
 | `/forget [all]` | the last exchange, or the session, is never trained on — and the queued work for it is withdrawn |
+| `/tool <what it should do>` | ask for a tool; tonight writes it, you read it, then it may run |
+| `/tools` | what it can call right now, what is waiting to be read, what is queued |
 | `/clear`, `/help` | fresh conversation, the command list |
+
+`/tool` is a command rather than something the model notices, on purpose. "Write me a
+tool for that" is said in the middle of a sentence, and a request that depends on the
+model recognising it is a request that works four times in five. Typed as a command it
+is recorded every time, in the same queue the night reads and the Tools panel shows.
 
 **Secrets never reach the training data, or the disk.** Every message is scanned for API
 keys, tokens, private keys, credentials in URLs and `password: …` assignments. A hit
@@ -1109,6 +1252,7 @@ and the estimates become exact.
 | `ai start` | run the daemon in the foreground |
 | `ai service install\|uninstall\|status` | run it as a systemd user service |
 | `ai update [--check] [--reset]` | update this install: source, package, service — and nothing else |
+| `ai doctor [--fix-torch] [--install-driver]` | why the GPU is not being used, and either way out of it |
 | `ai status [--json]` | state, schedule, adapters, GPU holder, pending work, failures, approvals |
 | `ai chat [message]` | one message, or an interactive session |
 | `ai sleep now [--dry-run]` | sleep immediately; `--dry-run` plans the night without doing it |
@@ -1200,12 +1344,14 @@ daemon.py              the entry point
 config.yaml            your settings
 scripts/install.sh     the one-liner's installer: server or client, idempotent
 scripts/update.sh      the one-liner's updater: moves the checkout, then 'ai update'
+scripts/driver.sh      the NVIDIA driver, per distribution — the only thing that wants sudo
 profiles/              hardware profiles, including the generated one
 docs/sources.yaml      topic -> documentation map, with licences; the fetcher's whole world
 modules/registry.yaml  the modules, their descriptions and their topic keywords
 src/gustav/
   core/                state machine, scheduler, supervisor, journal, GPU lease, recovery
   hw/                  detection, the model ladder, memory model, pre-flight, planner
+  hw/driver.py         the CUDA error, which torch a driver may run, how to replace it
   inference/           backend, generation loop, sampling, adapters, router, caches
   backup/              snapshots, manifests, atomic swaps, restore, retention, the guard
   sleep/               the pipeline, its steps, and the model as a step sees it
@@ -1219,7 +1365,7 @@ src/gustav/
   report/              the HTML report
   data/                the defaults a fresh project is given
 packaging/             the systemd user unit
-  wake/                the chat side
+  wake/                the chat side, the commands, and what the model is told it can do
   server/ cli.py       control plane and its client
   web/                 the web interface: three files, no build step
   store/               SQLite schema and migrations

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import zlib
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
@@ -96,6 +97,9 @@ class Harness:
         self._summaries: dict[tuple[str, int, int], str] = {}
         #: What the last streamed answer's tools did, for the server's final event.
         self._last_tools: Any = None
+        #: What the model is told it can do, and when that was last worked out.
+        self._capabilities: Any = None
+        self._capabilities_at: float = 0.0
         #: Set when a load was attempted and failed. "Not loaded yet" is not a failure:
         #: the daemon's startup health check runs *before* the first load, and treating
         #: that as unhealthy would send it straight to safe mode.
@@ -322,7 +326,9 @@ class Harness:
         session_id: int | str = "default",
     ) -> tuple[list[Message], RouteDecision]:
         conversation = Conversation.from_history(
-            history, max_turns=self.config.wake.max_history_turns
+            history,
+            max_turns=self.config.wake.max_history_turns,
+            system_prompt=self.system_prompt(),
         )
         conversation.add_user(message)
         decision = self.router.route(message, forced=params.adapters)
@@ -436,6 +442,57 @@ class Harness:
             source=source,
         )
         return session if session.enabled else None
+
+    def capabilities(self):
+        """What this daemon can actually do, this minute.
+
+        Cheap enough to do per answer — three indexed queries — but it is done per
+        answer *window* instead, because a chat is a burst of turns and the tool table
+        does not change between them. A tool approved while someone is typing is in
+        the prompt within the minute, which is the promise the panel makes.
+        """
+        from gustav.wake import capabilities as caps
+
+        now = time.monotonic()
+        if self._capabilities is not None and now - self._capabilities_at < 60.0:
+            return self._capabilities
+        store = None
+        if self.db is not None:
+            from gustav.tools.store import ToolStore
+
+            store = ToolStore(
+                self.db, self.paths.tools, max_tools=self.config.tools.max_tools
+            )
+        paused = False
+        if self.db is not None:
+            # The daemon owns this flag; the prompt must not promise tonight's training
+            # while training is switched off.
+            with contextlib.suppress(Exception):
+                paused = str(self.db.get_meta("learning_paused") or "").lower() in (
+                    "1", "true", "yes",
+                )
+        found = caps.collect(
+            self.config,
+            store=store,
+            base_model=self._spec.id if self._spec else "",
+            can_call_tools=bool(getattr(self.backend, "supports_tools", False)),
+            learning_paused=paused,
+        )
+        self._capabilities, self._capabilities_at = found, now
+        return found
+
+    def system_prompt(self) -> str:
+        """What the model is told, sized to the window it has to say it in."""
+        from gustav.wake import capabilities as caps
+
+        found = self.capabilities()
+        if self._budget().max_seq_len < 4096:
+            return caps.brief_prompt(found)
+        return caps.system_prompt(found)
+
+    def forget_capabilities(self) -> None:
+        """Drop the cache: a tool was approved, retired, or written."""
+        self._capabilities = None
 
     async def respond(
         self,

@@ -35,6 +35,7 @@ from gustav.core.recovery import Recovery, RecoveryReport
 from gustav.core.scheduler import Observation, Scheduler, SleepDecision
 from gustav.core.state import State, StateMachine
 from gustav.core.supervisor import ChildSpec, Supervisor
+from gustav.hw import driver as gpu_driver
 from gustav.hw.service import HardwareService, PlanOutcome
 from gustav.paths import Paths
 from gustav.sleep.pipeline import PipelineRunner, RunOutcome, default_pipeline
@@ -49,6 +50,14 @@ META_LEARNING_PAUSED = "learning_paused"
 
 #: How long a pause request waits for the sleep pipeline to checkpoint and stop.
 PAUSE_TIMEOUT_SECONDS = 120.0
+
+
+def _backend_can_call(responder, config) -> bool:
+    """Whether an answer could call a tool, without building anything to find out."""
+    backend = getattr(responder, "_backend", None)
+    if backend is not None:
+        return bool(getattr(backend, "supports_tools", False))
+    return bool(config.tools.enabled)
 
 
 class Daemon:
@@ -98,7 +107,16 @@ class Daemon:
             config, self.paths, self.db, self.events, detector=detector
         )
         self.responder: Responder = responder or self._default_responder()
-        self.commands = CommandHandler(self.db, self.journal, self.events)
+        self.commands = CommandHandler(
+            self.db,
+            self.journal,
+            self.events,
+            # "/tool do X" has to record something whatever the model makes of it, so
+            # the handler is given the daemon's own two tool entry points rather than
+            # a copy of what they do.
+            request_tool=self.request_tool,
+            describe_tools=self.describe_tools,
+        )
         self.state = StateMachine(
             State.STARTING, clock=self.clock, on_transition=self._record_transition
         )
@@ -119,6 +137,10 @@ class Daemon:
         self.plan_outcome: PlanOutcome | None = None
         #: Why the model is not loaded, if it is not. Shown by `ai status`.
         self.load_error: str | None = None
+        #: And what to do about it, when the reason is one we recognise — a driver
+        #: older than the torch built on top of it is the whole of the genre. Kept
+        #: beside the error because the error alone sends people to a search engine.
+        self.load_help: str | None = None
         self.last_decision: SleepDecision | None = None
         self.last_run_outcome: RunOutcome | None = None
 
@@ -275,15 +297,24 @@ class Daemon:
             await self.responder.load()
         except Exception as exc:  # noqa: BLE001 - a bad model must not stop the daemon
             self.load_error = f"{type(exc).__name__}: {exc}"
+            # A CUDA failure is the one load error that is never about the model: the
+            # driver, or the torch sitting on it, is wrong, and no amount of retrying
+            # changes that. Working out which is a few regexes and no I/O, so it is
+            # done here, once, while the text is in hand.
+            self.load_help = gpu_driver.help_for(self.load_error)
             self.log.error("the model did not load (%s): %s", reason, exc)
             self.events.emit(
                 "inference.load_failed",
                 f"the model did not load: {exc}".split("\n")[0],
                 level="error",
                 detail=self.load_error,
+                help=self.load_help,
             )
+            if self.load_help:
+                self.log.error("what to do about it: %s", self.load_help)
             return False
         self.load_error = None
+        self.load_help = None
         return True
 
     async def serve_forever(self) -> None:
@@ -566,11 +597,22 @@ class Daemon:
             "inference", evictor=self._evict_inference, reason="serving", timeout=None
         )
         if not await self._try_load_model("a chat request"):
-            raise RuntimeError(
-                f"the model is not available, so I cannot answer: {self.load_error}"
-            )
+            raise RuntimeError(self.load_failure_message())
         if self.state.state is State.SAFE_MODE:
             self.state.transition(State.WAKE, "the model loaded on retry")
+
+    def load_failure_message(self) -> str:
+        """What to say to someone who asked a question and the model is not there.
+
+        A CUDA traceback in a chat box is the worst of both worlds: it is addressed to
+        nobody, and the one sentence that would help — which of the two fixes this
+        machine needs — is not in it. When the failure is one `gustav.hw.driver`
+        recognises, that sentence is what goes out instead, and the traceback stays in
+        the log where it is useful.
+        """
+        if self.load_help:
+            return f"I cannot answer right now: {self.load_help}"
+        return f"the model is not available, so I cannot answer: {self.load_error}"
 
     def _store_text(self, message: str) -> tuple[str, list]:
         """What goes on disk. Secrets are replaced unless the operator opted out."""
@@ -892,6 +934,7 @@ class Daemon:
             if approve
             else store.reject(name, version, by=by, note=note)
         )
+        self._forget_capabilities()
         self.events.emit(
             "tool.approved" if approve else "tool.rejected",
             f"{decided.name}@{decided.version} was "
@@ -929,12 +972,49 @@ class Daemon:
         )
         return {"name": name, "version": decided.version, "status": decided.status}
 
+    def capabilities(self):
+        """What this daemon can do right now, as the model is told it.
+
+        One place, so `/tools`, the system prompt and anything that asks later cannot
+        disagree about what is approved.
+        """
+        from gustav.tools.store import ToolStore
+        from gustav.wake import capabilities as caps
+
+        store = None
+        if self.config.tools.enabled:
+            store = ToolStore(
+                self.db, self.paths.tools, max_tools=self.config.tools.max_tools
+            )
+        return caps.collect(
+            self.config,
+            store=store,
+            instance=self.config.instance.name,
+            base_model=(self.responder.describe() or {}).get("base_model", "") or "",
+            # The already-built backend, never the property: reading `.backend` on the
+            # harness constructs one, and `/tools` is not a reason to do that.
+            can_call_tools=_backend_can_call(self.responder, self.config),
+            learning_paused=self.learning_paused,
+        )
+
+    def _forget_capabilities(self) -> None:
+        """The tool table moved: whatever is caching what the model may claim is stale."""
+        forget = getattr(self.responder, "forget_capabilities", None)
+        if callable(forget):
+            forget()
+
+    def describe_tools(self) -> list[str]:
+        from gustav.wake import capabilities as caps
+
+        return caps.summary_lines(self.capabilities())
+
     def request_tool(self, text: str, *, source: str = "user") -> dict[str, Any]:
         """Ask for a tool. The night writes it; you review it."""
         if not text.strip():
             raise ValueError("a tool request needs a description of what it should do")
         request_id = self._tool_store().add_request(text, source=source)
         self.journal.add_pending_work("tool_request", weight=5, ref=str(request_id))
+        self._forget_capabilities()
         self.events.emit(
             "tool.requested", f"a tool was requested: {text[:160]}", request=request_id
         )
@@ -1812,6 +1892,7 @@ class Daemon:
             "last_activity_at": self.last_activity_at.isoformat(timespec="seconds"),
             "model": self.responder.describe(),
             "load_error": self.load_error,
+            "load_help": self.load_help,
             "gpu": {
                 "holder": self.lease.holder,
                 "return_requested": self.lease.return_requested,
