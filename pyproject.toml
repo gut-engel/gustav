@@ -40,6 +40,15 @@ ml = [
     "safetensors>=0.4",
     "sentencepiece>=0.2",
 ]
+# Talking to it. Three things, and the first is not optional for the socket: uvicorn
+# speaks WebSocket only when one of websockets/wsproto is installed, and the fast
+# voice path *is* a WebSocket. The other two are the models, and they are the large
+# part — a gigabyte between them — which is why none of this is in the base install.
+voice = [
+    "websockets>=13.0",
+    "faster-whisper>=1.1",
+    "piper-tts>=1.2",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -59,8 +68,11 @@ artifacts = ["src/gustav/data/*.yaml", "src/gustav/hw/*.yaml",
              "src/gustav/web/*.html", "src/gustav/web/*.css", "src/gustav/web/*.js"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "docs", "modules", "profiles", "packaging", "README.md",
-           "config.yaml", "daemon.py", "pyproject.toml"]
+# No config.yaml: that one belongs to whoever runs it and is not in the repository.
+# The template that `ai init` writes is src/gustav/data/config.yaml, which comes along
+# with the package.
+include = ["src", "tests", "docs", "modules", "profiles", "packaging", "scripts",
+           "satellite", "README.md", "daemon.py", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

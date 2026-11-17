@@ -63,6 +63,8 @@ const ICONS = {
   users: "M8.5 11a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4z|M2.5 20c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"
          + "|M16.5 11.5a3 3 0 100-6|M17 14.7c2.6.4 4.5 2.4 4.5 5.3",
   events: "M4 6h16|M4 12h16|M4 18h10",
+  voice: "M12 3.5a3 3 0 013 3v5a3 3 0 11-6 0v-5a3 3 0 013-3z|M5.5 11a6.5 6.5 0 0013 0"
+         + "|M12 17.5V21|M8.5 21h7",
   plus: "M12 5v14|M5 12h14",
 };
 
@@ -437,7 +439,7 @@ function banner(what) {
 /* --- views ------------------------------------------------------------ */
 const VIEWS = [
   "chat", "facts", "skills", "tools",
-  "system", "models", "hardware", "runs", "backups", "users", "events",
+  "system", "models", "hardware", "runs", "backups", "voice", "users", "events",
 ];
 
 //: What each panel is called, and what loads it. One place, so adding a panel is one
@@ -451,6 +453,7 @@ const PANELS = {
   hardware: ["Hardware", () => loadHardware()],
   runs: ["Runs", () => loadRuns()],
   backups: ["Backups", () => loadBackups()],
+  voice: ["Voice", () => loadVoice()],
   users: ["Users", () => loadUsers()],
   events: ["Events", () => loadEvents()],
 };
@@ -1942,6 +1945,169 @@ function loadEvents() {
           event.message,
         ]))
       : el("p", "empty", "Nothing matches."));
+    return nodes;
+  });
+}
+
+/* --- talking to it ------------------------------------------------------ */
+function field(label, value, kind = "text", options = null) {
+  const wrap = el("label", "setting");
+  wrap.append(el("span", "fine", label));
+  let input;
+  if (options) {
+    input = el("select", "field");
+    for (const option of options) {
+      const node = el("option", "", option);
+      node.value = option;
+      if (String(value) === option) node.selected = true;
+      input.append(node);
+    }
+  } else if (kind === "checkbox") {
+    input = el("input");
+    input.type = "checkbox";
+    input.checked = Boolean(value);
+  } else {
+    input = el("input", "field");
+    input.type = kind;
+    input.value = value === null || value === undefined ? "" : String(value);
+  }
+  wrap.append(input);
+  return [wrap, input];
+}
+
+function loadVoice() {
+  return panel("#voice-panel", async () => {
+    let status = null;
+    try {
+      status = await api("/voice/config");
+    } catch (error) {
+      if (error.status !== 404) throw error;
+      return [
+        el("h2", "", "Talking to it"),
+        el("p", "sub", "The voice assistant is switched off on this daemon."),
+        (() => {
+          const card = el("div", "card");
+          card.append(el("h3", "", "To switch it on"));
+          const pre = el("pre", "source");
+          pre.append(el("code", "", "voice:\n  enabled: true\n  language: en\n"));
+          card.append(el("p", "sub", "In the daemon's config.yaml, then restart it:"));
+          card.append(pre);
+          card.append(el("p", "fine",
+            "The models are an extra: pip install -e '.[voice]' on the server "
+            + "(faster-whisper to listen, piper to speak, websockets for the fast path)."));
+          return card;
+        })(),
+      ];
+    }
+
+    const settings = await api("/voice/settings");
+    const nodes = [el("h2", "", "Talking to it")];
+
+    nodes.push(stats([
+      ["ready", status.ready ? "yes" : "not yet"],
+      ["listening with", `${status.stt.engine} @ ${status.stt.sample_rate} Hz`],
+      ["speaking with", status.tts.engine],
+      ["language", status.language],
+      ["answers in", status.reply_language],
+      ["models loaded", status.warmed ? `yes, in ${status.warm_ms} ms` : "on first use"],
+    ]));
+    for (const part of ["stt", "tts", "socket"]) {
+      const state = status[part];
+      if (state && !state.ok) nodes.push(el("p", "error", `${part}: ${state.detail}`));
+      else if (state && state.detail) nodes.push(el("p", "fine", `${part}: ${state.detail}`));
+    }
+
+    // --- what it sounds like ------------------------------------------
+    const tryIt = el("div", "card");
+    tryIt.append(el("h3", "", "Hear it"));
+    tryIt.append(el("p", "sub", "Synthesised on the server and played here."));
+    const row = el("div", "row");
+    const text = el("input", "field");
+    text.value = "The driver is too old, so I cannot answer yet.";
+    const play = action("Say it", async () => {
+      const response = await fetch("/voice/speak", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: text.value }),
+      });
+      if (!response.ok) throw new Error((await response.text()) || response.statusText);
+      const sound = new Audio(URL.createObjectURL(await response.blob()));
+      await sound.play();
+      return "";
+    }, { kind: "primary" });
+    row.append(text, play);
+    tryIt.append(row);
+    const second = el("div", "row");
+    second.append(action("Load the models now", async () => {
+      const report = await api("/voice/warm", { body: {} });
+      loadVoice();
+      return `ready in ${report.ms} ms`;
+    }));
+    tryIt.append(second);
+    nodes.push(tryIt);
+
+    // --- the settings ---------------------------------------------------
+    const form = el("div", "card");
+    form.append(el("h3", "", "Settings"));
+    form.append(el("p", "sub",
+      "Stored here, over the daemon's config.yaml — which is never rewritten, so the "
+      + "comments in it survive. Blank means \"whatever config.yaml says\"."));
+    const grid = el("div", "settings");
+    const effective = settings.effective || {};
+    const inputs = {};
+    const add = (key, label, kind = "text", options = null) => {
+      const [wrap, input] = field(label, effective[key], kind, options);
+      if ((settings.set_here || {})[key] !== undefined) wrap.append(pill("set here", "warn"));
+      grid.append(wrap);
+      inputs[key] = [input, kind];
+    };
+    add("language", "Language spoken to it");
+    add("reply_language", "Language it answers in (blank: the one it heard)");
+    add("stt.engine", "Listening", "text", ["auto", "whisper", "null"]);
+    add("stt.model", "Whisper model (tiny, base, small…)");
+    add("stt.device", "Whisper runs on", "text", ["cpu", "cuda", "auto"]);
+    add("tts.engine", "Speaking", "text", ["auto", "piper", "null"]);
+    add("tts.voice", "Voice (blank: one matching the language)");
+    add("tts.speed", "Speed", "number");
+    add("filler_after_ms", "Say something after (ms)", "number");
+    add("max_reply_tokens", "Longest spoken answer (tokens)", "number");
+    add("wake_words", "Wake words, comma separated");
+    add("fillers", "What it says while thinking, comma separated");
+    add("stream_sentences", "Speak each sentence as it is ready", "checkbox");
+    add("barge_in", "Stop talking when someone speaks", "checkbox");
+    form.append(grid);
+    form.append(action("Save", async () => {
+      const body = {};
+      for (const [key, [input, kind]] of Object.entries(inputs)) {
+        if (kind === "checkbox") body[key] = input.checked;
+        else if (kind === "number") body[key] = Number(input.value);
+        else if (key === "wake_words" || key === "fillers") {
+          body[key] = input.value.split(",").map((part) => part.trim()).filter(Boolean);
+        } else body[key] = input.value;
+      }
+      await api("/voice/settings", { body });
+      loadVoice();
+      return "saved; the next question uses it";
+    }, { kind: "primary" }));
+    nodes.push(form);
+
+    // --- a satellite ----------------------------------------------------
+    const satellite = el("div", "card");
+    satellite.append(el("h3", "", "A satellite"));
+    satellite.append(el("p", "sub",
+      "A microphone and a speaker in another room — a Raspberry Pi, an old laptop. "
+      + "One file, no dependencies, about fifteen seconds to install."));
+    const line = el("pre", "source");
+    line.append(el("code", "",
+      `curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/satellite.sh \\
+  | bash -s -- --url ${location.origin} --token <token>`));
+    satellite.append(line);
+    satellite.append(el("p", "fine",
+      "Make the token under Users (Issue a token). Then on the satellite: "
+      + "`gustav-satellite --calibrate` to measure the room, and "
+      + "`gustav-satellite --say hello` to check the speaker."));
+    nodes.push(satellite);
     return nodes;
   });
 }

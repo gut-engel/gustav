@@ -435,6 +435,100 @@ Four things worth knowing about how it is built:
   JavaScript never sees a token. The static files are mounted *last*, so a file in the
   web directory can never shadow an API route.
 
+## Talking to it
+
+A microphone and a speaker, here or in another room. Off until you ask for it, because
+it needs models:
+
+```bash
+pip install -e '.[voice]'     # faster-whisper to listen, piper to speak, websockets
+```
+
+```yaml
+voice:
+  enabled: true
+  language: de          # the language spoken *to* it — not the one you type in
+  reply_language: ""    # blank: it answers in whatever it heard
+```
+
+Then `http://your-server:8713/#voice` has the rest of it: which engines loaded, a box
+to hear the voice, every setting, and the one-liner for a satellite. What you set there
+is stored as an overlay in the database rather than written into `config.yaml` — that
+file is hand-written and full of comments explaining itself, and a program that
+rewrites it loses all of them. The panel says which values came from where.
+
+### The budget is one number
+
+The gap between someone finishing a sentence and hearing the first syllable back.
+Everything in the design is in service of it:
+
+* **The first sentence is spoken before the rest exists.** The model streams tokens; as
+  soon as a sentence is complete it is synthesised and sent. The second half of an
+  answer is generated while the first half is being read aloud, so the *length* of an
+  answer stops mattering to how responsive it feels.
+* **It says something human while it thinks.** If nothing is ready by
+  `filler_after_ms` (350 by default), a short phrase goes out — *"one moment"*, in the
+  voice language. They are rendered once and kept in `var/voice/fillers/`, because
+  synthesising "one moment" at the exact moment you have no time to spare would be an
+  odd way to save time.
+* **The satellite sends while you are still talking**, with 240 ms of pre-roll from
+  *before* speech was detected — without it every utterance loses its first consonant
+  and "play" becomes "lay".
+* **It stops the moment you speak.** Barge-in is the difference between a device you
+  talk to and a device you wait for.
+* **Answers meant for a speaker are short.** `max_reply_tokens` is not a quality
+  setting; it is an acknowledgement that speech is slow.
+
+Every part of that is measured and comes back with every turn —
+`transcribe_ms`, `first_token_ms`, `first_audio_ms`, `first_audio_was_filler`,
+`total_ms` — because a latency claim nobody measures stops being true within a month.
+On a GTX 1650 with whisper-base on the CPU and a 0.6B model, first sound lands around
+0.3–0.5 s; the filler is what covers the days it does not.
+
+### The API
+
+Five endpoints, under the same identity rules as everything else — an account, a token,
+or the Unix socket. A microphone in a hallway is not a reason to open a hole.
+
+| | |
+|---|---|
+| `GET /voice/config` | everything a satellite needs to configure itself, so its own file holds an address and a token and nothing else |
+| `POST /voice/transcribe` | audio in, text out (WAV or raw 16-bit PCM) |
+| `POST /voice/speak` | text in, WAV out |
+| `POST /voice/ask` | audio in, the whole turn back as JSON — the version you can test with curl |
+| `WS /voice/stream` | the fast path: frames up, events down as they happen |
+
+```bash
+curl -s --data-binary @question.wav -H 'content-type: audio/wav' \
+     -H "Authorization: Bearer $TOKEN" https://box:8713/voice/ask | jq .timings
+```
+
+### A satellite
+
+A Raspberry Pi, an old laptop, anything with a microphone:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/satellite.sh \
+  | bash -s -- --url http://box.local:8713 --token <token>
+```
+
+**It has no dependencies.** Not numpy, not sounddevice, not websockets: one Python file,
+`arecord` and `aplay` for sound, and two hundred lines of RFC 6455 at the bottom of it
+for the socket. Every wheel that has to be compiled on an ARM board is a minute of
+someone's evening and a new way for an install to fail — so on a Pi Zero this is about
+fifteen seconds, most of it apt installing `alsa-utils`. (That client is tested against
+a real server rather than against my reading of the specification.)
+
+It takes its language, its wake words and how long a question may be from the daemon,
+so there is nothing on the satellite to get out of step. Two things to do once:
+
+```bash
+gustav-satellite --calibrate        # measure the room; put the number in the config
+gustav-satellite --say "hello"      # make the daemon talk through this speaker
+```
+
+Make the token on the server with `ai user add kitchen` and `ai user token kitchen`.
+
 ## How the daemon schedules itself
 
 One asyncio process holds the state machine:
@@ -1378,6 +1472,8 @@ config.yaml            your settings
 scripts/install.sh     the one-liner's installer: server or client, idempotent
 scripts/update.sh      the one-liner's updater: moves the checkout, then 'ai update'
 scripts/driver.sh      the NVIDIA driver, per distribution — the only thing that wants sudo
+scripts/satellite.sh   puts a satellite on a Pi: one file, no dependencies
+satellite/             that file — microphone, speaker, VAD, and its own websocket
 profiles/              hardware profiles, including the generated one
 docs/sources.yaml      topic -> documentation map, with licences; the fetcher's whole world
 modules/registry.yaml  the modules, their descriptions and their topic keywords
@@ -1399,6 +1495,7 @@ src/gustav/
   data/                the defaults a fresh project is given
 packaging/             the systemd user unit
   wake/                the chat side, the commands, and what the model is told it can do
+  voice/               speech in and out, the latency budget, the assistant API
   server/ cli.py       control plane and its client
   web/                 the web interface: three files, no build step
   store/               SQLite schema and migrations

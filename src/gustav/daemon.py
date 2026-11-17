@@ -135,6 +135,10 @@ class Daemon:
         self.last_activity_at = self.clock.now()
         self.recovery_report: RecoveryReport | None = None
         self.plan_outcome: PlanOutcome | None = None
+        #: The voice side, built the first time anyone speaks. None until then, and
+        #: None for good on a daemon with voice.enabled off: a speech model and a
+        #: voice are a few hundred megabytes that a silent daemon should not hold.
+        self._voice = None
         #: Why the model is not loaded, if it is not. Shown by `ai status`.
         self.load_error: str | None = None
         #: And what to do about it, when the reason is one we recognise — a driver
@@ -257,6 +261,13 @@ class Daemon:
             health_checks=[self.responder.health],
             logger=get_logger("recovery"),
         ).run()
+
+        if self.config.voice.enabled:
+            from gustav.voice.service import apply_overrides
+
+            changed = apply_overrides(self.config, self.voice_settings())
+            if changed:
+                self.log.info("voice settings from the interface: %s", ", ".join(changed))
 
         self._plan_hardware(reason="startup")
 
@@ -992,6 +1003,48 @@ class Daemon:
             version=decided.version,
         )
         return {"name": name, "version": decided.version, "status": decided.status}
+
+    def voice_settings(self) -> dict:
+        """What the interface has set over config.yaml, if anything."""
+        stored = self.db.get_meta("voice.settings")
+        return stored if isinstance(stored, dict) else {}
+
+    def set_voice_settings(self, settings: dict) -> dict:
+        """Change the voice without rewriting a hand-commented config file.
+
+        The settings are stored as an overlay in the database and applied on top of
+        config.yaml here and at every start. config.yaml stays exactly as its owner
+        wrote it, comments and all, and the panel shows which values came from where.
+        """
+        from gustav.voice.service import SETTABLE, apply_overrides
+
+        unknown = sorted(set(settings) - set(SETTABLE))
+        if unknown:
+            raise ValueError(f"not something the interface may set: {', '.join(unknown)}")
+        merged = {**self.voice_settings(), **settings}
+        changed = apply_overrides(self.config, merged)
+        self.db.set_meta("voice.settings", merged)
+        # The engines are built from the config, so the next turn gets the new ones.
+        self._voice = None
+        self.events.emit(
+            "voice.settings_changed",
+            f"the voice was changed: {', '.join(changed) or 'nothing'}",
+            changed=changed,
+        )
+        return merged
+
+    @property
+    def voice(self):
+        """Speech in and speech out, over this daemon's own chat.
+
+        Built on first use rather than at startup, so switching voice on in
+        config.yaml costs a restart and nothing else costs anything.
+        """
+        if self._voice is None and self.config.voice.enabled:
+            from gustav.voice.service import VoiceService
+
+            self._voice = VoiceService(self.config, self.paths, ask=self.chat_stream)
+        return self._voice
 
     def capabilities(self):
         """What this daemon can do right now, as the model is told it.

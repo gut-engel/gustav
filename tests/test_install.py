@@ -687,3 +687,95 @@ def test_the_script_and_the_module_agree_on_every_family():
         assert recipe.tool and recipe.tool in script, (
             f"{recipe.family}: ai doctor says {recipe.tool}, driver.sh does not use it"
         )
+
+
+# ---------------------------------------------------------------------------
+# the satellite installer
+#
+# One file with no dependencies, so the installer is four small steps: check the sound
+# card, fetch the file, write a config, install a service. What is tested is that it
+# refuses rather than guessing, and that it never writes a token into a world-readable
+# file.
+# ---------------------------------------------------------------------------
+SATELLITE = REPO / "scripts" / "satellite.sh"
+
+
+def satellite(*args: str, env: dict | None = None, timeout: int = 120):
+    # --skip-sound-check because the machine running the suite is not the machine the
+    # microphone is plugged into; everything else about the install is the same.
+    return subprocess.run(
+        ["bash", str(SATELLITE), "--skip-sound-check", *args],
+        capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, **(env or {})},
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_the_satellite_installer_is_valid_and_explains_itself():
+    assert subprocess.run(["bash", "-n", str(SATELLITE)], capture_output=True).returncode == 0
+    help_text = satellite("--help").stdout
+    assert "--calibrate" in help_text
+    assert "--token" in help_text
+    assert satellite("--version").stdout.strip().startswith("satellite.sh 20")
+
+
+def test_it_will_not_guess_which_server_to_talk_to(tmp_path):
+    result = satellite("--dry-run", "--no-service", env={"HOME": str(tmp_path)})
+    assert result.returncode != 0
+    assert "--url" in result.stderr
+
+
+def test_a_dry_run_changes_nothing(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    result = satellite(
+        "--dry-run", "--no-service", "--url", "http://example.invalid:8713",
+        "--token", "s3cr3t", env={"HOME": str(home)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "would write" in result.stdout
+    assert not list(home.rglob("gustav_satellite.py"))
+    assert "s3cr3t" not in result.stdout
+
+
+def test_it_installs_the_one_file_and_a_config_only_you_can_read(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    result = satellite(
+        "--no-service", "--url", "http://example.invalid:8713", "--token", "s3cr3t",
+        "--source", str(REPO), "--name", "kitchen",
+        env={"HOME": str(home), "GUSTAV_BIN": str(home / "bin")},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    program = home / ".local" / "share" / "gustav-satellite" / "gustav_satellite.py"
+    assert program.is_file()
+    assert (home / "bin" / "gustav-satellite").is_file()
+
+    config = home / ".config" / "gustav-satellite.conf"
+    text = config.read_text(encoding="utf-8")
+    assert "url = http://example.invalid:8713" in text
+    assert "token = s3cr3t" in text
+    # It holds a token, so it is not readable by the rest of the machine.
+    assert oct(config.stat().st_mode)[-3:] == "600"
+
+    # And the thing it installed runs.
+    ran = subprocess.run(
+        [str(home / "bin" / "gustav-satellite"), "--version"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert ran.stdout.strip().startswith("gustav-satellite")
+
+
+def test_it_keeps_a_config_that_is_already_there(tmp_path):
+    home = tmp_path / "home"
+    (home / ".config").mkdir(parents=True)
+    config = home / ".config" / "gustav-satellite.conf"
+    config.write_text("url = http://mine:8713\nthreshold = 0.07\n", encoding="utf-8")
+    result = satellite(
+        "--no-service", "--url", "http://example.invalid:8713", "--source", str(REPO),
+        env={"HOME": str(home), "GUSTAV_BIN": str(home / "bin")},
+    )
+    assert result.returncode == 0
+    assert "keeping your" in result.stdout
+    assert "threshold = 0.07" in config.read_text(encoding="utf-8")

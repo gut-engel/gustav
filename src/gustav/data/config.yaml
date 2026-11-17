@@ -265,6 +265,46 @@ api:
   # Requests per minute per caller before they are refused.
   rate_limit_per_minute: 120
 
+voice:
+  # Talking to it: a microphone and a speaker, here or in another room. Off until you
+  # ask for it, because it needs models — on the server:  pip install -e '.[voice]'
+  # (faster-whisper to listen, piper to speak, websockets for the fast path).
+  enabled: false
+  # The language spoken *to* it, which is not the language you type in. Whisper is
+  # told rather than left to guess: guessing costs a second and gets short commands
+  # wrong, and the voice is picked to match this.
+  language: en
+  # What it answers in. Blank means "whatever language it heard", which is what you
+  # want unless you are practising one.
+  reply_language: ""
+  stt:
+    engine: auto           # auto | whisper | null
+    model: base            # tiny, base, small… base is faster than real time on a CPU
+    device: cpu            # the GPU here is busy holding the language model
+    compute_type: int8
+    sample_rate: 16000     # what a satellite records at
+    max_utterance_seconds: 20
+  tts:
+    engine: auto           # auto | piper | null
+    voice: ""              # a piper voice, e.g. de_DE-thorsten-low; blank: match the language
+    speed: 1.0
+    sample_rate: 22050
+  # If nothing is ready to say by now, say something human. Silence on a speaker reads
+  # as broken rather than busy, and this is pre-rendered so it costs nothing when it
+  # is needed.
+  filler_after_ms: 350
+  fillers: []              # blank: the built-in phrases for `language`
+  # Speak each sentence as it is finished instead of waiting for the whole answer.
+  # The single biggest thing in the latency budget.
+  stream_sentences: true
+  # Stop talking the moment the person starts.
+  barge_in: true
+  # Only answer when the transcript starts with one of these. Empty: answer everything
+  # the satellite decides was a question.
+  wake_words: []
+  # Speech is slow and nobody wants eight paragraphs read to them.
+  max_reply_tokens: 160
+
 web:
   # The web interface, served by the daemon from the package — no second process and no
   # build step. On: open http://127.0.0.1:8713/ once the daemon is running. The owner

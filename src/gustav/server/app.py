@@ -890,6 +890,14 @@ def create_app(daemon: "Daemon") -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------
+    # talking to it
+    # ------------------------------------------------------------------
+    if daemon.config.voice.enabled:
+        from gustav.voice.server import voice_routes
+
+        app.include_router(voice_routes(daemon, guard, account, identify))
+
+    # ------------------------------------------------------------------
     # the web interface
     # ------------------------------------------------------------------
     @app.get("/web/config")

@@ -118,3 +118,15 @@ def repo_root() -> Path:
 def python_exe() -> str:
     venv = REPO_ROOT / ".venv" / "bin" / "python"
     return str(venv) if venv.exists() else shutil.which("python3") or "python3"
+
+
+@pytest.fixture
+def voice_config():
+    """The voice section on its own, with the engines that need no models."""
+    from gustav.config.schema import VoiceConfig
+
+    return VoiceConfig(
+        enabled=True,
+        stt={"engine": "null"},
+        tts={"engine": "null"},
+    )
