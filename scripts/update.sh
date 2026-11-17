@@ -18,7 +18,7 @@
 # Nothing here touches the database, the adapters, the weights or your config.
 set -euo pipefail
 
-VERSION="2026-11-17.1"
+VERSION="2026-11-17.2"
 
 exec 3>&1 4>&2
 
@@ -170,6 +170,54 @@ fi
 say "Fetching $REF"
 run git -C "$DIR" fetch --quiet origin "$REF" || fail "could not fetch $REF from origin"
 
+# --- the files that are yours ------------------------------------------------
+# config.yaml is the settings of the gustav in this directory. It is edited on every
+# machine — that is what it is for — and it used to be in the repository as a template,
+# so the first upstream commit to touch it stopped every update dead with "your local
+# changes would be overwritten by merge".
+#
+# `ai update` knows this now, but the `ai update` on a stuck machine is by definition
+# the old one, and this script is the thing you paste into a stuck machine. So it is
+# handled here as well: read the file, put the tracked copy back so nothing can object
+# to it, and write it again at the end. The version that arrives in the update, if it
+# differs, lands beside yours as config.yaml.new rather than over it.
+YOURS=(config.yaml)
+KEPT_DIR=""
+KEPT=()
+if [ "$CHECK" = false ] && [ "$DRY_RUN" = false ]; then
+  for file in "${YOURS[@]}"; do
+    [ -f "$DIR/$file" ] || continue
+    git -C "$DIR" ls-files --error-unmatch "$file" >/dev/null 2>&1 || continue
+    [ -n "$(git -C "$DIR" status --porcelain -- "$file")" ] || continue
+    if [ -z "$KEPT_DIR" ]; then
+      KEPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gustav-yours-XXXXXX")" || break
+    fi
+    mkdir -p "$KEPT_DIR/$(dirname "$file")"
+    cp -p "$DIR/$file" "$KEPT_DIR/$file" || continue
+    git -C "$DIR" checkout -- "$file" || continue
+    KEPT+=("$file")
+    say "Keeping your $file across the update"
+    log "set aside $DIR/$file -> $KEPT_DIR/$file"
+  done
+fi
+
+restore_yours() {
+  [ "${#KEPT[@]}" -gt 0 ] || return 0
+  local file
+  for file in "${KEPT[@]}"; do
+    if [ -f "$DIR/$file" ] && ! cmp -s "$DIR/$file" "$KEPT_DIR/$file"; then
+      cp -p "$DIR/$file" "$DIR/$file.new" 2>/dev/null \
+        && say "  the version from the update is in $file.new"
+    fi
+    cp -p "$KEPT_DIR/$file" "$DIR/$file" && log "put $file back"
+  done
+  rm -rf "$KEPT_DIR"
+  KEPT=()
+}
+# Whatever happens next — a failed merge, a failed pip, a Ctrl-C — the settings go
+# back. A file that was set aside and never restored is the worst outcome available.
+trap 'restore_yours' EXIT
+
 if [ "$CHECK" = false ] && [ "$DRY_RUN" = false ]; then
   if [ "$RESET" = true ]; then
     log "resetting the checkout to origin/$REF"
@@ -202,8 +250,13 @@ fi
 
 say ""
 log "\$ $AI update ${forward[*]:-}"
+update_rc=0
 if [ "$QUIET" = true ]; then
-  "$AI" update "${forward[@]}" < /dev/null || fail "'ai update' did not finish"
+  "$AI" update "${forward[@]}" < /dev/null || update_rc=$?
 else
-  "$AI" update "${forward[@]}" < /dev/null 2>&1 | tee /dev/fd/3 || fail "'ai update' did not finish"
+  "$AI" update "${forward[@]}" < /dev/null 2>&1 | tee /dev/fd/3 || update_rc=$?
 fi
+
+# Before anything restarts, and before this script can exit for any other reason.
+restore_yours
+[ "$update_rc" -eq 0 ] || fail "'ai update' did not finish"

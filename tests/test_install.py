@@ -779,3 +779,81 @@ def test_it_keeps_a_config_that_is_already_there(tmp_path):
     assert result.returncode == 0
     assert "keeping your" in result.stdout
     assert "threshold = 0.07" in config.read_text(encoding="utf-8")
+
+
+# --- the one-liner rescuing a stuck install -------------------------------
+# Reported twice from the same server. config.yaml is the settings of the gustav in
+# that directory and was also in the repository, so an upstream edit to it stopped the
+# update — and the `ai update` on a machine that is stuck is, by definition, the old
+# one that does not know how to get past it. This script is what you paste into a
+# stuck machine, so it has to be the thing that fixes it.
+def a_checkout_whose_config_is_in_the_way(tmp_path) -> Path:
+    checkout = a_checkout_with_an_origin(tmp_path)
+    seed, env = tmp_path / "seed", {
+        **os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    # It was in the repository, so every checkout has a tracked copy…
+    (seed / "config.yaml").write_text("web:\n  enabled: false\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "--quiet", "-m", "a config"],
+                   check=True, env=env)
+    subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "pull", "--quiet", "--ff-only"], check=True)
+
+    # …upstream changes it…
+    (seed / "config.yaml").write_text("web:\n  enabled: true\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "--quiet", "-m", "enable the web"],
+                   check=True, env=env)
+    subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"], check=True)
+
+    # …and so have you.
+    (checkout / "config.yaml").write_text(
+        "web:\n  enabled: true\napi:\n  port: 9000   # mine\n", encoding="utf-8")
+    return checkout
+
+
+def test_the_one_liner_gets_past_a_config_that_was_in_the_way(tmp_path):
+    checkout = a_checkout_whose_config_is_in_the_way(tmp_path)
+    # The `ai update` on a stuck machine is the old one: it does nothing but succeed.
+    fake_ai(checkout, "#!/bin/sh\nexit 0\n")
+
+    result = update_sh("--dir", str(checkout), "--ref", "main", "--no-restart")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # The checkout moved…
+    assert subprocess.run(
+        ["git", "-C", str(checkout), "rev-list", "--count", "HEAD..origin/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip() == "0"
+    # …your settings are still yours…
+    assert "port: 9000" in (checkout / "config.yaml").read_text(encoding="utf-8")
+    # …and theirs is beside it, not on top of it.
+    assert (checkout / "config.yaml.new").read_text(encoding="utf-8") == (
+        "web:\n  enabled: true\n"
+    )
+    assert "Keeping your config.yaml" in result.stdout
+
+
+def test_the_settings_come_back_even_when_the_update_fails(tmp_path):
+    """A file set aside and never put back is the worst outcome available."""
+    checkout = a_checkout_whose_config_is_in_the_way(tmp_path)
+    mine = (checkout / "config.yaml").read_text(encoding="utf-8")
+    fake_ai(checkout, "#!/bin/sh\nif [ \"$2\" = --help ]; then exit 0; fi\nexit 3\n")
+
+    result = update_sh("--dir", str(checkout), "--ref", "main", "--no-restart")
+    assert result.returncode != 0
+    assert (checkout / "config.yaml").read_text(encoding="utf-8") == mine
+
+
+def test_a_config_nobody_has_touched_is_left_alone(tmp_path):
+    checkout = a_checkout_with_an_origin(tmp_path)
+    fake_ai(checkout, "#!/bin/sh\nexit 0\n")
+    (checkout / "config.yaml").write_text("mine: yes\n", encoding="utf-8")   # untracked
+
+    result = update_sh("--dir", str(checkout), "--ref", "main", "--no-restart")
+    assert result.returncode == 0
+    assert (checkout / "config.yaml").read_text(encoding="utf-8") == "mine: yes\n"
+    assert not (checkout / "config.yaml.new").exists()
+    assert "Keeping your" not in result.stdout
