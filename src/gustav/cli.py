@@ -1082,6 +1082,8 @@ def cmd_update(args: argparse.Namespace) -> int:
             print(f"    {line}")
         if len(result.behind) > 10:
             print(f"    … and {len(result.behind) - 10} more")
+        if result.changed:
+            print(f"    {result.changed}")
     elif args.check:
         print("  already up to date")
 
@@ -1091,8 +1093,14 @@ def cmd_update(args: argparse.Namespace) -> int:
 
     print()
     for step in result.steps:
-        print(f"  {step.mark} {step.name:<9}{step.detail}")
+        took = f"  [{step.took}]" if step.took else ""
+        print(f"  {step.mark} {step.name:<9}{step.detail}{took}")
     print()
+    if result.was and result.now and result.was != result.now:
+        print(f"  {result.was} → {result.now}", end="")
+        print(f" in {result.seconds:.1f}s" if result.seconds else "")
+    elif result.seconds:
+        print(f"  nothing moved; {result.seconds:.1f}s")
     print(f"  the log is in {result.log}")
     if not result.ok:
         print("\nthat did not finish; the log has the whole of it", file=sys.stderr)

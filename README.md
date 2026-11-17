@@ -120,8 +120,32 @@ refuses a checkout that has gone its own way rather than installing something el
 code (`--reset` stashes that work and matches the ref, and says which commit it was, so
 nothing becomes unreachable), it puts back files deleted from the tree that the commit
 still has, it byte-compiles the source before declaring success, and it restarts
-`gustav.service` only if it was already running. Every command and all of its output
-goes to `~/.local/state/gustav/update-<date>.log`, next to the installer's.
+`gustav.service` only if it was already running.
+
+**The log is written for the question that actually gets asked a week later** — *what
+changed, and was this machine any different from the one it worked on.* It goes to
+`~/.local/state/gustav/update-<date>.log`, next to the installer's, and the last ten are
+kept. In it:
+
+* **the machine, before anything about it changes** — gustav's version, the user, the
+  host and kernel, the distribution, the interpreter and its path, how much room is
+  left where the checkout lives, and the `PIP_*`/proxy/`CUDA_*` environment pip will
+  see, plus `python -VV` and `pip --version`;
+* **where it started** — the commit, its author and date, the remote, the working tree's
+  state;
+* **what the fetch brought** — not just the subjects: each commit with author and date,
+  and the `--stat` of every file that moved;
+* **every command and all of its output**, with its exit code, pip included and verbose,
+  so a build that failed is in there whole;
+* **what the environment holds afterwards** — `pip list` by version and what `pip check`
+  made of it;
+* **where it ended up**, a one-line `was → now (N files changed, …) in Ns`, and every
+  step repeated with how long it took, so the end of the file is a summary.
+
+Credentials are masked wherever they appear — a token in a remote URL is printed by
+`git remote -v` and by half of pip's output, and this file gets pasted into issues.
+`ai update` prints the short version of the same thing: the commits, the diffstat, the
+steps with their seconds, and `was → now`.
 
 It says what it is doing while it does it — six numbered steps, and a clock with the
 last line of output beside it while pip spends ten minutes on four gigabytes of CUDA —

@@ -152,9 +152,69 @@ def test_a_wheel_install_is_told_it_cannot_be_updated_this_way(tmp_path):
 def test_everything_it_ran_is_in_the_log(checkout, tmp_path):
     update(checkout, tmp_path)
     written = (tmp_path / "update.log").read_text(encoding="utf-8")
-    assert "$ git -C" in written and "fetch" in written
+    assert "$ git fetch" in written
     assert "-> exit 0" in written
-    assert str(checkout) in written
+    assert str(checkout) in written, "the checkout is named once, in the header"
+    assert "$ git -C" not in written, "and not again on every line"
+
+
+def test_the_log_says_what_machine_this_was(checkout, tmp_path):
+    """The question a week later is whether this machine differed from the one it worked on."""
+    update(checkout, tmp_path)
+    written = (tmp_path / "update.log").read_text(encoding="utf-8")
+    for expected in ("--- the machine ", "gustav    ", "user      ", "machine   ",
+                     "python    ", "disk      ", "environment pip will see"):
+        assert expected in written, expected
+    assert "-VV" in written and "pip --version" in written
+
+
+def test_the_log_says_where_it_started_what_moved_and_where_it_ended(checkout, tmp_path):
+    result = update(checkout, tmp_path)
+    written = (tmp_path / "update.log").read_text(encoding="utf-8")
+    assert "--- where it is starting from " in written
+    assert "--- where it ended up " in written
+    assert result.was and result.now and result.was != result.now
+    assert f"finished: {result.was} -> {result.now}" in written
+    # Not just the subjects: the files that moved, and how far.
+    assert "the thing you are missing" in written
+    assert "1 file changed" in written or "files changed" in written
+    assert result.changed, "and the caller can print it too"
+    # Every step is repeated at the end, so the end of the log is a summary.
+    for step in result.steps:
+        assert f"{step.mark} {step.name:<9}" in written
+
+
+def test_a_check_ends_the_log_rather_than_stopping_mid_sentence(checkout, tmp_path):
+    result = update(checkout, tmp_path, check_only=True)
+    written = (tmp_path / "update.log").read_text(encoding="utf-8")
+    assert "finished: --check only, nothing was changed" in written
+    assert result.seconds > 0
+
+
+def test_a_token_in_the_remote_never_reaches_the_log(checkout, tmp_path):
+    """Logs get pasted into issues; `git remote -v` prints whatever is in the URL."""
+    git(checkout, "remote", "set-url", "origin",
+        f"https://x-access-token:s3cr3t@example.invalid/gustav.git")
+    git(checkout, "remote", "add", "real", str(tmp_path / "origin.git"))
+    update(checkout, tmp_path, ref="main")   # the fetch fails; the log still happened
+    written = (tmp_path / "update.log").read_text(encoding="utf-8")
+    assert "s3cr3t" not in written
+    assert "x-access-token" not in written
+    assert "https://***@example.invalid" in written, "masked, not dropped: it is still evidence"
+
+
+def test_old_logs_are_pruned_but_only_the_ones_it_named(tmp_path):
+    from gustav.update import prune_logs
+
+    directory = tmp_path / "state"
+    directory.mkdir()
+    for n in range(14):
+        (directory / f"update-202611{n:02d}-000000.log").write_text("x", encoding="utf-8")
+    (directory / "install-20261101-000000.log").write_text("x", encoding="utf-8")
+    removed = prune_logs(keep=10, directory=directory)
+    assert len(removed) == 4
+    assert len(list(directory.glob("update-*.log"))) == 10
+    assert (directory / "install-20261101-000000.log").exists(), "not the installer's"
 
 
 def test_it_updates_the_checkout_this_ai_runs_from(tmp_path):
