@@ -253,6 +253,81 @@ class WebConfig(Strict):
     owner_panels: bool = True
 
 
+class SttConfig(Strict):
+    """Speech in. Runs on this machine like everything else."""
+
+    #: ``auto`` takes whatever is installed and falls back to nothing; ``whisper`` is
+    #: faster-whisper, which runs on the CPU of a Pi and on the GPU here; ``null`` is
+    #: the deterministic stand-in the tests use.
+    engine: str = "auto"
+    model: str = "base"
+    #: ``auto`` | ``cpu`` | ``cuda``. On this machine the GPU is usually busy holding
+    #: the language model, and whisper-base on CPU is already faster than real time.
+    device: str = "cpu"
+    compute_type: str = "int8"
+    #: Longer than this and it stops listening: a microphone that hears a television
+    #: would otherwise send minutes of audio.
+    max_utterance_seconds: float = 20.0
+    #: What a satellite records at. Whisper wants 16 kHz mono and will resample
+    #: anything else, which costs time nobody has.
+    sample_rate: int = 16000
+
+
+class TtsConfig(Strict):
+    """Speech out."""
+
+    #: ``auto`` | ``piper`` | ``null``. Piper is a few hundred megabytes, runs faster
+    #: than real time on a Pi 4, and sounds like a person.
+    engine: str = "auto"
+    #: A piper voice name, e.g. ``en_GB-alba-medium`` or ``de_DE-thorsten-low``. Empty
+    #: means "whichever voice matches the language".
+    voice: str = ""
+    speed: float = 1.0
+    sample_rate: int = 22050
+
+
+class VoiceConfig(Strict):
+    """Talking to it.
+
+    The whole section is about one number: the gap between someone finishing a
+    sentence and hearing the first syllable of the answer. Everything here that looks
+    like a knob is really a way of not waiting — speaking the first sentence before
+    the rest has been generated, saying something human while the model is still
+    thinking, and giving up on an utterance that has gone on too long.
+    """
+
+    enabled: bool = False
+    #: The language spoken *to* it, which is not the language you type in. Whisper is
+    #: told this instead of guessing (guessing costs a second and gets it wrong on
+    #: short commands), and the voice is picked to match.
+    language: str = "en"
+    #: What it answers in. Empty means "the language that was spoken", which is what
+    #: you want unless you are practising one.
+    reply_language: str = ""
+    stt: SttConfig = SttConfig()
+    tts: TtsConfig = TtsConfig()
+    #: If the model has not produced a word by this point, say something. Not a trick:
+    #: a person who is thinking says "hmm" too, and silence on a speaker reads as
+    #: broken rather than busy.
+    filler_after_ms: int = 350
+    #: What to say. Empty means the built-in phrases for `language`.
+    fillers: list[str] = []
+    #: Speak each sentence as it is finished rather than waiting for the whole answer.
+    #: This is the single biggest win in the budget and there is no reason to turn it
+    #: off except to hear what it sounds like without.
+    stream_sentences: bool = True
+    #: Stop talking the moment the person starts. Without it they have to wait out a
+    #: wrong answer, which is the most irritating thing a speaker can do.
+    barge_in: bool = True
+    #: Only answer when the transcript starts with one of these. Empty: answer
+    #: everything the satellite sends, and let the satellite's own silence detection
+    #: decide what is a question.
+    wake_words: list[str] = []
+    #: How long an answer may be when it is going to be spoken. Speech is slow and
+    #: nobody wants eight paragraphs read to them.
+    max_reply_tokens: int = 160
+
+
 class ToolsConfig(Strict):
     """Section 11: tools the system writes for itself.
 
@@ -550,6 +625,7 @@ class Config(Strict):
     inference: dict[str, Any] = {}
     api: ApiConfig = ApiConfig()
     web: WebConfig = WebConfig()
+    voice: VoiceConfig = VoiceConfig()
     tools: ToolsConfig = ToolsConfig()
     expansion: ExpansionConfig = ExpansionConfig()
     optimisation: OptimisationConfig = OptimisationConfig()

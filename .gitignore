@@ -8,4 +8,9 @@ backups/
 adapters/
 models/
 profiles/auto-generated.yaml
+# The settings of the gustav that lives in this checkout. It is yours, it is edited on
+# every machine, and while it was tracked an upstream edit to it stopped every update
+# with "your local changes would be overwritten by merge". `ai init` writes it from
+# src/gustav/data/config.yaml, which is the template.
+config.yaml
 .coverage

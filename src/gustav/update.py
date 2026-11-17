@@ -44,6 +44,28 @@ class UpdateError(RuntimeError):
     """Something the person has to decide about, said plainly."""
 
 
+#: Files in the checkout that belong to whoever runs it, not to the project.
+#:
+#: ``config.yaml`` is the settings of the gustav that lives in this directory — it is
+#: edited on every machine, by definition — and it was also in the repository as a
+#: template. So the day an upstream commit touched it, every update everywhere stopped
+#: dead with "your local changes would be overwritten by merge". It is no longer
+#: tracked, and this list is what carries the ones that still are across the pull.
+YOURS = ("config.yaml",)
+
+
+def _yours(porcelain: list[str]) -> list[str]:
+    """The dirty files from `git status --porcelain` that are the person's."""
+    found = []
+    for line in porcelain:
+        path = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in path:          # a rename; not something to second-guess
+            continue
+        if path in YOURS:
+            found.append(path)
+    return found
+
+
 # --- where the log goes ------------------------------------------------------
 
 
@@ -370,12 +392,28 @@ def _run(
     if not can_fast_forward and not reset:
         raise UpdateError(
             f"{root} cannot be fast-forwarded to origin/{ref}.\n"
+            + ("  (your config.yaml is not the problem; that one is kept either way)\n"
+               if _yours(local) else "")
             + (f"  {commits_ahead} commit(s) of its own\n" if commits_ahead else "")
             + ("".join(f"  {line}\n" for line in local) if local else "")
             + f"Pass --reset to match origin/{ref}: uncommitted work goes to a git stash,\n"
             + "and it tells you the commit this was on so nothing becomes unreachable.\n"
             + "Or sort it out by hand and run it again."
         )
+
+    # Whatever is the person's is carried over the pull rather than standing in its
+    # way. Read first, then put the tracked copy back so git has nothing to object to.
+    yours: dict[str, str] = {}
+    if not dry_run:
+        for path in _yours(local):
+            try:
+                yours[path] = (root / path).read_text(encoding="utf-8")
+            except OSError as exc:
+                transcript.write(f"could not read {path}, leaving it alone: {exc}")
+        if yours:
+            transcript.section("setting your own files aside")
+            for path in yours:
+                _git(root, "checkout", "--", path, transcript=transcript)
 
     transcript.section("pull")
     at = time.monotonic()
@@ -415,6 +453,31 @@ def _run(
                  f"{len(state.behind)} commit(s)" + (f", {state.changed}" if state.changed else ""),
                  time.monotonic() - at)
         )
+
+    if yours:
+        transcript.section("putting your own files back")
+        restored, fresh = [], []
+        for path, text in yours.items():
+            target = root / path
+            # If the commit that just arrived has its own version, it is kept *beside*
+            # yours rather than over it: nobody wants their settings replaced, and
+            # nobody wants to be told nothing changed either.
+            incoming = None
+            try:
+                incoming = target.read_text(encoding="utf-8")
+            except OSError:
+                pass
+            if incoming is not None and incoming != text:
+                (root / f"{path}.new").write_text(incoming, encoding="utf-8")
+                fresh.append(f"{path}.new")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+            restored.append(path)
+            transcript.write(f"kept your {path}" + (f"; theirs is in {path}.new" if fresh else ""))
+        detail = f"kept your {', '.join(sorted(restored))}"
+        if fresh:
+            detail += f"; the version from the update is in {', '.join(sorted(fresh))}"
+        state.steps.append(Step("yours", "done", detail))
 
     # The hole a fast-forward leaves behind.
     if not dry_run:

@@ -122,6 +122,15 @@ nothing becomes unreachable), it puts back files deleted from the tree that the 
 still has, it byte-compiles the source before declaring success, and it restarts
 `gustav.service` only if it was already running.
 
+**Your `config.yaml` is yours.** It is the settings of the gustav in that directory,
+so it is edited on every machine there is — and it is not in the repository, precisely
+so that an upstream edit to the template can never stop your update with *"your local
+changes would be overwritten by merge"*. `ai init` writes it the first time from the
+template in `src/gustav/data/config.yaml`; after that nothing upstream touches it. For
+the checkouts that still have a tracked copy, `ai update` carries it across the pull
+and, if the incoming version differs, leaves that beside it as `config.yaml.new`
+instead of over it.
+
 **The log is written for the question that actually gets asked a week later** — *what
 changed, and was this machine any different from the one it worked on.* It goes to
 `~/.local/state/gustav/update-<date>.log`, next to the installer's, and the last ten are

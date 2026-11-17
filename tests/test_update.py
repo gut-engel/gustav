@@ -222,3 +222,75 @@ def test_it_updates_the_checkout_this_ai_runs_from(tmp_path):
     root = install_root()
     assert (root / "pyproject.toml").exists()
     assert (root / "src" / "gustav" / "update.py").exists()
+
+
+# --- the file that is yours ----------------------------------------------
+# Reported from a real server: `ai update` stopped dead with "Your local changes to
+# the following files would be overwritten by merge: config.yaml". Of course they
+# would — config.yaml is the settings of the gustav in that directory, so it is
+# edited on every machine there is, and it was also in the repository as a template.
+def test_your_settings_do_not_stop_the_update(checkout, tmp_path):
+    """The exact failure: upstream edits config.yaml, you have edited it too."""
+    seed = tmp_path / "seed"
+    # It was in the repository once, so everyone's checkout has a tracked copy.
+    (seed / "config.yaml").write_text("web:\n  enabled: true   # theirs\n", encoding="utf-8")
+    git(seed, "add", "-A")
+    git(seed, "commit", "--quiet", "-m", "a config in the repository")
+    git(seed, "push", "--quiet", "origin", "main")
+    git(checkout, "pull", "--quiet", "--ff-only", "origin", "main")
+
+    # Upstream changes it...
+    (seed / "config.yaml").write_text("web:\n  enabled: false  # theirs\n", encoding="utf-8")
+    git(seed, "add", "-A")
+    git(seed, "commit", "--quiet", "-m", "upstream touches the template")
+    git(seed, "push", "--quiet", "origin", "main")
+    # ...and so have you.
+    (checkout / "config.yaml").write_text(
+        "web:\n  enabled: true   # mine, with a port\napi:\n  port: 9000\n", encoding="utf-8")
+
+    result = update(checkout, tmp_path)
+
+    assert result.ok, [(s.name, s.status, s.detail) for s in result.steps]
+    assert (checkout / "config.yaml").read_text(encoding="utf-8").endswith("port: 9000\n")
+    # And you are told that theirs exists, rather than it being thrown away silently.
+    assert (checkout / "config.yaml.new").read_text(encoding="utf-8") == (
+        "web:\n  enabled: false  # theirs\n"
+    )
+    step = next(s for s in result.steps if s.name == "yours")
+    assert "kept your config.yaml" in step.detail
+    assert "config.yaml.new" in step.detail
+
+
+def test_a_config_only_the_person_has_is_simply_left_alone(checkout, tmp_path):
+    """The normal case after this: it is not tracked, so nothing is in the way."""
+    (checkout / "config.yaml").write_text("mine: yes\n", encoding="utf-8")
+    result = update(checkout, tmp_path)
+    assert result.ok
+    assert (checkout / "config.yaml").read_text(encoding="utf-8") == "mine: yes\n"
+    assert not (checkout / "config.yaml.new").exists()
+
+
+def test_other_local_changes_still_stop_it(checkout, tmp_path):
+    """Only the files that are *yours* get this treatment. Source does not."""
+    (checkout / "src" / "needed.py").write_text("x = 'mine'\n", encoding="utf-8")
+    (checkout / "src" / "later.py").write_text("y = 'mine'\n", encoding="utf-8")
+    git(checkout, "add", "-A")
+    git(checkout, "commit", "--quiet", "-m", "a commit of my own")
+    with pytest.raises(UpdateError) as refused:
+        update(checkout, tmp_path)
+    assert "cannot be fast-forwarded" in str(refused.value)
+
+
+def test_the_settings_file_is_not_in_the_repository(repo_root):
+    """Belt as well as braces: the collision cannot happen again if it is not tracked."""
+    import subprocess
+
+    tracked = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-files", "config.yaml"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert tracked == "", "config.yaml is the person's settings, not the project's"
+    ignored = (repo_root / ".gitignore").read_text(encoding="utf-8")
+    assert "config.yaml" in ignored
+    # And the template it is written from still ships.
+    assert (repo_root / "src" / "gustav" / "data" / "config.yaml").is_file()

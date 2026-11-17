@@ -49,10 +49,19 @@ def test_profile_is_merged(tmp_path):
     assert config.hardware.balance == 0.5
 
 
-def test_real_preset_profiles_load(repo_root):
+def test_real_preset_profiles_load(repo_root, tmp_path):
+    """The shipped template, beside the shipped profiles, the way `ai init` lays them out.
+
+    Not the checkout's own config.yaml: that one is the settings of whoever is running
+    it and is not in the repository at all.
+    """
+    import shutil
+
+    shutil.copy(repo_root / "src" / "gustav" / "data" / "config.yaml", tmp_path / "config.yaml")
+    shutil.copytree(repo_root / "profiles", tmp_path / "profiles")
     for name in ("small-12gb", "tiny-4gb", "server-multigpu"):
         config, _ = load_config(
-            repo_root / "config.yaml", overrides={"hardware": {"profile": name}}
+            tmp_path / "config.yaml", overrides={"hardware": {"profile": name}}
         )
         assert config.hardware.plan["base_model"]
         assert config.hardware.profile == name
