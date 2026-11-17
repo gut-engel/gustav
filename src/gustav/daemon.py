@@ -1403,6 +1403,31 @@ class Daemon:
             return {"ok": False, "model": spec.id, "error": result.error,
                     "outcome": str(result.outcome)}
         payload = result.payload or {}
+        # The child can finish without an error and still leave a checkpoint that
+        # cannot be loaded — a weight file that never arrived is the usual one. Saying
+        # "done" then is how someone ends up pulling the same model twice and still
+        # being told, by the chat box, that the model is not available.
+        if not payload.get("complete", False):
+            missing = payload.get("missing") or ["unknown"]
+            size = payload.get("size_mb", 0) / 1024
+            self.events.emit(
+                "model.pull.incomplete",
+                f"{spec.repo}: {', '.join(missing)} did not arrive ({size:.2f} GiB on disk)",
+                level="error",
+                model=spec.id,
+            )
+            return {
+                "ok": False,
+                "model": spec.id,
+                "error": (
+                    f"the download finished but the checkpoint is not complete: "
+                    f"{', '.join(missing)} is missing from {payload.get('path', destination)} "
+                    f"({size:.2f} GiB on disk). Run the same command again — it resumes — "
+                    f"and if it keeps stopping at the same size, the weight file is what "
+                    f"your network is refusing."
+                ),
+                **payload,
+            }
         self.events.emit(
             "model.pull.done",
             f"{spec.repo} fetched ({payload.get('size_mb', 0) / 1024:.2f} GiB)",

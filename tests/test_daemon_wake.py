@@ -223,3 +223,30 @@ async def test_the_model_listing_shows_the_ladder(client):
 async def test_pulling_an_unknown_model_is_a_404(client):
     response = await client.post("/models/pull", json={"model_id": "llama-900b"})
     assert response.status_code == 404
+
+
+async def test_a_pull_that_leaves_a_hole_is_not_reported_as_done(client, daemon, monkeypatch):
+    """A weight file that never arrived is a failed pull, whatever the child says."""
+    from gustav.core.supervisor import ChildResult, Outcome
+
+    async def half_a_download(spec):
+        return ChildResult(
+            outcome=Outcome.OK,
+            payload={
+                "repo": "Qwen/Qwen3-0.6B",
+                "path": str(daemon.paths.models / "qwen3-0.6b"),
+                "size_mb": 32.0,
+                "complete": False,
+                "missing": ["model.safetensors"],
+            },
+        )
+
+    monkeypatch.setattr(daemon.supervisor, "run", half_a_download)
+    payload = (await client.post("/models/pull", json={"model_id": "qwen3-0.6b"})).json()
+
+    assert payload["ok"] is False
+    assert "model.safetensors" in payload["error"]
+    assert payload["missing"] == ["model.safetensors"]
+    assert any(
+        event["kind"] == "model.pull.incomplete" for event in daemon.events.recent(limit=10)
+    ), "and it is in the events, at error level"

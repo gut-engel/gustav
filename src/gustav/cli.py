@@ -350,6 +350,8 @@ def cmd_model(args: argparse.Namespace, client: Client) -> int:
     result = client.post("/models/pull", json={"model_id": args.model_id})
     if not result.get("ok"):
         print(f"failed: {result.get('error')}", file=sys.stderr)
+        for name in result.get("missing") or []:
+            print(f"  missing: {name}", file=sys.stderr)
         return 1
     print(f"done: {result['path']} ({result['size_mb'] / 1024:.2f} GiB)")
     return 0
