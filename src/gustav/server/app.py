@@ -909,14 +909,9 @@ def create_app(daemon: "Daemon") -> FastAPI:
         }
 
     if daemon.config.web.enabled:
-        # Registered last, so every API route above wins over the static files. The
-        # three files are served as they are; everything they show comes from the same
-        # endpoints the CLI calls, under the same identity rules.
-        from fastapi.staticfiles import StaticFiles
-
         root = Path(__file__).resolve().parent.parent / "web"
         if root.is_dir():
-            app.mount("/", StaticFiles(directory=str(root), html=True), name="web")
+            _serve_web(app, root, daemon)
         else:  # pragma: no cover - only if the package was installed without its data
             daemon.events.emit(
                 "web.missing",
@@ -925,3 +920,64 @@ def create_app(daemon: "Daemon") -> FastAPI:
             )
 
     return app
+
+
+def _asset_stamp(root: Path) -> str:
+    """A number that changes whenever the interface does.
+
+    The newest mtime of the three files, which after `ai update` is the moment the
+    checkout moved. Used as a query string, so a browser holding yesterday's
+    stylesheet is asked for a URL it has never seen rather than politely offered one
+    it thinks it already has.
+    """
+    newest = 0.0
+    for name in ("index.html", "styles.css", "app.js"):
+        try:
+            newest = max(newest, (root / name).stat().st_mtime)
+        except OSError:
+            continue
+    return str(int(newest))
+
+
+def _serve_web(app: FastAPI, root: Path, daemon: "Daemon") -> None:
+    """The page, and the two files it asks for.
+
+    Registered last, so every API route above wins over the static files. Everything
+    the page shows comes from the same endpoints the CLI calls, under the same
+    identity rules.
+
+    The caching is the fiddly part, and getting it wrong looks like a catastrophe.
+    Starlette's StaticFiles sends ETag and Last-Modified but no Cache-Control, which
+    leaves the browser free to invent a freshness lifetime of its own — the usual
+    heuristic is a tenth of the file's age, so a stylesheet that has been on disk a
+    fortnight is considered fresh for a day and a half. Update the daemon and the
+    browser then pairs the new HTML, which it does revalidate, with the old CSS, which
+    it does not ask about: every class renames itself under your feet and the page
+    arrives looking like the stylesheet never loaded.
+
+    So: `no-cache` on all of it — which does not mean "do not store", it means "ask
+    first", and the answer is a 304 of a couple of hundred bytes on a LAN — and the
+    page's own references carry ?v=<mtime>, which rescues a browser that already has
+    the stale copy and would not otherwise ask until its invented lifetime ran out.
+    """
+    from fastapi.responses import HTMLResponse
+    from fastapi.staticfiles import StaticFiles
+
+    class Fresh(StaticFiles):
+        async def get_response(self, path: str, scope):  # type: ignore[override]
+            response = await super().get_response(path, scope)
+            response.headers.setdefault("cache-control", "no-cache, must-revalidate")
+            return response
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/index.html", include_in_schema=False)
+    async def page() -> HTMLResponse:
+        stamp = _asset_stamp(root)
+        html = (root / "index.html").read_text(encoding="utf-8")
+        html = html.replace('href="styles.css"', f'href="styles.css?v={stamp}"')
+        html = html.replace('src="app.js"', f'src="app.js?v={stamp}"')
+        return HTMLResponse(
+            html, headers={"cache-control": "no-cache, must-revalidate"}
+        )
+
+    app.mount("/", Fresh(directory=str(root), html=True), name="web")

@@ -199,3 +199,17 @@ def test_the_brief_prompt_switches_off_with_the_same_switches():
     assert "/tool" not in caps.brief_prompt(caps.Capabilities(authoring=False))
     assert "No tools" not in caps.brief_prompt(caps.Capabilities(tools_enabled=False))
     assert "learning is paused" in caps.brief_prompt(caps.Capabilities(learning_paused=True))
+
+
+# --- what it must not do with any of this --------------------------------
+def test_it_is_not_handed_a_sentence_about_itself_to_recite():
+    """A 0.6B model given "your weights are X plus adapters" opens every answer with it."""
+    text = caps.system_prompt(caps.Capabilities(base_model="Qwen/Qwen3-0.6B"))
+    assert "Qwen/Qwen3-0.6B" not in text
+    assert "Your weights are" not in text
+
+
+def test_it_is_told_not_to_open_with_what_it_is():
+    for text in (prompt(), caps.brief_prompt(caps.Capabilities())):
+        assert "As a model" in text and "Never open with what you are" in text
+        assert "Start with the answer" in text or "start with the answer" in text

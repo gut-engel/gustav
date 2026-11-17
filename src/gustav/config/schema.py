@@ -209,13 +209,17 @@ class TunableConfig(Strict):
 class ApiConfig(Strict):
     """The TCP API: what the remote CLI and the web interface talk to.
 
-    **Off by default, and that is the point.** Everything the daemon can do is already
-    reachable over the Unix socket, where the filesystem decides who may ask. Opening a
-    port means the network may ask, so it is a deliberate act — and once it is open,
-    every request has to say who it is from.
+    **On, on loopback, with accounts.** An assistant you cannot open in a browser is an
+    assistant nobody uses, so the port is open by default — but only to this machine
+    (``host: 127.0.0.1``), and every request over it still has to say who it is from.
+    Reaching it from another machine is the deliberate act: that is changing ``host``,
+    which is a line you type on purpose.
+
+    Everything is also reachable over the Unix socket, where the filesystem decides who
+    may ask and no password is needed. That is still how the owner's `ai` talks to it.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     host: str = "127.0.0.1"
     port: int = 8713
     #: Accounts with passwords, tokens and sessions. With this off, the only way in is
@@ -235,9 +239,14 @@ class ApiConfig(Strict):
 
 
 class WebConfig(Strict):
-    """The web interface, served by the daemon from the package. Off by default."""
+    """The web interface, served by the daemon from the package.
 
-    enabled: bool = False
+    On by default, and reachable at http://127.0.0.1:8713/ as soon as the daemon is up.
+    It is served by the same listener as the API, under the same identity rules, so it
+    is exactly as exposed as ``api.host`` says and no more.
+    """
+
+    enabled: bool = True
     title: str = "gustav"
     #: Show the owner's panels (status, tools review, approvals) in the browser. Owner
     #: accounts only either way; this hides them entirely.

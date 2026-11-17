@@ -411,20 +411,41 @@ class Daemon:
                     "the API is reachable from the network with accounts switched off; "
                     "everyone who has instance.http_token is the owner"
                 )
-            tcp_server = _Server(
-                uvicorn.Config(
-                    app,
+            # The port is bound here rather than inside uvicorn, because uvicorn's
+            # answer to a port it cannot have is sys.exit(3) — inside a task, that is
+            # the whole daemon gone. Since the API is on by default, "something else
+            # is on 8713" is now an ordinary thing to happen (a second project, a
+            # daemon that has not finished shutting down), and it must cost the TCP
+            # listener and nothing else: the socket is still there, and `ai` uses it.
+            listener = _bind(host, port)
+            if listener is None:
+                self.log.error(
+                    "the API port %s:%s is already in use, so it was not opened. "
+                    "Another gustav, most likely — `ai status` over the socket still "
+                    "works. Change api.port, or stop the other one.",
+                    host, port,
+                )
+                self.events.emit(
+                    "api.port_busy",
+                    f"{host}:{port} is already in use; the API and the web interface "
+                    f"are not reachable over the network this run",
+                    level="error",
                     host=host,
                     port=port,
-                    log_level=level,
-                    access_log=False,
                 )
-            )
-            self._servers.append(tcp_server)
-            self._tasks.append(asyncio.create_task(tcp_server.serve(), name="tcp-server"))
-            if self.config.web.enabled:
-                shown = "localhost" if host in ("0.0.0.0", "::") else host
-                self.log.info("the web interface is at http://%s:%s/", shown, port)
+            else:
+                tcp_server = _Server(
+                    uvicorn.Config(app, log_level=level, access_log=False)
+                )
+                self._servers.append(tcp_server)
+                self._tasks.append(
+                    asyncio.create_task(
+                        tcp_server.serve(sockets=[listener]), name="tcp-server"
+                    )
+                )
+                if self.config.web.enabled:
+                    shown = "localhost" if host in ("0.0.0.0", "::") else host
+                    self.log.info("the web interface is at http://%s:%s/", shown, port)
         elif self.config.web.enabled:
             # Worth saying out loud: the socket cannot be browsed, so the interface is
             # switched on and reachable by nobody.
@@ -2015,6 +2036,30 @@ def _socket_ready(path: Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def _bind(host: str, port: int) -> socket.socket | None:
+    """A listening socket, or None if the address is taken.
+
+    Returned rather than raised: a busy port is a thing to tell someone about, not a
+    reason for a daemon holding a model in VRAM to exit.
+    """
+    try:
+        info = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )[0]
+    except socket.gaierror:
+        return None
+    sock = socket.socket(info[0], socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(info[4])
+        sock.listen(2048)
+    except OSError:
+        sock.close()
+        return None
+    sock.set_inheritable(True)
+    return sock
 
 
 def _version() -> str:

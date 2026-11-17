@@ -54,6 +54,16 @@ const ICONS = {
   system: "M4 7h9|M17.5 7h2.5|M4 17h3.5|M12 17h8|M13 4v6|M7.5 14v6",
   close: "M6.5 6.5l11 11|M17.5 6.5l-11 11",
   alert: "M12 4l9 16H3z|M12 10v4.5|M12 17.4h.01",
+  kebab: "M12 5.5h.01|M12 12h.01|M12 18.5h.01",
+  chevdown: "M6 10l6 6 6-6",
+  models: "M12 3l8 4.5v9L12 21l-8-4.5v-9z|M4 7.5l8 4.5 8-4.5|M12 12v9",
+  hardware: "M8 4h8v16H8z|M4 8h4|M4 12h4|M4 16h4|M16 8h4|M16 12h4|M16 16h4",
+  runs: "M20.5 14.5A8.5 8.5 0 019.5 3.5a7.5 7.5 0 1011 11z",
+  backups: "M3 7h18v4H3z|M5 11v9h14v-9|M10 15h4",
+  users: "M8.5 11a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4z|M2.5 20c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"
+         + "|M16.5 11.5a3 3 0 100-6|M17 14.7c2.6.4 4.5 2.4 4.5 5.3",
+  events: "M4 6h16|M4 12h16|M4 18h10",
+  plus: "M12 5v14|M5 12h14",
 };
 
 function icon(name, size = 16) {
@@ -151,6 +161,10 @@ const state = {
   streaming: null,   // the AbortController of the answer being streamed
   owner: false,
   systemAt: "",      // what the System panel was last built from
+  model: "",         // what the top bar says is answering
+  //: Whether the thread should follow the newest message. True until someone scrolls
+  //: up to read something, which is the only reason not to.
+  pinned: true,
 };
 
 /* --- transport -------------------------------------------------------- */
@@ -246,15 +260,17 @@ $("#theme").addEventListener("click", () => {
 /* --- boot ------------------------------------------------------------- */
 async function boot() {
   applyTheme(remember.get("theme", "auto"));
-  for (const [id, name] of [["#collapse", "collapse"], ["#new-chat", "plus"], ["#menu", "menu"]]) {
+  for (const [id, name] of [["#collapse", "collapse"], ["#new-chat", "plus"],
+                           ["#menu", "menu"], ["#to-bottom", "chevdown"],
+                           ["#commands", "plus"]]) {
     $(id).replaceChildren(icon(name));
   }
   $("#search-wrap").firstElementChild.replaceChildren(icon("search", 14));
   $("#send").replaceChildren(icon("send"));
   for (const button of document.querySelectorAll("#workspace button")) {
-    const names = { facts: "Facts", skills: "Skills", tools: "Tools", system: "System" };
-    button.replaceChildren(icon(button.dataset.view), el("span", "", names[button.dataset.view]));
-    button.addEventListener("click", () => show(button.dataset.view));
+    const view = button.dataset.view;
+    button.replaceChildren(icon(view), el("span", "", (PANELS[view] || [view])[0]));
+    button.addEventListener("click", () => show(view));
   }
 
   try {
@@ -353,6 +369,19 @@ async function refreshState() {
   const fingerprint = `${health.state}|${status.load_error || ""}|${status.learning_paused}`;
   if (state.view === "system" && fingerprint !== state.systemAt) loadSystem();
   state.systemAt = fingerprint;
+
+  // Which weights answered is the first question anyone has about an answer, so it
+  // goes where OpenWebUI puts its model selector.
+  const model = status.model || {};
+  const name = model.base_model || model.responder || "";
+  const adapters = Object.entries(model.adapters || {});
+  state.model = name;
+  const chip = $("#model-chip");
+  chip.replaceChildren(icon("models", 14), el("span", "", name || "no model"));
+  chip.title = adapters.length
+    ? `adapters: ${adapters.map(([m, v]) => `${m} ${v}`).join(", ")}`
+    : "no adapters loaded";
+  chip.hidden = state.view !== "chat" || !name;
 }
 
 function setChip(name, title) {
@@ -369,8 +398,10 @@ function banner(what) {
   const node = $("#banner");
   // It appears above the thread and takes two lines with it, so a conversation that
   // was sitting at the bottom would quietly end up a paragraph short of it.
-  const pinned = nearBottom();
-  const settle = () => { if (pinned) scrollDown(true); };
+  // Asked of the flag, not of the scroll position: the banner arrives a moment after
+  // the thread is rendered and before the browser has laid it out, so the position
+  // at this instant says nothing about whether anyone is reading halfway up.
+  const settle = () => { if (state.pinned && state.view === "chat") scrollDown(true); };
   if (!what) {
     node.hidden = true;
     node.replaceChildren();
@@ -404,7 +435,25 @@ function banner(what) {
 }
 
 /* --- views ------------------------------------------------------------ */
-const VIEWS = ["chat", "facts", "skills", "tools", "system"];
+const VIEWS = [
+  "chat", "facts", "skills", "tools",
+  "system", "models", "hardware", "runs", "backups", "users", "events",
+];
+
+//: What each panel is called, and what loads it. One place, so adding a panel is one
+//: line here and one <section> in the page.
+const PANELS = {
+  facts: ["Facts", () => loadFacts()],
+  skills: ["Skills", () => loadSkills()],
+  tools: ["Tools", () => loadTools()],
+  system: ["System", () => loadSystem()],
+  models: ["Models", () => loadModels()],
+  hardware: ["Hardware", () => loadHardware()],
+  runs: ["Runs", () => loadRuns()],
+  backups: ["Backups", () => loadBackups()],
+  users: ["Users", () => loadUsers()],
+  events: ["Events", () => loadEvents()],
+};
 
 function show(view) {
   state.view = view;
@@ -419,17 +468,15 @@ function show(view) {
   for (const button of document.querySelectorAll("#workspace button")) {
     button.setAttribute("aria-current", String(button.dataset.view === view));
   }
-  const names = { chat: "", facts: "Facts", skills: "Skills", tools: "Tools", system: "System" };
-  if (view !== "chat") {
-    $("#chat-title").textContent = names[view];
+  const panel = PANELS[view];
+  if (panel) {
+    $("#chat-title").textContent = panel[0];
     $("#chat-sub").textContent = "";
+    panel[1]();
   } else {
     showChatTitle();
   }
-  if (view === "facts") loadFacts();
-  if (view === "skills") loadSkills();
-  if (view === "tools") loadTools();
-  if (view === "system") loadSystem();
+  $("#model-chip").hidden = view !== "chat" || !state.model;
   closeSidebarOnNarrow();
 }
 
@@ -531,17 +578,39 @@ function chatRow(chat) {
   open.addEventListener("click", () => openChat(chat.id));
   row.append(open);
 
-  const rename = el("button", "drop", "");
-  rename.append(icon("pencil", 14));
-  rename.title = "Rename";
-  rename.addEventListener("click", async (event) => {
+  // One kebab rather than a row of icons: the second icon is always the one you did
+  // not mean to press, and on a touchscreen it is the only one you can hit.
+  const kebab = el("button", "drop", "");
+  kebab.append(icon("kebab", 15));
+  kebab.title = "More";
+  kebab.setAttribute("aria-haspopup", "true");
+  kebab.addEventListener("click", (event) => {
     event.stopPropagation();
+    rowMenu(chat, row, kebab);
+  });
+  row.append(kebab);
+  row.setAttribute("aria-current", String(state.current === chat.id));
+  return row;
+}
+
+function rowMenu(chat, row, anchorEl) {
+  const open = document.querySelector(".row-menu");
+  if (open) {
+    open.remove();
+    document.querySelector(".chat-item.menu-open")?.classList.remove("menu-open");
+    if (open.dataset.chat === String(chat.id)) return;
+  }
+  const menu = el("div", "row-menu");
+  menu.dataset.chat = String(chat.id);
+  row.classList.add("menu-open");
+
+  const rename = el("button", "", "");
+  rename.append(icon("pencil", 15), el("span", "", "Rename"));
+  rename.addEventListener("click", async () => {
+    close();
     const title = await sheet({
-      title: "Rename this chat",
-      value: chat.title || "",
-      confirm: "Rename",
-      multiline: false,
-      label: "Title",
+      title: "Rename this chat", value: chat.title || "", confirm: "Rename",
+      multiline: false, label: "Title",
     });
     if (title === null || !title.trim()) return;
     try {
@@ -551,11 +620,10 @@ function chatRow(chat) {
     } catch (error) { toast(error.message, "bad"); }
   });
 
-  const drop = el("button", "drop", "");
-  drop.append(icon("trash", 14));
-  drop.title = "Archive this chat";
-  drop.addEventListener("click", async (event) => {
-    event.stopPropagation();
+  const archive = el("button", "bad", "");
+  archive.append(icon("trash", 15), el("span", "", "Archive"));
+  archive.addEventListener("click", async () => {
+    close();
     if (!await confirmSheet(
       "Archive this chat?",
       "It leaves the list. Nothing it taught the model is undone — what was learned stays learned.",
@@ -570,9 +638,21 @@ function chatRow(chat) {
     renderThread();
   });
 
-  row.append(rename, drop);
-  row.setAttribute("aria-current", String(state.current === chat.id));
-  return row;
+  menu.append(rename, archive);
+  document.body.append(menu);
+  const box = anchorEl.getBoundingClientRect();
+  menu.style.top = `${Math.min(box.bottom + 4, window.innerHeight - menu.offsetHeight - 8)}px`;
+  menu.style.left = `${Math.min(box.left, window.innerWidth - menu.offsetWidth - 8)}px`;
+
+  function close() {
+    menu.remove();
+    row.classList.remove("menu-open");
+    document.removeEventListener("click", onAway, true);
+  }
+  function onAway(event) {
+    if (!menu.contains(event.target)) close();
+  }
+  setTimeout(() => document.addEventListener("click", onAway, true), 0);
 }
 
 $("#search").addEventListener("input", (event) => {
@@ -609,6 +689,7 @@ $("#new-chat").addEventListener("click", async () => {
 /* --- the thread ------------------------------------------------------- */
 function renderThread() {
   const thread = $("#thread");
+  state.pinned = true;
   thread.replaceChildren();
   if (!state.messages.length) {
     thread.append(greeting());
@@ -945,12 +1026,69 @@ function nearBottom() {
 
 function scrollDown(force) {
   const scroll = $("#thread-scroll");
-  if (!force && !nearBottom()) return;
+  if (force) state.pinned = true;
+  if (!force && !state.pinned) return;
   scroll.scrollTop = scroll.scrollHeight;
   // scrollHeight is only final once the browser has laid the thread out, and a long
   // conversation is never laid out by the time the fetch that produced it returns.
   requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
 }
+
+$("#thread-scroll").addEventListener("scroll", () => {
+  state.pinned = nearBottom();
+  $("#to-bottom").hidden = state.pinned || state.view !== "chat";
+});
+$("#to-bottom").addEventListener("click", () => {
+  state.pinned = true;
+  const scroll = $("#thread-scroll");
+  scroll.scrollTo({ top: scroll.scrollHeight, behavior: "smooth" });
+  $("#to-bottom").hidden = true;
+});
+
+$("#new-chat-full").addEventListener("click", () => $("#new-chat").click());
+
+/* The composer's + is OpenWebUI's attachment button, which this has no use for: here
+   it opens the commands, which are the thing people do not discover otherwise. */
+const COMMAND_HELP = [
+  ["/tool ", "have a tool written tonight — say what it should do"],
+  ["/tools", "what it can call right now"],
+  ["/good", "that answer was good — train on it tonight"],
+  ["/bad", "that answer was wrong"],
+  ["/correct ", "say what it should have answered"],
+  ["/forget", "never train on the last exchange"],
+  ["/clear", "start a fresh conversation"],
+  ["/help", "the whole list, from the daemon"],
+];
+
+$("#commands").addEventListener("click", (event) => {
+  event.stopPropagation();
+  const menu = $("#command-menu");
+  if (!menu.hidden) {
+    menu.hidden = true;
+    return;
+  }
+  menu.replaceChildren();
+  for (const [command, why] of COMMAND_HELP) {
+    const row = el("button", "", "");
+    row.append(el("code", "", command.trim()), el("small", "", why));
+    row.addEventListener("click", () => {
+      const input = $("#input");
+      input.value = command;
+      menu.hidden = true;
+      if (command.endsWith(" ")) {
+        input.focus();
+        input.setSelectionRange(command.length, command.length);
+      } else {
+        send();
+      }
+    });
+    menu.append(row);
+  }
+  menu.hidden = false;
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#commands, #command-menu")) $("#command-menu").hidden = true;
+});
 
 $("#composer-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1345,6 +1483,13 @@ function loadSystem() {
     controls.append(control(status.learning_paused ? "Resume learning" : "Pause learning",
       "/control/learning", { paused: !status.learning_paused }));
     controls.append(control("Release the GPU", "/control/release-gpu"));
+    controls.append(action("Shut the daemon down", async () => {
+      await api("/control/shutdown", { body: {} });
+      return "shutting down — this page will go quiet";
+    }, { confirm: ["Shut the daemon down?",
+                   "It checkpoints anything running, hands the GPU back and stops. "
+                   + "Starting it again is `systemctl --user start gustav` or `ai start` "
+                   + "on that machine — not from here.", "Shut down"] }));
     nodes.push(controls);
 
     nodes.push(el("h2", "", `Waiting for you (${approvals.approvals.length})`));
@@ -1429,3 +1574,374 @@ function approvalCard(approval) {
 boot().catch((error) => {
   document.body.append(el("p", "error", `could not reach the daemon: ${error.message}`));
 });
+
+/* --- the admin panels --------------------------------------------------
+ *
+ * Everything the daemon can be told to do, in the browser, through the same endpoints
+ * `ai` uses. Nothing here is new power: it is the CLI's surface, laid out so that the
+ * owner does not have to remember which of thirty subcommands does the thing.
+ */
+
+function action(label, run, { kind = "small", confirm: ask = null } = {}) {
+  const button = el("button", `btn ${kind}`, label);
+  button.addEventListener("click", async () => {
+    if (ask && !await confirmSheet(ask[0], ask[1], ask[2] || "Yes")) return;
+    button.disabled = true;
+    try {
+      const said = await run();
+      if (said) toast(said, "good");
+    } catch (error) {
+      toast(error.message, "bad");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
+function when_(text) {
+  return (text || "").replace("T", " ").slice(0, 16);
+}
+
+/* --- models and adapters ------------------------------------------------ */
+function loadModels() {
+  return panel("#models-panel", async () => {
+    const [models, adapters, status] = await Promise.all([
+      api("/models"), api("/adapter/status"), api("/status"),
+    ]);
+    const onDisk = new Map((models.models || []).map((m) => [m.id || m.model_id, m]));
+    const active = (status.model && status.model.base_model) || "";
+
+    const nodes = [
+      el("h2", "", "Models"),
+      el("p", "sub", `Weights live in ${models.models_dir}. The ladder is what this `
+        + `machine could run; the plan picked ${models.plan_model || "nothing yet"}.`),
+    ];
+
+    const rows = (models.ladder || []).map((rung) => {
+      const here = onDisk.get(rung.id);
+      const marks = el("div", "row");
+      if (rung.id === active) marks.append(pill("answering", "good"));
+      else if (rung.id === models.plan_model) marks.append(pill("planned", "warn"));
+      if (here) marks.append(pill(`${(here.size_mb / 1024).toFixed(1)} GiB on disk`, ""));
+      const act = here
+        ? el("span", "fine", "fetched")
+        : action("Pull", async () => {
+            toast(`fetching ${rung.repo} — this takes a while`, "good");
+            const done = await api("/models/pull", { body: { model_id: rung.id } });
+            loadModels();
+            return `${rung.id}: ${(done.size_mb / 1024).toFixed(2)} GiB`;
+          });
+      return [rung.rung, rung.id, rung.repo, `${rung.params_b}B`, marks, act];
+    });
+    nodes.push(table(["rung", "id", "repo", "size", "", ""], rows));
+
+    nodes.push(el("h2", "", "Adapters"));
+    const modules = Object.entries(adapters.modules || {});
+    if (!modules.length) {
+      nodes.push(el("p", "empty", adapters.note || "No adapters have been trained yet."));
+    } else {
+      nodes.push(table(
+        ["module", "active", "versions", "loaded", ""],
+        modules.map(([name, info]) => [
+          name,
+          info.active || "–",
+          (info.versions || []).length,
+          (adapters.active_in_model || {})[name] ? pill("in the model", "good") : "",
+          action("Roll back", async () => {
+            const done = await api("/adapter/rollback", { body: { module: name } });
+            loadModels();
+            return `${name}: back to ${done.version || "the previous version"}`;
+          }, { confirm: [`Roll ${name} back?`,
+                        "It goes to the previous version. The weights are kept either way.",
+                        "Roll back"] }),
+        ]),
+      ));
+    }
+    return nodes;
+  });
+}
+
+/* --- hardware ------------------------------------------------------------ */
+function loadHardware() {
+  return panel("#hardware-panel", async () => {
+    const hw = await api("/hardware");
+    const plan = hw.plan || {};
+    const nodes = [
+      el("h2", "", "What this machine is"),
+      stats([
+        ["gpus", (hw.gpus || []).length],
+        ["cpu cores", (hw.host || {}).cpu_count],
+        ["ram", `${Math.round(((hw.host || {}).ram_total_mb || 0) / 1024)} GiB`],
+        ["disk free", `${Math.round(((hw.host || {}).disk_free_mb || 0) / 1024)} GiB`],
+        ["detected by", hw.source],
+        ["fingerprint", hw.fingerprint],
+      ]),
+    ];
+    for (const line of hw.gpus || []) nodes.push(el("p", "fine", line));
+    for (const line of hw.budgets || []) nodes.push(el("p", "fine", line));
+
+    nodes.push(el("h2", "", "The plan"));
+    const rows = Object.entries(plan).filter(([, v]) => typeof v !== "object");
+    nodes.push(rows.length
+      ? table(["setting", "value"], rows.map(([k, v]) => [k, String(v)]))
+      : el("p", "empty", "Nothing has been planned yet."));
+
+    const controls = el("div", "row");
+    controls.append(action("Plan again", async () => {
+      await api("/hardware/plan", { body: {} });
+      loadHardware();
+      return "re-planned";
+    }));
+    controls.append(action("Plan and apply", async () => {
+      await api("/hardware/plan", { body: { apply: true } });
+      loadHardware();
+      return "planned and applied";
+    }, { confirm: ["Apply a new plan?",
+                   "It can change the model, the quantisation and the sequence length. "
+                   + "Nothing is trained or deleted.", "Apply"] }));
+    nodes.push(controls);
+    if (hw.problem) nodes.push(el("p", "error", hw.problem));
+    return nodes;
+  });
+}
+
+/* --- sleep runs ---------------------------------------------------------- */
+function loadRuns() {
+  return panel("#runs-panel", async () => {
+    const data = await api("/runs?limit=30");
+    const nodes = [
+      el("h2", "", "Nights"),
+      el("p", "sub", "Every sleep run, its steps, and what each one did."),
+    ];
+    if (!(data.runs || []).length) {
+      nodes.push(el("p", "empty", "It has not slept yet."));
+      return nodes;
+    }
+    for (const run of data.runs) {
+      const card = el("div", "card");
+      const head = el("div", "row");
+      head.append(el("h3", "", `run ${run.id}`));
+      head.append(pill(run.status, run.status === "finished" ? "good"
+        : run.status === "failed" ? "bad" : "warn"));
+      head.append(el("span", "spacer"));
+      head.append(el("span", "fine", `${when_(run.started_at)} → ${when_(run.finished_at) || "…"}`));
+      card.append(head);
+      if (run.trigger) card.append(el("p", "sub", `triggered by ${run.trigger}`));
+
+      const actions = el("div", "row");
+      actions.append(action("Steps", async () => {
+        const already = card.querySelector(".table-wrap");
+        if (already) { already.remove(); return ""; }
+        const detail = await api(`/runs/${run.id}`);
+        card.insertBefore(table(
+          ["step", "status", "detail", "started", "finished"],
+          (detail.steps || []).map((step) => [
+            step.step || step.name,
+            pill(step.status, step.status === "done" ? "good"
+              : step.status === "failed" ? "bad" : "warn"),
+            step.error || step.detail || "",
+            when_(step.started_at), when_(step.finished_at),
+          ]),
+        ), actions);
+        return "";
+      }));
+      actions.append(action("Write the report", async () => {
+        const report = await api(`/report?run_id=${run.id}`);
+        return `report written to ${report.path || "var/reports"}`;
+      }));
+      card.append(actions);
+      nodes.push(card);
+    }
+    return nodes;
+  });
+}
+
+/* --- backups ------------------------------------------------------------- */
+function loadBackups() {
+  return panel("#backups-panel", async () => {
+    const data = await api("/backups");
+    const nodes = [
+      el("h2", "", "Snapshots"),
+      el("p", "sub", `In ${data.location} · ${Math.round(data.free_mb / 1024)} GiB free · `
+        + `${data.policy}`),
+    ];
+    const controls = el("div", "row");
+    controls.append(action("Take one now", async () => {
+      const done = await api("/backups", { body: { operation: "manual" } });
+      loadBackups();
+      return `${done.id || "snapshot"} taken`;
+    }));
+    controls.append(action("Apply the retention policy", async () => {
+      const done = await api("/backups/retention", { body: {} });
+      loadBackups();
+      return `${(done.removed || []).length} removed`;
+    }, { confirm: ["Apply retention?", "Snapshots outside the policy are deleted.", "Apply"] }));
+    nodes.push(controls);
+
+    const snapshots = data.snapshots || [];
+    nodes.push(snapshots.length
+      ? table(["id", "what", "size", "state", "when", ""], snapshots.map((snap) => [
+          snap.id, snap.operation,
+          `${Math.round(snap.size_mb)} MiB · ${snap.file_count} files`,
+          (() => {
+            const marks = el("div", "row");
+            marks.append(snap.complete ? pill("complete", "good") : pill("incomplete", "bad"));
+            if (snap.protected) marks.append(pill("kept by policy", ""));
+            return marks;
+          })(),
+          when_(snap.created_at),
+          (() => {
+            const row = el("div", "row");
+            row.append(action("Verify", async () => {
+              const done = await api(`/backups/${snap.id}/verify`, { body: {} });
+              loadBackups();
+              return done.ok ? "it matches its manifest" : "it does NOT match";
+            }));
+            row.append(action("Restore", async () => {
+              await api(`/backups/${snap.id}/restore`, { body: {} });
+              loadBackups();
+              return "restored";
+            }, { confirm: [`Restore ${snap.id}?`,
+                           "Current weights and adapters are snapshotted first, so this "
+                           + "is undoable.", "Restore"] }));
+            return row;
+          })(),
+        ]))
+      : el("p", "empty", "No snapshots yet."));
+
+    if ((data.changes || []).length) {
+      nodes.push(el("h2", "", "Recent weight changes"));
+      nodes.push(table(["what", "module", "version", "when"],
+        data.changes.slice(0, 10).map((change) => [
+          change.operation, change.module || "", change.version || "", when_(change.created_at),
+        ])));
+    }
+    return nodes;
+  });
+}
+
+/* --- accounts ------------------------------------------------------------ */
+function loadUsers() {
+  return panel("#users-panel", async () => {
+    const data = await api("/users");
+    const nodes = [el("h2", "", "Accounts")];
+    if (!data.accounts) {
+      nodes.push(el("p", "sub", "Accounts are switched off (api.accounts), so the only "
+        + "way in over the network is instance.http_token — one shared secret that has "
+        + "no idea who used it."));
+    }
+
+    const add = el("div", "card");
+    add.append(el("h3", "", "Add an account"));
+    add.append(el("p", "sub", "They sign in at this address with `ai login`, or in a browser."));
+    const row = el("div", "row");
+    const name = el("input", "field");
+    name.placeholder = "name";
+    const password = el("input", "field");
+    password.type = "password";
+    password.placeholder = "password (8 or more)";
+    const owner = el("label", "row");
+    const box = el("input");
+    box.type = "checkbox";
+    owner.append(box, el("span", "fine", "owner"));
+    row.append(name, password, owner, action("Create", async () => {
+      const made = await api("/users", {
+        body: { name: name.value, password: password.value,
+                role: box.checked ? "owner" : "user" },
+      });
+      name.value = password.value = "";
+      loadUsers();
+      return `${made.name} created as ${made.role}`;
+    }, { kind: "primary" }));
+    add.append(row);
+    nodes.push(add);
+
+    const users = data.users || [];
+    nodes.push(users.length
+      ? table(["name", "role", "state", "last seen", ""], users.map((user) => [
+          user.name,
+          user.role,
+          user.disabled ? pill("disabled", "bad") : pill("enabled", "good"),
+          when_(user.last_seen_at || user.created_at),
+          (() => {
+            const row2 = el("div", "row");
+            row2.append(action(user.role === "owner" ? "Make a user" : "Make an owner",
+              async () => {
+                await api(`/users/${encodeURIComponent(user.name)}`, {
+                  body: { role: user.role === "owner" ? "user" : "owner" },
+                });
+                loadUsers();
+                return `${user.name} is now ${user.role === "owner" ? "a user" : "an owner"}`;
+              }));
+            row2.append(action(user.disabled ? "Enable" : "Disable", async () => {
+              await api(`/users/${encodeURIComponent(user.name)}`,
+                        { body: { disabled: !user.disabled } });
+              loadUsers();
+              return `${user.name} ${user.disabled ? "enabled" : "disabled"}`;
+            }));
+            row2.append(action("New password", async () => {
+              const fresh = await sheet({
+                title: `New password for ${user.name}`,
+                note: "Every token and session they have is revoked.",
+                confirm: "Change it", multiline: false, label: "password",
+              });
+              if (fresh === null || fresh.length < 8) return "";
+              await api(`/users/${encodeURIComponent(user.name)}`, { body: { password: fresh } });
+              return "changed; their sessions are revoked";
+            }));
+            row2.append(action("Issue a token", async () => {
+              const made = await api(`/users/${encodeURIComponent(user.name)}`,
+                                     { body: { token: "web" } });
+              await sheet({
+                title: `A token for ${user.name}`,
+                note: "Shown once. On the other machine: ai login <url> --token <this>",
+                value: made.token, confirm: "Done",
+              });
+              return "";
+            }));
+            row2.append(action("Delete", async () => {
+              await api(`/users/${encodeURIComponent(user.name)}`, { method: "DELETE" });
+              loadUsers();
+              return `${user.name} deleted`;
+            }, { confirm: [`Delete ${user.name}?`,
+                           "Their chats stay in the store; they simply cannot sign in.",
+                           "Delete"] }));
+            return row2;
+          })(),
+        ]))
+      : el("p", "empty", "No accounts yet — the owner signs in over the socket."));
+    return nodes;
+  });
+}
+
+/* --- the event log ------------------------------------------------------- */
+function loadEvents() {
+  return panel("#events-panel", async () => {
+    const kind = state.eventKind || "";
+    const data = await api(`/events?limit=200${kind ? `&kind=${encodeURIComponent(kind)}` : ""}`);
+    const nodes = [el("h2", "", "What the daemon has been doing")];
+
+    const row = el("div", "row");
+    const field = el("input", "field");
+    field.placeholder = "filter by kind, e.g. sleep. or tool.";
+    field.value = kind;
+    const apply = () => { state.eventKind = field.value.trim(); loadEvents(); };
+    field.addEventListener("keydown", (event) => { if (event.key === "Enter") apply(); });
+    row.append(field, action("Filter", async () => { apply(); return ""; }),
+               action("Refresh", async () => { loadEvents(); return ""; }));
+    nodes.push(row);
+
+    const events = data.events || [];
+    nodes.push(events.length
+      ? table(["when", "level", "kind", "what"], events.map((event) => [
+          when_(event.ts),
+          pill(event.level, event.level === "error" ? "bad"
+            : event.level === "warning" ? "warn" : "good"),
+          event.kind,
+          event.message,
+        ]))
+      : el("p", "empty", "Nothing matches."));
+    return nodes;
+  });
+}

@@ -221,15 +221,31 @@ async def test_the_service_token_still_works(daemon, accounts):
 
 
 # --- the listener --------------------------------------------------------
-async def test_the_port_is_closed_until_you_open_it(project, repo_root):
-    """The default install is not reachable from the network at all."""
+async def test_the_default_listener_is_this_machine_and_nothing_else(project, repo_root):
+    """On by default, so the browser works out of the box — on loopback, so only here.
+
+    The thing that must stay true is not "the port is shut" but "the network cannot
+    reach it": the default binds to 127.0.0.1, and opening it to anything else is a
+    line someone types on purpose.
+    """
+    from gustav.config.schema import Config
+
+    fresh = Config()
+    assert fresh.api.enabled is True
+    assert fresh.web.enabled is True
+    assert fresh.api.host == "127.0.0.1", "never 0.0.0.0 without being asked"
+    assert fresh.api.accounts is True, "and a request still has to say who it is from"
+    assert fresh.api.allow_registration is False
+
+
+async def test_the_port_is_closed_when_it_is_switched_off(project, repo_root):
     import socket
 
     from gustav.config.load import load_config as _load
 
     config, paths = _load(project / "config.yaml")
-    assert config.api.enabled is False
-    assert config.web.enabled is False
+    config.api.enabled = False
+    config.web.enabled = False
 
     instance = Daemon(config, paths)
     await instance.start()
@@ -266,3 +282,39 @@ async def test_turning_the_api_on_opens_the_port(project, repo_root):
             assert (await http.get("/status")).status_code == 401
     finally:
         await instance.shutdown("test finished")
+
+
+async def test_a_port_that_is_already_taken_costs_the_listener_and_nothing_else(project):
+    """Now that the API is on by default, a busy 8713 is an ordinary Tuesday.
+
+    uvicorn's own answer to a port it cannot have is sys.exit(3), which inside a task
+    is the whole daemon — model, lease, scheduler and all — gone at startup.
+    """
+    import socket
+
+    from gustav.config.load import load_config as _load
+
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+
+    config, paths = _load(project / "config.yaml")
+    config.api.enabled = True
+    config.api.port = squatter.getsockname()[1]
+
+    instance = Daemon(config, paths)
+    try:
+        await instance.start()
+        # It came up, and it says why the port is not there.
+        assert str(instance.state.state) in ("wake", "safe_mode")
+        assert any(
+            event["kind"] == "api.port_busy" for event in instance.events.recent(limit=20)
+        )
+        # And the socket — which is how `ai` talks to it — works.
+        transport = httpx.AsyncHTTPTransport(uds=str(instance.socket_path))
+        async with httpx.AsyncClient(transport=transport, base_url="http://gustav") as http:
+            assert (await http.get("/health")).status_code == 200
+    finally:
+        await instance.shutdown("test finished")
+        squatter.close()

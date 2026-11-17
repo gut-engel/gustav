@@ -43,7 +43,11 @@ def project(tmp_path: Path) -> Path:
         "sleep:\n  simulated_step_seconds: 0.02\n"
         f"  simulated_steps: [{', '.join(ALL_STEPS)}]\n"
         # Deterministic and GPU-free: the tests that need real weights are marked `gpu`.
-        "inference:\n  responder: echo\n",
+        "inference:\n  responder: echo\n"
+        # The API is on by default now, and a suite full of daemons would spend its
+        # time fighting over port 8713. The tests that want a listener open one on a
+        # port they picked themselves.
+        "api:\n  enabled: false\n",
         encoding="utf-8",
     )
     return root

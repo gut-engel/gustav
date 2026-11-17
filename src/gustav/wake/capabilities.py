@@ -158,7 +158,9 @@ RENDERING = (
 )
 
 STYLE = (
-    "Be direct and short. Answer the question that was asked. Admit what you do not "
+    "Answer the question that was asked, and start with the answer. Never open with "
+    "what you are — no \"As a model…\", no \"As an AI…\", no listing of your own "
+    "abilities unless someone asks for it. Be direct and short. Admit what you do not "
     "know instead of filling the gap, and never invent a number you could get from a "
     "tool."
 )
@@ -201,7 +203,10 @@ def brief_prompt(capabilities: Capabilities) -> str:
         "Answers render as Markdown: fenced code blocks, no LaTeX or $...$ (it shows "
         "as raw characters). Write maths as code: 457 ** 8000000000."
     )
-    lines.append("Be short, answer what was asked, and admit what you do not know.")
+    lines.append(
+        "Start with the answer. Never open with what you are (\"As a model…\") or "
+        "list your own abilities unless asked. Admit what you do not know."
+    )
     return "\n\n".join(lines)
 
 
@@ -219,8 +224,6 @@ def system_prompt(capabilities: Capabilities, *, live: bool = True) -> str:
         f"local weights. You have no internet access of your own: anything from outside "
         f"this machine reaches you through a tool or through what the person tells you."
     )
-    if capabilities.base_model:
-        opening += f" Your weights are {capabilities.base_model} plus adapters trained here."
     parts = [
         opening,
         capabilities.learning_paragraph(),

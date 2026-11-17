@@ -41,6 +41,10 @@
       <button class="icon" id="new-chat" title="New chat (Ctrl+Shift+O)" aria-label="New chat"></button>
     </div>
 
+    <button class="new-chat" id="new-chat-full">
+      <span class="plus" aria-hidden="true"></span><span>New chat</span>
+    </button>
+
     <div class="side-search">
       <label class="search" id="search-wrap">
         <span class="search-icon" aria-hidden="true"></span>
@@ -57,7 +61,15 @@
         <button data-view="facts"></button>
         <button data-view="skills"></button>
         <button data-view="tools"></button>
+
+        <p class="side-label">Admin</p>
         <button data-view="system"></button>
+        <button data-view="models"></button>
+        <button data-view="hardware"></button>
+        <button data-view="runs"></button>
+        <button data-view="backups"></button>
+        <button data-view="users"></button>
+        <button data-view="events"></button>
       </nav>
     </div>
 
@@ -80,6 +92,7 @@
         <b id="chat-title">New chat</b>
         <span id="chat-sub" class="fine"></span>
       </div>
+      <button class="model" id="model-chip" hidden></button>
       <span class="spacer"></span>
       <button class="state" id="state-chip" title="What the daemon is doing">
         <i class="dot" aria-hidden="true"></i><span id="state-text">…</span>
@@ -96,16 +109,20 @@
       <div class="scroll" id="thread-scroll">
         <div class="thread" id="thread"></div>
       </div>
+      <button class="to-bottom" id="to-bottom" hidden aria-label="Jump to the newest message"></button>
       <div class="composer">
         <form class="box" id="composer-form">
           <textarea id="input" rows="1" enterkeyhint="send"
                     placeholder="Ask anything, or /help for the commands"></textarea>
           <div class="box-foot">
-            <span class="fine" id="hint">Enter sends · Shift+Enter is a newline · /good /bad /correct teach it overnight</span>
+            <button class="round" id="commands" type="button" title="Commands"
+                    aria-label="Commands" aria-haspopup="true"></button>
+            <span class="fine" id="hint">Enter sends · Shift+Enter is a newline</span>
             <span class="spacer"></span>
             <button class="send" id="send" type="submit" title="Send" aria-label="Send"></button>
           </div>
         </form>
+        <div id="command-menu" class="menu commands" role="menu" hidden></div>
         <button class="btn stop" id="stop" hidden>Stop generating</button>
       </div>
     </section>
@@ -115,6 +132,12 @@
     <section id="view-skills" class="view scroll" hidden><div class="panel" id="skills-panel"></div></section>
     <section id="view-tools" class="view scroll" hidden><div class="panel" id="tools-panel"></div></section>
     <section id="view-system" class="view scroll" hidden><div class="panel" id="system-panel"></div></section>
+    <section id="view-models" class="view scroll" hidden><div class="panel" id="models-panel"></div></section>
+    <section id="view-hardware" class="view scroll" hidden><div class="panel" id="hardware-panel"></div></section>
+    <section id="view-runs" class="view scroll" hidden><div class="panel" id="runs-panel"></div></section>
+    <section id="view-backups" class="view scroll" hidden><div class="panel" id="backups-panel"></div></section>
+    <section id="view-users" class="view scroll" hidden><div class="panel" id="users-panel"></div></section>
+    <section id="view-events" class="view scroll" hidden><div class="panel" id="events-panel"></div></section>
   </main>
 </div>
 

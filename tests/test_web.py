@@ -10,6 +10,7 @@ fact that switching the interface on does not quietly shadow the API it talks to
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from collections.abc import AsyncIterator
@@ -398,3 +399,51 @@ async def test_status_carries_both_the_error_and_what_to_do_about_it(owner, daem
     payload = (await owner.get("/status")).json()
     assert "12040" in payload["load_error"]
     assert "ai doctor" in payload["load_help"]
+
+
+# --- the page a browser has already seen ----------------------------------
+async def test_the_page_tells_the_browser_to_ask_before_reusing_anything(daemon):
+    """The bug this exists for: new HTML, fortnight-old CSS, a page with no styling.
+
+    StaticFiles sends an ETag and no Cache-Control, so the browser invents a freshness
+    lifetime — about a tenth of the file's age — and simply does not ask for the
+    stylesheet again after an update.
+    """
+    async with client(daemon) as http:
+        for path in ("/", "/styles.css", "/app.js"):
+            response = await http.get(path)
+            assert response.status_code == 200, path
+            assert "no-cache" in response.headers.get("cache-control", ""), path
+
+
+async def test_the_page_asks_for_the_version_of_the_files_it_was_built_with(daemon):
+    """And a browser that already holds the stale copy is asked for a URL it has not seen."""
+    async with client(daemon) as http:
+        html = (await http.get("/")).text
+    assert 'href="styles.css?v=' in html
+    assert 'src="app.js?v=' in html
+
+    stamp = re.search(r'styles\.css\?v=(\d+)', html).group(1)
+    newest = max((WEB / name).stat().st_mtime for name in ("index.html", "styles.css", "app.js"))
+    assert stamp == str(int(newest)), "the stamp is when the interface last changed"
+
+
+async def test_the_stamp_moves_when_the_interface_does(daemon, tmp_path):
+    from gustav.server.app import _asset_stamp
+
+    room = tmp_path / "web"
+    room.mkdir()
+    for name in ("index.html", "styles.css", "app.js"):
+        (room / name).write_text("x", encoding="utf-8")
+    before = _asset_stamp(room)
+    os.utime(room / "styles.css", (2_000_000_000, 2_000_000_000))
+    assert _asset_stamp(room) != before
+
+
+async def test_the_files_are_still_served_as_they_are(daemon):
+    """The page is rewritten; the two files it asks for are not touched."""
+    async with client(daemon) as http:
+        css = await http.get("/styles.css?v=123")
+        js = await http.get("/app.js?v=123")
+    assert css.text == (WEB / "styles.css").read_text(encoding="utf-8")
+    assert js.text == (WEB / "app.js").read_text(encoding="utf-8")
