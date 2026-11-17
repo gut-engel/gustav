@@ -83,6 +83,18 @@ model, a few megabytes:
 curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/install.sh | bash -s -- --client --url https://your-server:8713
 ```
 
+**A satellite** — a microphone and a speaker in another room: a Raspberry Pi, an old
+laptop, anything with a sound card. No GPU, no model, no Python packages at all:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/satellite.sh \
+  | bash -s -- --url http://your-server:8713 --token <token>
+```
+
+Make the token on the server first with `ai user add kitchen` and `ai user token
+kitchen`, and switch the voice on there — [Talking to it](#talking-to-it) is the whole
+of it. On a Pi Zero this takes about fifteen seconds.
+
 Leave the flags off and it asks what this machine is, whether to run it as a service,
 and which server to point at — the questions go to your terminal, not to the pipe the
 script arrived on, so piping it into `bash` stays interactive:
@@ -505,7 +517,8 @@ curl -s --data-binary @question.wav -H 'content-type: audio/wav' \
 
 ### A satellite
 
-A Raspberry Pi, an old laptop, anything with a microphone:
+A Raspberry Pi, an old laptop, anything with a microphone — the same one-liner as in
+[Install](#install):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/satellite.sh \
