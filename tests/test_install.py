@@ -857,3 +857,68 @@ def test_a_config_nobody_has_touched_is_left_alone(tmp_path):
     assert (checkout / "config.yaml").read_text(encoding="utf-8") == "mine: yes\n"
     assert not (checkout / "config.yaml.new").exists()
     assert "Keeping your" not in result.stdout
+
+
+def test_it_says_when_the_command_will_not_be_found(tmp_path):
+    """Reported from a Pi: installed fine, then `gustav-satellite: command not found`.
+
+    ~/.local/bin is on PATH on most distributions *if it existed when you logged in*,
+    which it did not five seconds ago.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    result = satellite(
+        "--no-service", "--url", "http://example.invalid:8713", "--source", str(REPO),
+        env={"HOME": str(home), "GUSTAV_BIN": str(home / "bin"),
+             "PATH": os.environ["PATH"]},     # which does not contain home/bin
+    )
+    assert result.returncode == 0
+    assert "is not on your PATH" in result.stderr
+    assert 'export PATH="$HOME/.local/bin:$PATH"' in result.stderr
+    # And the commands it suggests afterwards use a path that works right now.
+    assert f"{home}/bin/gustav-satellite --say" in result.stdout
+
+
+def test_it_keeps_quiet_about_the_path_when_the_path_is_fine(tmp_path):
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    result = satellite(
+        "--no-service", "--url", "http://example.invalid:8713", "--source", str(REPO),
+        env={"HOME": str(home), "GUSTAV_BIN": str(home / "bin"),
+             "PATH": f"{home}/bin:{os.environ['PATH']}"},
+    )
+    assert "is not on your PATH" not in result.stderr
+    assert "gustav-satellite --say" in result.stdout
+
+
+def test_a_daemon_without_voice_is_told_apart_from_no_daemon(tmp_path):
+    """404 means the address is right and voice is off. That is a different fix."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):          # noqa: N802 - the stdlib's spelling
+            self.send_error(404, "Not Found")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        home = tmp_path / "home"
+        home.mkdir()
+        result = satellite(
+            "--no-service", "--url", f"http://127.0.0.1:{server.server_port}",
+            "--source", str(REPO),
+            env={"HOME": str(home), "GUSTAV_BIN": str(home / "bin")},
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert result.returncode == 0, "a server that is not ready is not a failed install"
+    assert "the daemon is there, but it has no /voice" in result.stdout
+    assert "voice.enabled" in result.stdout
+    assert "could not reach it" not in result.stdout

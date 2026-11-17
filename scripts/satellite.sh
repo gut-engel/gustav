@@ -22,7 +22,7 @@ set -euo pipefail
 
 exec 3>&1 4>&2
 
-VERSION="2026-11-17.1"
+VERSION="2026-11-17.2"
 
 ARGV=("$@")
 URL="${GUSTAV_URL:-}"
@@ -222,7 +222,7 @@ fi
 if [ "$DRY_RUN" != true ]; then
   say "  asking $URL what it sounds like"
   if "$PYTHON" - "$URL" "$TOKEN" <<'CHECK'
-import json, sys, urllib.request
+import json, sys, urllib.error, urllib.request
 url, token = sys.argv[1].rstrip("/"), sys.argv[2]
 request = urllib.request.Request(url + "/voice/config")
 if token:
@@ -230,8 +230,23 @@ if token:
 try:
     with urllib.request.urlopen(request, timeout=10) as response:
         found = json.loads(response.read().decode())
+except urllib.error.HTTPError as exc:
+    # The daemon answered, which already tells you the address and the port are
+    # right. What it said is the useful part, and each of these has its own fix.
+    if exc.code == 404:
+        print("    the daemon is there, but it has no /voice: either voice.enabled is")
+        print("    false in its config.yaml, or it is older than the voice support.")
+        print("    On the server:  ai update  &&  pip install -e '.[voice]'")
+    elif exc.code in (401, 403):
+        print("    the daemon refused the token. Make one on the server with:")
+        print("        ai user add <name> && ai user token <name>")
+    else:
+        print(f"    the daemon answered {exc.code}: {exc.reason}")
+    raise SystemExit(1)
 except Exception as exc:
     print(f"    could not reach it: {exc}")
+    print("    Is that the right address, and is api.enabled true on the server?")
+    print("    api.host must be something this machine can reach — 127.0.0.1 is not.")
     raise SystemExit(1)
 print(f"    {found.get('instance', 'gustav')}: language {found.get('language')}, "
       f"{found['stt']['sample_rate']} Hz")
@@ -294,9 +309,29 @@ EOF
   fi
 fi
 
+# ~/.local/bin is on PATH on most distributions *if it existed when you logged in*,
+# which it did not five seconds ago. Saying so beats "command not found".
+ON_PATH=true
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) ON_PATH=false ;;
+esac
+
 say ""
 say "Done."
-say "  gustav-satellite --calibrate      measure this room, then put the number in"
-say "                                    $CONFIG"
-say "  gustav-satellite --say \"hello\"     make the daemon talk through this speaker"
+if [ "$ON_PATH" != true ]; then
+  warn "$BIN_DIR is not on your PATH, so 'gustav-satellite' will not be found."
+  warn "Add it — most shells read this from ~/.profile at login:"
+  warn "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+  warn "For this terminal, now:"
+  warn "    export PATH=\"$BIN_DIR:\$PATH\""
+  warn "(The service does not care: its unit uses the full path.)"
+  say ""
+fi
+RUN="gustav-satellite"
+[ "$ON_PATH" = true ] || RUN="$BIN_DIR/gustav-satellite"
+say "  $RUN --calibrate"
+say "      measure this room, then put the number in $CONFIG"
+say "  $RUN --say \"hello\""
+say "      make the daemon talk through this speaker"
 say "  journalctl --user -u gustav-satellite -f"
