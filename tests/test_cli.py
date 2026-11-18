@@ -325,3 +325,29 @@ def test_doctor_refuses_to_pick_a_torch_without_knowing_the_driver(project, repo
     )
     assert result.returncode == 1
     assert "nvidia-smi is missing" in result.stderr
+
+
+def test_every_command_in_the_parser_is_actually_dispatched():
+    """A command can be added to the parser and never wired to anything.
+
+    That is exactly what happened to `ai voice`: it was in the help, it had its own
+    function, and running it said "unhandled command voice" — because the one line
+    that connects the two was in a patch whose other half failed. The help is not
+    evidence that a command works, so this reads the dispatch rather than the parser.
+    """
+    import inspect
+    import re
+
+    from gustav import cli
+
+    source = inspect.getsource(cli.main)
+    # `args.command == "x"`, `args.command in (None, "chat")`, and the `local` dict.
+    wired = set(re.findall(r'args\.command\s*(?:==|in)\s*\(?([^:\n]+?)\)?:', source))
+    dispatched: set[str] = set()
+    for fragment in wired:
+        dispatched |= set(re.findall(r'"([a-z][a-z-]*)"', fragment))
+    dispatched |= set(re.findall(r'"([a-z][a-z-]*)":\s*cmd_', source))
+
+    known = set(cli.build_parser()._actions[-1].choices)
+    missing = sorted(known - dispatched - set(cli.NOT_YET))
+    assert not missing, f"in the parser and wired to nothing: {', '.join(missing)}"

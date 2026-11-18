@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "2026-11-17.2"
+VERSION = "2026-11-18.1"
 
 #: 20 ms of 16 kHz 16-bit mono. The unit everything here counts in.
 FRAME_MS = 20
@@ -117,6 +117,31 @@ class Settings:
 def say(message: str, *, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout
     print(f"{time.strftime('%H:%M:%S')}  {message}", file=stream, flush=True)
+
+
+def why(exc: Exception) -> str:
+    """What the daemon said, not just the status line it said it with.
+
+    An HTTPError carries the response body, and for this daemon that body is a
+    sentence naming the thing to do about it — "piper has no voice installed: `ai
+    voice install …`". Printing "503 Service Unavailable" and throwing that away
+    leaves someone with a number and no next step.
+    """
+    import urllib.error
+
+    if isinstance(exc, urllib.error.HTTPError):
+        detail = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+            try:
+                detail = (json.loads(body) or {}).get("detail", "") or body
+            except ValueError:
+                detail = body
+        except Exception:  # noqa: BLE001
+            detail = ""
+        detail = " ".join(detail.split())[:400]
+        return f"{exc.code} {exc.reason}" + (f" — {detail}" if detail else "")
+    return str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +611,7 @@ class Satellite:
         try:
             self.hello()
         except Exception as exc:  # noqa: BLE001
-            say(f"cannot reach {self.settings.url}: {exc}", error=True)
+            say(f"cannot reach {self.settings.url}: {why(exc)}", error=True)
             return 3
 
         self.mic.start()
@@ -709,7 +734,7 @@ def say_something(settings: Settings, text: str) -> int:
         with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
             wav = response.read()
     except Exception as exc:  # noqa: BLE001
-        say(f"the daemon would not speak: {exc}", error=True)
+        say(f"the daemon would not speak: {why(exc)}", error=True)
         return 1
     argv = ["aplay", "-q"]
     if settings.output_device:

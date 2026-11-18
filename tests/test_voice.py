@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import shutil
 import socket as socket_module
 import sys
@@ -803,3 +804,50 @@ def test_half_a_voice_is_fetched_again_rather_than_trusted(tmp_path):
     assert got["already"] is False
     assert (tmp_path / "de_DE-thorsten-low.onnx").stat().st_size == 4096
     assert (tmp_path / "de_DE-thorsten-low.onnx.json").is_file()
+
+
+# --- what the satellite shows you -----------------------------------------
+def test_the_satellite_prints_the_reason_not_just_the_status():
+    """Reported: "503 Service Unavailable" and nothing else.
+
+    The daemon's 503 carries a sentence naming the command that fixes it. Printing
+    the status line and discarding the body leaves someone with a number.
+    """
+    import io
+    import urllib.error
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    refused = urllib.error.HTTPError(
+        "http://box:8713/voice/speak", 503, "Service Unavailable", {},
+        io.BytesIO(json.dumps({
+            "detail": "piper has no voice installed, so it cannot say anything. "
+                      "Install one — `ai voice install de_DE-thorsten-low`."
+        }).encode()),
+    )
+    said = satellite.why(refused)
+    assert "503" in said
+    assert "ai voice install de_DE-thorsten-low" in said
+    assert "no voice installed" in said
+
+
+def test_a_body_that_is_not_json_is_still_shown():
+    import io
+    import urllib.error
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    said = satellite.why(urllib.error.HTTPError(
+        "http://box:8713/voice/speak", 502, "Bad Gateway", {},
+        io.BytesIO(b"<html>nginx</html>"),
+    ))
+    assert "502" in said and "nginx" in said
+
+
+def test_an_ordinary_failure_is_left_alone():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    assert satellite.why(OSError("connection refused")) == "connection refused"

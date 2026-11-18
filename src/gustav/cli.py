@@ -1913,6 +1913,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_tools(args, client)
         if args.command == "approve-expansion":
             return cmd_approve_expansion(args, client)
+        if args.command == "voice":
+            return cmd_voice(args, client)
         parser.error(f"unhandled command {args.command}")
         return 2
     except DaemonUnreachable as exc:
