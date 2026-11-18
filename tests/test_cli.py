@@ -351,3 +351,31 @@ def test_every_command_in_the_parser_is_actually_dispatched():
     known = set(cli.build_parser()._actions[-1].choices)
     missing = sorted(known - dispatched - set(cli.NOT_YET))
     assert not missing, f"in the parser and wired to nothing: {', '.join(missing)}"
+
+    # And what it is wired *to* has to exist. The first version of this test read the
+    # dispatch and was happy, while `ai voice list` died on NameError: cmd_voice —
+    # the line was there and the function it named was not. Python compiles a module
+    # with a name that does not exist, so nothing before runtime says a word.
+    for name in sorted(set(re.findall(r"\b(cmd_[a-z_]+)\b", source))):
+        assert callable(getattr(cli, name, None)), f"main() calls {name}, which is not there"
+
+
+@pytest.mark.slow
+def test_every_command_runs_far_enough_to_fail_honestly(project, repo_root):
+    """The only check that catches a command which merely looks installed.
+
+    Each one is run against a socket nothing is listening on. What comes back should
+    be the daemon-is-not-there message, or argparse complaining about arguments —
+    never a traceback out of the CLI itself, which is what "unhandled command" and
+    "NameError: cmd_voice" both were.
+    """
+    names = set(build_parser()._actions[-1].choices)
+    # The ones that would do something to this machine rather than talk to a daemon.
+    doing = {"start", "init", "service", "update", "login", "logout", "doctor"}
+    for name in sorted(names - doing - set(__import__("gustav.cli", fromlist=["NOT_YET"]).NOT_YET)):
+        result = ai(project, "--socket", "/nonexistent/gustav.sock", name,
+                    repo_root=repo_root)
+        output = result.stdout + result.stderr
+        assert "Traceback" not in output, f"ai {name} fell over:\n{output}"
+        assert "unhandled command" not in output, f"ai {name} is not wired up"
+        assert result.returncode in (0, 1, 2, 3), f"ai {name} exited {result.returncode}"

@@ -18,7 +18,7 @@
 # Nothing here touches the database, the adapters, the weights or your config.
 set -euo pipefail
 
-VERSION="2026-11-17.2"
+VERSION="2026-11-18.1"
 
 exec 3>&1 4>&2
 
@@ -225,10 +225,25 @@ if [ "$CHECK" = false ] && [ "$DRY_RUN" = false ]; then
       --message "update.sh $(now)" || true
     git -C "$DIR" checkout --quiet "$REF" || fail "could not switch $DIR to $REF"
     git -C "$DIR" reset --hard --quiet "origin/$REF" || fail "could not reset $DIR"
-  elif ! git -C "$DIR" merge --ff-only --quiet "origin/$REF" 2>/dev/null; then
-    # Not fatal here: 'ai update' says exactly what is in the way, and in the words
-    # the rest of the project uses. This only means it will be the old copy saying it.
-    log "could not fast-forward; leaving that to 'ai update' to explain"
+  else
+    # Said out loud, because this script does the moving and then `ai update` finds
+    # nothing left to pull and reports "already up to date" — which reads, to anyone
+    # watching, as though the whole thing did nothing at all.
+    was="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || true)"
+    if git -C "$DIR" merge --ff-only --quiet "origin/$REF" 2>/dev/null; then
+      now="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || true)"
+      if [ -n "$was" ] && [ "$was" != "$now" ]; then
+        count="$(git -C "$DIR" rev-list --count "$was..$now" 2>/dev/null || echo '?')"
+        say "Moved $was -> $now ($count commit(s))"
+        log "fast-forwarded $was -> $now"
+      else
+        say "Already at $now"
+      fi
+    else
+      # Not fatal here: 'ai update' says exactly what is in the way, and in the words
+      # the rest of the project uses. This only means it will be the old copy saying it.
+      log "could not fast-forward; leaving that to 'ai update' to explain"
+    fi
   fi
 fi
 

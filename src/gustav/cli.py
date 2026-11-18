@@ -1135,6 +1135,66 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_voice(args: argparse.Namespace, client: Client) -> int:
+    """Voices for piper: what is installed, fetching one, and hearing it.
+
+    piper does not come with a voice, and a server with no browser open still needs a
+    way to get one — the answer should not be "curl two files out of a HuggingFace
+    repository by hand".
+    """
+    action = args.action or "list"
+
+    if action == "list":
+        found = client.get("/voice/voices")
+        print(f"voices in {found['directory']}")
+        if not found["installed"]:
+            print("  none yet — it cannot speak until one is here")
+        for entry in found["installed"]:
+            mark = " " if entry["complete"] else "!"
+            in_use = "   <- in use" if entry["name"] == found.get("in_use") else ""
+            state = "" if entry["complete"] else "  (incomplete: fetch it again)"
+            print(f" {mark} {entry['name']:<32} {entry['size_mb']:>6.1f} MiB{state}{in_use}")
+        print("\nworth fetching for this language:")
+        for name in found["suggested"]:
+            print(f"    ai voice install {name}")
+        return 0
+
+    if action == "install":
+        if not args.name:
+            print("which one? 'ai voice list' suggests some", file=sys.stderr)
+            return 2
+        print(f"fetching {args.name} — about 20 MiB for a low, 60 for a medium")
+        got = client.post(
+            "/voice/voices", json={"name": args.name, "use": not args.keep}
+        )
+        where = "was already here" if got.get("already") else f"{got['size_mb']} MiB"
+        print(f"  {got['name']}: {where}")
+        print(f"  {got['path']}")
+        spoken = (got.get("status") or {}).get("tts") or {}
+        if spoken.get("ok"):
+            print(f"  {spoken['detail']}")
+            print('  try it:  ai voice say "hallo, hier ist gustav"')
+        elif spoken.get("detail"):
+            print(f"  {spoken['detail']}", file=sys.stderr)
+        return 0
+
+    if action == "say":
+        if not args.name:
+            print('say what?  ai voice say "hallo"', file=sys.stderr)
+            return 2
+        audio = client.request(
+            "POST", "/voice/speak", raw=True, json={"text": args.name}
+        )
+        target = Path(args.out or "said.wav").expanduser()
+        target.write_bytes(audio)
+        print(f"wrote {target} ({len(audio) / 1024:.0f} KiB)")
+        print(f"  play it:  aplay {target}")
+        return 0
+
+    print(f"unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Why the GPU is not being used, and which of the two cures this machine needs.
 

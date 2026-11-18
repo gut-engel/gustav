@@ -990,3 +990,32 @@ def test_a_default_that_works_is_left_alone(tmp_path):
     assert "input_device" not in (
         home / ".config" / "gustav-satellite.conf"
     ).read_text(encoding="utf-8")
+
+
+def test_the_one_liner_says_what_it_moved(tmp_path):
+    """It does the moving, then `ai update` says "already up to date" — which reads
+    like nothing happened at all."""
+    checkout = a_checkout_with_an_origin(tmp_path)
+    seed, env = tmp_path / "seed", {
+        **os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    (seed / "src").mkdir(exist_ok=True)
+    (seed / "src" / "new.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "--quiet", "-m", "something new"],
+                   check=True, env=env)
+    subprocess.run(["git", "-C", str(seed), "push", "--quiet", "origin", "main"], check=True)
+    fake_ai(checkout, "#!/bin/sh\nexit 0\n")
+
+    result = update_sh("--dir", str(checkout), "--ref", "main", "--no-restart")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Moved " in result.stdout and "1 commit(s)" in result.stdout
+
+
+def test_it_says_so_when_there_was_nothing_to_move(tmp_path):
+    checkout = a_checkout_with_an_origin(tmp_path)
+    fake_ai(checkout, "#!/bin/sh\nexit 0\n")
+    result = update_sh("--dir", str(checkout), "--ref", "main", "--no-restart")
+    assert result.returncode == 0
+    assert "Already at " in result.stdout
