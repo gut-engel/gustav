@@ -463,8 +463,25 @@ voice:
   reply_language: ""    # blank: it answers in whatever it heard
 ```
 
-Then `http://your-server:8713/#voice` has the rest of it: which engines loaded, a box
-to hear the voice, every setting, and the one-liner for a satellite. What you set there
+**piper does not come with a voice**, the way a text editor does not come with a
+novel — it is two files, and until one of them is on disk the speaking half is a
+program that cannot speak. Which one you want depends on the language you are going to
+talk to it in, so nothing fetches one for you:
+
+```bash
+ai voice list                              # what is here, and what is worth fetching
+ai voice install de_DE-thorsten-low        # about 20 MB; `medium` is 60 and better
+ai voice say "hallo, hier ist gustav"      # writes a wav you can play
+```
+
+The Voice panel does the same with a dropdown and a button. A name like
+`de_DE-thorsten-low` *is* its path in rhasspy's collection — locale, speaker, quality —
+and the quality is the size: `low` is faster than real time on a Pi, `high` is not
+worth it through a kitchen speaker.
+
+Then `http://your-server:8713/#voice` has the rest of it: which engines loaded, which
+voices are installed, a box to hear one, every setting, and the one-liner for a
+satellite. What you set there
 is stored as an overlay in the database rather than written into `config.yaml` — that
 file is hand-written and full of comments explaining itself, and a program that
 rewrites it loses all of them. The panel says which values came from where.
@@ -509,6 +526,8 @@ or the Unix socket. A microphone in a hallway is not a reason to open a hole.
 | `POST /voice/speak` | text in, WAV out |
 | `POST /voice/ask` | audio in, the whole turn back as JSON — the version you can test with curl |
 | `WS /voice/stream` | the fast path: frames up, events down as they happen |
+| `GET`/`POST /voice/voices` | what is installed, and fetching one |
+| `GET`/`POST /voice/settings` | what is configured, and changing it without touching config.yaml |
 
 ```bash
 curl -s --data-binary @question.wav -H 'content-type: audio/wav' \
@@ -1393,6 +1412,7 @@ and the estimates become exact.
 | `ai service install\|uninstall\|status` | run it as a systemd user service |
 | `ai update [--check] [--reset]` | update this install: source, package, service — and nothing else |
 | `ai doctor [--fix-torch] [--install-driver]` | why the GPU is not being used, and either way out of it |
+| `ai voice list\|install <name>\|say <text>` | voices for the spoken assistant: what is installed, fetch one, try it |
 | `ai status [--json]` | state, schedule, adapters, GPU holder, pending work, failures, approvals |
 | `ai chat [message]` | one message, or an interactive session |
 | `ai sleep now [--dry-run]` | sleep immediately; `--dry-run` plans the night without doing it |

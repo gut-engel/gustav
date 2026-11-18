@@ -659,3 +659,147 @@ def test_a_null_engine_that_was_asked_for_is_fine(project):
     found = VoiceService(config, paths, ask=None).status()
     assert found["ready"] is True
     assert found["ready_for_a_satellite"] == found["socket"]["ok"]
+
+
+# --- voices ---------------------------------------------------------------
+# Reported from the server: `gustav-satellite --say hello` came back as HTTP 500.
+# piper was installed and had nothing to speak with, and the reason was only in the
+# daemon's log.
+def test_a_voice_name_is_its_path_in_the_collection():
+    from gustav.voice import voices as catalogue
+
+    voice = catalogue.parse("de_DE-thorsten-low")
+    assert voice.language == "de" and voice.locale == "de_DE"
+    assert voice.speaker == "thorsten" and voice.quality == "low"
+    assert voice.directory == "de/de_DE/thorsten/low"
+    assert voice.model_url.endswith("/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx")
+    assert voice.config_url == voice.model_url + ".json"
+
+
+@pytest.mark.parametrize(
+    "name", ["thorsten", "de-thorsten-low", "de_DE-thorsten-enormous", "", "../../etc/passwd"],
+)
+def test_something_that_is_not_a_voice_name_is_refused(name):
+    from gustav.voice import voices as catalogue
+
+    with pytest.raises(catalogue.VoiceError, match="not a piper voice name"):
+        catalogue.parse(name)
+
+
+def test_what_is_installed_is_read_off_the_disk(tmp_path):
+    from gustav.voice import voices as catalogue
+
+    (tmp_path / "de_DE-thorsten-low.onnx").write_bytes(b"x" * 2048)
+    (tmp_path / "de_DE-thorsten-low.onnx.json").write_text(
+        '{"language": {"code": "de_DE"}, "audio": {"sample_rate": 16000}}', encoding="utf-8")
+    # A download that was interrupted: a model with no settings beside it.
+    (tmp_path / "en_GB-alba-medium.onnx").write_bytes(b"x" * 2048)
+
+    found = {entry["name"]: entry for entry in catalogue.installed(tmp_path)}
+    assert found["de_DE-thorsten-low"]["complete"] is True
+    assert found["de_DE-thorsten-low"]["sample_rate"] == 16000
+    assert found["en_GB-alba-medium"]["complete"] is False, "half a voice is not a voice"
+    assert catalogue.for_language(tmp_path, "de").endswith("de_DE-thorsten-low.onnx")
+    assert catalogue.for_language(tmp_path, "fr") is None
+
+
+def test_installing_a_voice_fetches_both_files(tmp_path):
+    import io
+
+    from gustav.voice import voices as catalogue
+
+    asked = []
+
+    def fake_open(url, timeout=0):
+        asked.append(url)
+        return io.BytesIO(b"x" * 4096)
+
+    got = catalogue.install("de_DE-thorsten-low", tmp_path, open_url=fake_open)
+    assert got["name"] == "de_DE-thorsten-low" and got["already"] is False
+    assert (tmp_path / "de_DE-thorsten-low.onnx").is_file()
+    assert (tmp_path / "de_DE-thorsten-low.onnx.json").is_file()
+    assert len(asked) == 2
+
+    # Asked for again, it does not fetch it again.
+    asked.clear()
+    assert catalogue.install("de_DE-thorsten-low", tmp_path, open_url=fake_open)["already"]
+    assert asked == []
+
+
+def test_a_model_without_its_settings_is_not_left_behind(tmp_path):
+    import io
+
+    from gustav.voice import voices as catalogue
+
+    def half(url, timeout=0):
+        if url.endswith(".json"):
+            raise OSError("the network went away")
+        return io.BytesIO(b"x" * 4096)
+
+    with pytest.raises(catalogue.VoiceError):
+        catalogue.install("de_DE-thorsten-low", tmp_path, open_url=half)
+    assert not list(tmp_path.glob("*.onnx")), "it would claim a voice that cannot load"
+
+
+def test_no_voice_is_a_sentence_rather_than_a_500(tmp_path):
+    from gustav.voice.engines import PiperTts, VoiceNotInstalled
+
+    piper = PiperTts(voices_dir=tmp_path)
+    with pytest.raises(VoiceNotInstalled) as refused:
+        piper.speak("hello", language="de")
+    assert "ai voice install de_DE-thorsten-low" in str(refused.value)
+
+
+def test_a_voice_that_was_named_but_not_installed_says_which(tmp_path):
+    from gustav.voice.engines import PiperTts, VoiceNotInstalled
+
+    piper = PiperTts(voice="de_DE-kerstin-low", voices_dir=tmp_path)
+    with pytest.raises(VoiceNotInstalled, match="de_DE-kerstin-low"):
+        piper.speak("hallo", language="de")
+
+
+async def test_the_panel_can_list_and_install_voices(http, daemon, monkeypatch, tmp_path):
+    import io
+
+    from gustav.voice import voices as catalogue
+
+    monkeypatch.setattr(
+        catalogue.urllib.request, "urlopen",
+        lambda url, timeout=0: io.BytesIO(b"x" * 4096),
+    )
+    listed = (await http.get("/voice/voices")).json()
+    assert listed["installed"] == []
+    assert "en_GB-alba-medium" in listed["suggested"]
+
+    # The suggestions follow the language, because a German speaker being offered
+    # three English voices is a panel that has not been paying attention.
+    await http.post("/voice/settings", json={"language": "de"})
+    assert "de_DE-thorsten-low" in (await http.get("/voice/voices")).json()["suggested"]
+
+    got = (await http.post("/voice/voices", json={"name": "de_DE-thorsten-low"})).json()
+    assert got["name"] == "de_DE-thorsten-low"
+    assert daemon.config.voice.tts.voice == "de_DE-thorsten-low", "and it is used"
+
+    again = (await http.get("/voice/voices")).json()
+    assert [one["name"] for one in again["installed"]] == ["de_DE-thorsten-low"]
+
+
+async def test_a_voice_name_that_is_nonsense_is_a_400(http):
+    refused = await http.post("/voice/voices", json={"name": "the nice one"})
+    assert refused.status_code == 400
+
+
+def test_half_a_voice_is_fetched_again_rather_than_trusted(tmp_path):
+    import io
+
+    from gustav.voice import voices as catalogue
+
+    # What an interrupted download leaves behind.
+    (tmp_path / "de_DE-thorsten-low.onnx").write_bytes(b"half")
+    got = catalogue.install(
+        "de_DE-thorsten-low", tmp_path,
+        open_url=lambda url, timeout=0: io.BytesIO(b"x" * 4096),
+    )
+    assert got["already"] is False
+    assert (tmp_path / "de_DE-thorsten-low.onnx").stat().st_size == 4096
+    assert (tmp_path / "de_DE-thorsten-low.onnx.json").is_file()

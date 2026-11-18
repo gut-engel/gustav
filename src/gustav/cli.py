@@ -43,7 +43,9 @@ class Client:
                 transport=transport, base_url="http://gustav", timeout=TIMEOUT, headers=headers
             )
 
-    def request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def request(self, method: str, path: str, *, raw: bool = False, **kwargs: Any) -> Any:
+        """``raw`` for the endpoints that answer with something other than JSON — the
+        voice, which answers with a WAV."""
         try:
             response = self._client.request(method, path, **kwargs)
         except httpx.ConnectError as exc:
@@ -58,7 +60,7 @@ class Client:
             except ValueError:
                 detail = response.text
             raise RuntimeError(f"daemon returned {response.status_code}: {detail}")
-        return response.json()
+        return response.content if raw else response.json()
 
     @property
     def token(self) -> str | None:
@@ -1448,6 +1450,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="replace an existing unit")
     p.add_argument("--dry-run", action="store_true", help="print the unit instead")
     p.set_defaults(local=True)
+
+    p = sub.add_parser("voice", help="voices for the spoken assistant: list, install, try")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=("list", "install", "say"))
+    p.add_argument("name", nargs="?", help="a voice name, or the text for 'say'")
+    p.add_argument("--keep", action="store_true",
+                   help="install it without making it the one in use")
+    p.add_argument("--out", help="where 'say' writes the wav (default: said.wav)")
 
     p = sub.add_parser(
         "doctor",

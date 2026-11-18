@@ -2049,6 +2049,61 @@ function loadVoice() {
     tryIt.append(second);
     nodes.push(tryIt);
 
+    // --- voices ---------------------------------------------------------
+    // piper does not come with a voice, the way a text editor does not come with a
+    // novel, and "curl two files out of a HuggingFace repository" is not an answer.
+    let voices = null;
+    try {
+      voices = await api("/voice/voices");
+    } catch { voices = null; }
+    if (voices) {
+      const card = el("div", "card");
+      card.append(el("h3", "", "Voices"));
+      card.append(el("p", "sub", `In ${voices.directory}. A "low" is about 20 MB and `
+        + `faster than real time on a Pi; a "medium" is about 60 MB and better.`));
+      if (voices.installed.length) {
+        card.append(table(["voice", "size", "state", ""], voices.installed.map((one) => [
+          one.name,
+          `${one.size_mb} MiB`,
+          one.complete ? pill("ready", "good") : pill("incomplete", "bad"),
+          !one.complete
+            // Half a voice cannot be loaded, so offering to speak with it is an
+            // invitation to a 503. Fetching it again is the thing to do.
+            ? action("Fetch it again", async () => {
+                const got = await api("/voice/voices", { body: { name: one.name, use: false } });
+                loadVoice();
+                return `${got.name}: ${got.size_mb} MiB`;
+              })
+            : one.name === voices.in_use
+            ? pill("in use", "warn")
+            : action("Use this one", async () => {
+                await api("/voice/settings", { body: { "tts.voice": one.name } });
+                loadVoice();
+                return `speaking with ${one.name}`;
+              }),
+        ])));
+      } else {
+        card.append(el("p", "empty", "No voice installed — it cannot speak yet."));
+      }
+      const getting = el("div", "row");
+      const choice = el("select", "field");
+      for (const name of voices.suggested) {
+        const option = el("option", "", name);
+        option.value = name;
+        choice.append(option);
+      }
+      getting.append(choice, action("Install", async () => {
+        toast(`fetching ${choice.value}…`, "good");
+        const got = await api("/voice/voices", { body: { name: choice.value } });
+        loadVoice();
+        return got.already ? "it was already here" : `${got.name}: ${got.size_mb} MiB`;
+      }, { kind: "primary" }));
+      card.append(getting);
+      card.append(el("p", "fine", "On the server it is the same thing: "
+        + "ai voice list, ai voice install <name>."));
+      nodes.push(card);
+    }
+
     // --- the settings ---------------------------------------------------
     const form = el("div", "card");
     form.append(el("h3", "", "Settings"));

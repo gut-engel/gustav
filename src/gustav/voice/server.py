@@ -33,7 +33,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSoc
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from gustav.voice import voices as catalogue
 from gustav.voice.audio import Audio, join
+from gustav.voice.engines import VoiceNotInstalled
 
 if TYPE_CHECKING:  # pragma: no cover
     from gustav.daemon import Daemon
@@ -45,6 +47,12 @@ MAX_FRAME_BYTES = 1 << 20
 #: And a whole utterance has a ceiling too, or a microphone next to a television
 #: becomes a denial of service with extra steps.
 MAX_UTTERANCE_BYTES = 32 << 20
+
+
+class VoiceRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=100)
+    #: Start speaking with it straight away, which is what you meant by installing it.
+    use: bool = True
 
 
 class SpeakRequest(BaseModel):
@@ -162,10 +170,47 @@ def voice_routes(daemon: "Daemon", guard: list[Any], account: list[Any],
     @router.post("/speak", dependencies=account)
     async def speak(req: SpeakRequest):
         voice = service()
-        audio = await asyncio.to_thread(
-            voice.speak, req.text, language=req.language, voice=req.voice
-        )
+        try:
+            audio = await asyncio.to_thread(
+                voice.speak, req.text, language=req.language, voice=req.voice
+            )
+        except VoiceNotInstalled as exc:
+            # The common one, and it used to be a 500 with the reason only in the
+            # server's log. It is a configuration someone can fix in one command.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            daemon.log.exception("the voice would not speak")
+            raise HTTPException(
+                status_code=503, detail=f"the voice would not speak: {exc}"
+            ) from exc
         return Response(content=audio.to_wav(), media_type="audio/wav")
+
+    @router.get("/voices", dependencies=guard)
+    async def list_voices() -> dict[str, Any]:
+        """What is on disk, and what is worth fetching for the language in use."""
+        voice = service()
+        return {
+            "directory": str(voice.voices_dir),
+            "installed": catalogue.installed(voice.voices_dir),
+            "suggested": catalogue.suggestions(daemon.config.voice.language),
+            "in_use": daemon.config.voice.tts.voice,
+        }
+
+    @router.post("/voices", dependencies=guard)
+    async def install_voice(req: VoiceRequest) -> dict[str, Any]:
+        """Fetch a voice. About 20 MB for a `low`, 60 for a `medium`."""
+        voice = service()
+        try:
+            got = await asyncio.to_thread(
+                catalogue.install, req.name, voice.voices_dir
+            )
+        except catalogue.VoiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if req.use:
+            daemon.set_voice_settings({"tts.voice": req.name})
+        daemon.events.emit("voice.installed", f"the voice {req.name} was installed",
+                           voice=req.name)
+        return {**got, "status": service().status()}
 
     @router.post("/ask", dependencies=account)
     async def ask(request: Request, session: str = "voice", language: str = "",

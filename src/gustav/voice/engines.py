@@ -191,6 +191,16 @@ class WhisperStt:
         )
 
 
+class VoiceNotInstalled(RuntimeError):
+    """piper is here and has nothing to speak with. A sentence, not a stack trace."""
+
+
+def _suggest(language: str) -> str:
+    from gustav.voice import voices as catalogue
+
+    return catalogue.suggestions(language)[0]
+
+
 class PiperTts:
     """piper, through its Python package if it is there and its binary if it is not.
 
@@ -222,18 +232,71 @@ class PiperTts:
                 "piper is not installed: pip install piper-tts, or set voice.tts.engine "
                 "to null"
             )
-        return True, f"piper, voice {self.voice or 'whichever matches the language'}"
+        # piper does not come with a voice, the way a text editor does not come with a
+        # novel. Without one it is a program that cannot speak, and finding that out
+        # at the moment someone presses Say it is too late.
+        from gustav.voice import voices as catalogue
+
+        if self.voice and Path(self.voice).exists():
+            return True, f"piper, voice {Path(self.voice).stem}"
+        on_disk = [
+            entry for entry in catalogue.installed(self.voices_dir or Path("."))
+            if entry["complete"]
+        ]
+        if not on_disk:
+            return False, (
+                "piper has no voice installed, so it cannot say anything. Install one "
+                "— `ai voice install de_DE-thorsten-low`, or the Voice panel does it "
+                "for you."
+            )
+        if self.voice and not any(entry["name"] == self.voice for entry in on_disk):
+            return False, (
+                f"voice.tts.voice is {self.voice!r}, which is not installed. On disk: "
+                + ", ".join(str(entry["name"]) for entry in on_disk)
+            )
+        return True, (
+            f"piper, voice {self.voice or 'whichever matches the language'} "
+            f"({len(on_disk)} installed)"
+        )
 
     def _voice_path(self, language: str) -> str:
-        """The voice to speak with: what was configured, or one matching the language."""
+        """The voice to speak with: what was configured, or one matching the language.
+
+        Configured names are looked for on disk too, so voice.tts.voice can be
+        ``de_DE-thorsten-low`` rather than an absolute path to a file nobody wants to
+        type out.
+        """
+        from gustav.voice import voices as catalogue
+
         if self.voice:
-            return self.voice
-        if self.voices_dir and self.voices_dir.is_dir():
-            for candidate in sorted(self.voices_dir.glob(f"{language}_*.onnx")):
-                return str(candidate)
-            for candidate in sorted(self.voices_dir.glob(f"{language}*.onnx")):
-                return str(candidate)
-        return ""
+            if Path(self.voice).exists():
+                return self.voice
+            if self.voices_dir:
+                guess = self.voices_dir / f"{self.voice}.onnx"
+                if guess.exists():
+                    return str(guess)
+            # Named but missing: say which, rather than falling back to another
+            # voice and leaving someone wondering who is speaking.
+            raise VoiceNotInstalled(
+                f"voice.tts.voice is {self.voice!r} and that voice is not installed. "
+                f"`ai voice install {self.voice}` fetches it."
+            )
+        if self.voices_dir:
+            found = catalogue.for_language(self.voices_dir, language)
+            if found:
+                return found
+            any_voice = [
+                entry for entry in catalogue.installed(self.voices_dir)
+                if entry["complete"]
+            ]
+            if any_voice:
+                # Something rather than nothing: a Dutch voice reading German is
+                # strange, silence is useless, and the panel says what is installed.
+                return str(any_voice[0]["path"])
+        raise VoiceNotInstalled(
+            "piper has no voice installed, so there is nothing to speak with. "
+            f"`ai voice install {_suggest(language)}` fetches one, or use the Voice panel."
+        )
 
     def warm(self) -> None:
         with_voice = self._voice_path("")
