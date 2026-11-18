@@ -325,11 +325,22 @@ class PiperTts:
     def _speak_in_process(self, text: str, name: str) -> Audio:
         import io
         import wave as wave_module
+        from piper import SynthesisConfig
 
         loaded = self._load(name)
         buffer = io.BytesIO()
+
+        syn_config = SynthesisConfig(
+            length_scale=1.0 / max(self.speed, 0.1)
+        )
+
         with wave_module.open(buffer, "wb") as handle:
-            loaded.synthesize(text, handle, length_scale=1.0 / max(self.speed, 0.1))
+            loaded.synthesize_wav(
+                text,
+                handle,
+                syn_config=syn_config,
+            )
+
         return Audio.from_wav(buffer.getvalue())
 
     def _speak_by_command(self, text: str, name: str) -> Audio:
