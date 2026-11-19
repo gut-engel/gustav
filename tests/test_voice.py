@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import shutil
 import socket as socket_module
 import sys
@@ -924,3 +925,84 @@ def test_music_mode_uses_the_connected_bluetooth_audio_source(monkeypatch):
 
     Result.stdout = "4 bluez_input.00_11_22_33_44_55.1 a2dp_source\n"
     assert satellite.BluetoothMusic.source() == "bluez_input.00_11_22_33_44_55.1"
+
+
+def test_the_satellite_captures_pcm_without_an_audio_card(tmp_path, monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    arecord = fake_bin / "arecord"
+    arecord.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        "frame = b'\\x00\\x08' * 320\n"
+        "while True:\n"
+        "    sys.stdout.buffer.write(frame)\n"
+        "    sys.stdout.buffer.flush()\n"
+        "    time.sleep(0.02)\n",
+        encoding="utf-8",
+    )
+    arecord.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+
+    mic = satellite.Microphone(satellite.Settings())
+    mic.start()
+    try:
+        frame = mic.read(timeout=2)
+        assert frame is not None
+        assert len(frame) == satellite.frame_bytes(16000)
+        assert satellite.rms(frame) > 0
+    finally:
+        mic.stop()
+
+
+def test_the_satellite_sends_pcm_to_the_speaker_without_an_audio_card(tmp_path,
+                                                                     monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    aplay = fake_bin / "aplay"
+    aplay.write_text("#!/bin/sh\ncat > \"$GUSTAV_CAPTURED_PCM\"\n", encoding="utf-8")
+    aplay.chmod(0o755)
+    capture = tmp_path / "played.pcm"
+    monkeypatch.setenv("GUSTAV_CAPTURED_PCM", str(capture))
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    expected = b"\x34\x12" * 640
+
+    speaker = satellite.Speaker(satellite.Settings())
+    speaker.play(expected, 16000)
+    speaker.finish()
+
+    assert capture.read_bytes() == expected
+
+
+def test_music_mode_returns_to_gustav_when_the_phone_disconnects(monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    commands = []
+
+    class Result:
+        stdout = "42\n"
+
+    def fake_run(argv, **kwargs):
+        commands.append(argv)
+        return Result()
+
+    sources = iter(("bluez_input.00_11_22_33_44_55.1", ""))
+    monkeypatch.setattr(satellite.shutil, "which", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(satellite.subprocess, "run", fake_run)
+    monkeypatch.setattr(satellite.BluetoothMusic, "source", lambda: next(sources))
+    monkeypatch.setattr(satellite.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(satellite, "say", lambda *args, **kwargs: None)
+
+    satellite.BluetoothMusic.wait_for_phone()
+
+    assert ["pactl", "load-module", "module-loopback",
+            "source=bluez_input.00_11_22_33_44_55.1", "latency_msec=80"] in commands
+    assert ["pactl", "unload-module", "42"] in commands
+    assert ["bluetoothctl", "discoverable", "off"] in commands

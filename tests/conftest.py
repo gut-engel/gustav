@@ -24,6 +24,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ALL_STEPS = [step.spec.name for step in default_pipeline(Config()).steps]
 
 
+def pytest_collection_modifyitems(items):
+    """Skip real-GPU cases when CUDA imports but cannot actually run a kernel."""
+    gpu_items = [item for item in items if item.get_closest_marker("gpu")]
+    if not gpu_items:
+        return
+    try:
+        import torch
+        from gustav.hw.detect import detect
+
+        torch.cuda.init()
+        torch.empty(1, device="cuda")
+        torch.cuda.synchronize()
+        if not detect().gpus:
+            raise RuntimeError("NVML did not find a GPU for the planner")
+    except Exception as exc:  # noqa: BLE001 - broken drivers can fail in many ways
+        reason = f"CUDA is not usable here: {type(exc).__name__}: {exc}"
+        skip = pytest.mark.skip(reason=reason)
+        for item in gpu_items:
+            item.add_marker(skip)
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     """A throwaway project tree with a minimal config.yaml."""

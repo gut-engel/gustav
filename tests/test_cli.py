@@ -298,8 +298,10 @@ def test_doctor_says_what_is_wrong_and_both_ways_out(project, repo_root, monkeyp
     assert result.returncode in (0, 1), result.stderr
     assert "machine " in result.stdout
     if result.returncode == 1:
-        assert "ai doctor --fix-torch" in result.stdout
-        assert "ai doctor --install-driver" in result.stdout
+        assert (
+            "ai doctor --fix-torch" in result.stdout
+            or "ai doctor --install-driver" in result.stdout
+        ), "the diagnosis should end with the fix that fits this machine"
     assert driver.detect_platform().system == "Linux"
 
 

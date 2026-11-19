@@ -411,14 +411,21 @@ fi
 
 if [ "$MODE" = server ]; then
   if command -v nvidia-smi >/dev/null 2>&1; then
-    say "  gpu        $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
+    if GPU_LINE="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null \
+                    | head -1)" && [ -n "$GPU_LINE" ]; then
+      say "  gpu        $GPU_LINE"
+    else
+      warn "  gpu        nvidia-smi is installed but could not read the card; the dry run"
+      warn "             can still show the server install, but a real install needs a working driver"
+    fi
     # The number in the nvidia-smi header is the newest CUDA the *driver* can run, and
     # it is the one thing that decides which torch is allowed to exist on this machine.
     # Current drivers renamed this field: `nvidia-smi --version` says "CUDA UMD
     # version", and where the old "CUDA version" still appears it now holds the word
     # Deprecated instead of a number. Both spellings, both places, digits only — a
     # driver whose CUDA could not be read is a machine that gets whatever PyPI has.
-    DRIVER_CUDA="$({ nvidia-smi --version; nvidia-smi; } 2>/dev/null | sed -n \
+    DRIVER_INFO="$({ nvidia-smi --version; nvidia-smi; } 2>/dev/null || true)"
+    DRIVER_CUDA="$(printf '%s\n' "$DRIVER_INFO" | sed -n \
       -e 's/.*CUDA UMD [Vv]ersion *: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
       -e 's/.*CUDA [Vv]ersion *: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
       -e 's/.*CUDA UMD Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
@@ -429,7 +436,8 @@ if [ "$MODE" = server ]; then
       warn "  driver     nvidia-smi did not say which CUDA it supports; torch is on its own"
     fi
     log "nvidia-smi says:"
-    nvidia-smi || log "  (nvidia-smi would not run a second time)"
+    [ -n "$DRIVER_INFO" ] && log "$DRIVER_INFO" \
+      || log "nvidia-smi is installed but did not return driver details"
   else
     warn "  gpu        no nvidia-smi found. The server needs an NVIDIA GPU; install will"
     warn "             continue, but 'ai plan-hardware' will tell you it cannot run here."

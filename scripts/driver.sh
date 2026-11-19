@@ -575,7 +575,8 @@ install_arch() {
   # proprietary module is the one that works everywhere.
   local flavour="$MODULE_FLAVOUR" capability=""
   if [ -z "$flavour" ]; then
-    capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)"
+    capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+                   | head -1 || true)"
     log "compute capability from nvidia-smi: ${capability:-unknown}"
     case "${capability%%.*}" in
       ''|*[!0-9]*) flavour=closed ;;
