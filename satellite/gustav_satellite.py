@@ -23,8 +23,8 @@ What makes it feel fast, in the order it matters:
   Gustav is speaking are discarded before the next turn, so his answer cannot become
   the next question.
 
-Run it with `--calibrate` once in the room it will live in; it prints the threshold to
-put in the config.
+Run `gustav-satellite configure` to set the server, token and sound devices in a short
+wizard. `--calibrate` measures the room's speech threshold when you want to tune it.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -667,7 +668,11 @@ class Satellite:
                 timings = event.get("timings") or {}
                 if event.get("ignored"):
                     say(f"ignored: {event['ignored']}")
-                elif settings.verbose or timings:
+                elif settings.verbose:
+                    reply = event.get("reply", "")
+                    say(f"reply: {reply or '(empty)'}")
+                    say("  ".join(f"{name}={value}" for name, value in timings.items()))
+                elif timings:
                     say("  ".join(f"{name}={value}" for name, value in timings.items()))
                 break
 
@@ -750,7 +755,164 @@ def capture_devices() -> list[str]:
     return found
 
 
-def calibrate(settings: Settings, seconds: float = 6.0) -> int:
+def playback_devices() -> list[str]:
+    """Every playback device `aplay -l` knows, as something you can pass to -D."""
+    try:
+        listed = subprocess.run(
+            ["aplay", "-l"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in listed.splitlines():
+        match = re.match(r"^card (\d+):.*device (\d+):", line)
+        if match:
+            found.append(f"plughw:{match.group(1)},{match.group(2)}")
+    return found
+
+
+def save_settings(settings: Settings, path: Path) -> None:
+    """Change the satellite's answers while keeping its notes and other settings."""
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values = {
+        "url": settings.url,
+        "token": settings.token,
+        "input_device": settings.input_device,
+        "output_device": settings.output_device,
+        "threshold": f"{settings.threshold:g}",
+    }
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    except OSError as exc:
+        raise OSError(f"could not read {path}: {exc}") from exc
+    written: set[str] = set()
+    output = []
+    for line in lines:
+        match = re.match(r"^(\s*)(url|token|input_device|output_device|threshold)\s*=", line)
+        if match:
+            key = match.group(2)
+            output.append(f"{match.group(1)}{key} = {values[key]}")
+            written.add(key)
+        else:
+            output.append(line)
+    output.extend(f"{key} = {value}" for key, value in values.items() if key not in written)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write("\n".join(output) + "\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _choose_device(label: str, current: str, devices: list[str]) -> str:
+    if devices:
+        say(f"{label} devices:")
+        for number, device in enumerate(devices, 1):
+            say(f"  {number}. {device}")
+    else:
+        say(f"no {label.lower()} devices were listed; you can enter an ALSA device name")
+    answer = input(f"{label} [Enter keeps {current or 'system default'}]: ").strip()
+    if not answer:
+        return current
+    if answer.lower() in ("default", "system default", "none"):
+        return ""
+    if answer.isdecimal() and 1 <= int(answer) <= len(devices):
+        return devices[int(answer) - 1]
+    return answer
+
+
+def configure(settings: Settings, path: Path) -> int:
+    """Ask the person at the satellite for the few things this room knows."""
+    import getpass
+
+    say("Satellite setup. Press Enter to keep a saved answer.")
+    try:
+        while True:
+            address = input(f"Gustav server [{settings.url}]: ").strip()
+            if not address:
+                break
+            if not address.startswith(("http://", "https://")):
+                address = "http://" + address
+            if urlparse(address).netloc:
+                settings.url = address.rstrip("/")
+                break
+            say("enter a server name such as http://box.local:8713")
+
+        token_prompt = "Token [saved; Enter keeps it, - clears it]: " \
+            if settings.token else "Token [none; - leaves it empty]: "
+        token = getpass.getpass(token_prompt)
+        if token == "-":
+            settings.token = ""
+        elif token:
+            settings.token = token
+
+        settings.input_device = _choose_device(
+            "Microphone", settings.input_device, capture_devices()
+        )
+        settings.output_device = _choose_device(
+            "Speaker", settings.output_device, playback_devices()
+        )
+        while True:
+            raw = input(f"Speech threshold, 0..1 [{settings.threshold:g}]: ").strip()
+            if not raw:
+                break
+            try:
+                threshold = float(raw)
+            except ValueError:
+                threshold = -1
+            if 0 < threshold <= 1:
+                settings.threshold = threshold
+                break
+            say("enter a number greater than 0 and no more than 1")
+
+        if input("Measure the room and calibrate the mic? [y/N]: ").strip().lower() in (
+            "y", "yes",
+        ):
+            if calibrate(settings, save_threshold=True) != 0:
+                say("keeping the threshold you entered")
+
+        save_settings(settings, path)
+    except (EOFError, KeyboardInterrupt):
+        say("setup cancelled; no changes were saved")
+        return 1
+    except OSError as exc:
+        say(str(exc), error=True)
+        return 1
+
+    say(f"saved {path} (readable by your account only)")
+    systemctl = shutil.which("systemctl")
+    if systemctl:
+        try:
+            active = subprocess.run(
+                [systemctl, "--user", "is-active", "--quiet", "gustav-satellite"],
+                capture_output=True, timeout=5, check=False,
+            ).returncode == 0
+            if active:
+                restarted = subprocess.run(
+                    [systemctl, "--user", "restart", "gustav-satellite"],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                if restarted.returncode == 0:
+                    say("restarted the satellite service with the new settings")
+                else:
+                    say("settings are saved, but the satellite service did not restart; "
+                        "run systemctl --user restart gustav-satellite", error=True)
+        except (OSError, subprocess.SubprocessError):
+            say("settings are saved; restart gustav-satellite if it is running", error=True)
+    if input("Play a test through the satellite speaker? [Y/n]: ").strip().lower() \
+            not in ("n", "no"):
+        say_something(settings, "Gustav is ready to listen.")
+    return 0
+
+
+def calibrate(settings: Settings, seconds: float = 6.0, *, save_threshold: bool = False) -> int:
     """Measure the room. Print the threshold to put in the config."""
     mic = Microphone(settings)
     mic.start()
@@ -794,6 +956,8 @@ def calibrate(settings: Settings, seconds: float = 6.0) -> int:
     if peak < floor * 2:
         say("those are too close together: move the microphone or speak up", error=True)
         return 1
+    if save_threshold:
+        settings.threshold = suggested
     return 0
 
 
@@ -825,6 +989,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="gustav-satellite", description=__doc__.split("\n")[0]
     )
+    parser.add_argument("command", nargs="?", choices=("configure",))
     parser.add_argument("--config", default=os.environ.get(
         "GUSTAV_SATELLITE_CONFIG", str(Path.home() / ".config" / "gustav-satellite.conf")))
     parser.add_argument("--url", help="the daemon, e.g. http://box.local:8713")
@@ -842,7 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gustav-satellite {VERSION}")
         return 0
 
-    settings = Settings.load(Path(args.config).expanduser())
+    config_path = Path(args.config).expanduser()
+    settings = Settings.load(config_path)
     for name in ("url", "token", "threshold", "input_device", "output_device"):
         value = getattr(args, name, None)
         if value:
@@ -853,6 +1019,8 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("GUSTAV_TOKEN"):
         settings.token = os.environ["GUSTAV_TOKEN"]
 
+    if args.command == "configure":
+        return configure(settings, config_path)
     if args.calibrate:
         return calibrate(settings)
     if args.say:

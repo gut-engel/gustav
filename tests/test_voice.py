@@ -911,6 +911,41 @@ def test_the_satellite_discards_its_own_playback_before_listening_again():
     assert mic.frames == []
 
 
+def test_verbose_satellite_shows_api_reply_and_filler_timing(capsys):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    class Mic:
+        def drain(self):
+            pass
+
+    class Speaker:
+        def finish(self):
+            pass
+
+    class Connection:
+        def settimeout(self, timeout):
+            pass
+
+        def recv_json(self):
+            return {
+                "type": "done",
+                "reply": "The actual answer from the API.",
+                "timings": {"first_audio_was_filler": True},
+            }
+
+    client = satellite.Satellite.__new__(satellite.Satellite)
+    client.settings = satellite.Settings(verbose=True)
+    client.mic = Mic()
+    client.speaker = Speaker()
+
+    client.play_answer(Connection())
+
+    output = capsys.readouterr().out
+    assert "reply: The actual answer from the API." in output
+    assert "first_audio_was_filler=True" in output
+
+
 def test_music_mode_uses_the_connected_bluetooth_audio_source(monkeypatch):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
     import gustav_satellite as satellite
@@ -1006,3 +1041,39 @@ def test_music_mode_returns_to_gustav_when_the_phone_disconnects(monkeypatch):
             "source=bluez_input.00_11_22_33_44_55.1", "latency_msec=80"] in commands
     assert ["pactl", "unload-module", "42"] in commands
     assert ["bluetoothctl", "discoverable", "off"] in commands
+
+
+def test_satellite_configure_wizard_keeps_saved_answers_and_protects_the_token(
+    tmp_path, monkeypatch, capsys,
+):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    config = tmp_path / "gustav-satellite.conf"
+    config.write_text(
+        "# room-specific setup\nurl = http://old:8713\ntoken = private-token\n"
+        "input_device = plughw:0,0\noutput_device = plughw:0,0\n"
+        "threshold = 0.02\nsilence_ms = 900\n",
+        encoding="utf-8",
+    )
+    answers = iter(("", "1", "", "0.05", "n", "n"))
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
+    monkeypatch.setattr(satellite, "capture_devices", lambda: ["plughw:1,0"])
+    monkeypatch.setattr(satellite, "playback_devices", lambda: ["plughw:2,0"])
+    monkeypatch.delenv("GUSTAV_URL", raising=False)
+    monkeypatch.delenv("GUSTAV_TOKEN", raising=False)
+
+    result = satellite.main(["configure", "--config", str(config)])
+
+    saved = config.read_text(encoding="utf-8")
+    assert result == 0
+    assert "# room-specific setup" in saved
+    assert "url = http://old:8713" in saved
+    assert "token = private-token" in saved
+    assert "input_device = plughw:1,0" in saved
+    assert "output_device = plughw:0,0" in saved
+    assert "threshold = 0.05" in saved
+    assert "silence_ms = 900" in saved
+    assert config.stat().st_mode & 0o777 == 0o600
+    assert "private-token" not in capsys.readouterr().out

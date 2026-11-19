@@ -409,6 +409,8 @@ fi
 RUN="gustav-satellite"
 [ "$ON_PATH" = true ] || RUN="$BIN_DIR/gustav-satellite"
 [ -n "$INPUT" ] && say "  the microphone is $INPUT; it is in $CONFIG"
+say "  $RUN configure"
+say "      change the server, token, microphone or speaker"
 say "  $RUN --calibrate"
 say "      measure this room, then put the number in $CONFIG"
 say "  $RUN --say \"hello\""

@@ -576,12 +576,24 @@ fifteen seconds, most of it apt installing `alsa-utils`. (That client is tested 
 a real server rather than against my reading of the specification.)
 
 It takes its language, its wake words and how long a question may be from the daemon,
-so there is nothing on the satellite to get out of step. Two things to do once:
+so there is nothing on the satellite to get out of step. To change its local settings,
+run the setup wizard; it keeps saved answers when you press Enter and hides the token
+while you type it:
+
+```bash
+gustav-satellite configure
+```
+
+To check the room's input threshold or make Gustav speak through the speaker:
 
 ```bash
 gustav-satellite --calibrate        # measure the room; put the number in the config
 gustav-satellite --say "hello"      # make the daemon talk through this speaker
 ```
+
+Run `gustav-satellite -v` to see the server's reply and whether the first sound was
+the thinking filler or the answer. The `/voice/ask` response reports the same distinction
+in `timings.first_audio_was_filler`.
 
 Make the token on the server with `ai user add kitchen` and `ai user token kitchen`.
 
