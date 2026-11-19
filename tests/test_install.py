@@ -781,6 +781,33 @@ def test_it_keeps_a_config_that_is_already_there(tmp_path):
     assert "threshold = 0.07" in config.read_text(encoding="utf-8")
 
 
+def test_update_reuses_the_server_token_and_microphone(tmp_path):
+    home = tmp_path / "home"
+    config_dir = home / ".config"
+    config_dir.mkdir(parents=True)
+    config = config_dir / "gustav-satellite.conf"
+    config.write_text(
+        "url = http://mine:8713\ntoken = already-secret\ninput_device = plughw:1,0\n",
+        encoding="utf-8",
+    )
+    program_dir = home / ".local" / "share" / "gustav-satellite"
+    program_dir.mkdir(parents=True)
+    (program_dir / "gustav_satellite.py").write_text("old version\n", encoding="utf-8")
+
+    result = satellite(
+        "--update", "--source", str(REPO), "--dir", str(program_dir),
+        env={"HOME": str(home), "GUSTAV_BIN": str(home / "bin")},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "updating the satellite that is already here" in result.stdout
+    saved = config.read_text(encoding="utf-8")
+    assert "url = http://mine:8713" in saved
+    assert "token = already-secret" in saved
+    assert "input_device = plughw:1,0" in saved
+    assert "already-secret" not in result.stdout + result.stderr
+
+
 # --- the one-liner rescuing a stuck install -------------------------------
 # Reported twice from the same server. config.yaml is the settings of the gustav in
 # that directory and was also in the repository, so an upstream edit to it stopped the

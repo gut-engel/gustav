@@ -22,7 +22,7 @@ set -euo pipefail
 
 exec 3>&1 4>&2
 
-VERSION="2026-11-17.3"
+VERSION="2026-11-18.1"
 
 ARGV=("$@")
 URL="${GUSTAV_URL:-}"
@@ -41,6 +41,7 @@ WITH_SERVICE=""
 DRY_RUN=false
 QUIET=false
 SKIP_SOUND_CHECK=false
+UPDATE_ONLY=false
 
 now()  { date '+%H:%M:%S'; }
 say()  { if [ "$QUIET" != true ]; then printf '%s  %s\n' "$(now)" "$*" >&3; fi; }
@@ -75,6 +76,9 @@ Usage: satellite.sh --url <http://server:8713> [--token <token>] [options]
   --service / --no-service
                       install (or skip) the systemd user service
   --skip-sound-check  install anyway on a machine with no sound card yet
+  --update            just fetch the newest program; keep the server, the token,
+                      the microphone and everything else already in the config
+                      (re-running without --url does this anyway)
   --source <path>     install from a checkout instead of downloading
   --dir <path>        where the program goes (default: $DIR)
   --dry-run           say what it would do and change nothing
@@ -100,6 +104,7 @@ while [ $# -gt 0 ]; do
     --service)    WITH_SERVICE=yes; shift ;;
     --no-service) WITH_SERVICE=no; shift ;;
     --skip-sound-check) SKIP_SOUND_CHECK=true; shift ;;
+    --update)     UPDATE_ONLY=true; shift ;;
     --source)     SOURCE="${2:-}"; shift 2 ;;
     --dir)        DIR="${2:-}"; shift 2 ;;
     --config)     CONFIG="${2:-}"; shift 2 ;;
@@ -193,6 +198,29 @@ EOF
 fi
 
 # --- 2. where does it point? -------------------------------------------------
+# A satellite that is already here knows where it points and what its token is, and
+# asking again — or worse, refusing to run without them — makes updating it a search
+# through a password manager for something this machine has had all along.
+KNOWN_URL=""
+KNOWN_TOKEN=""
+if [ -f "$CONFIG" ]; then
+  KNOWN_URL="$(sed -n 's/^[[:space:]]*url[[:space:]]*=[[:space:]]*//p' "$CONFIG" | head -1)"
+  KNOWN_TOKEN="$(sed -n 's/^[[:space:]]*token[[:space:]]*=[[:space:]]*//p' "$CONFIG" | head -1)"
+fi
+[ -z "$URL" ] && URL="$KNOWN_URL"
+[ -z "$TOKEN" ] && TOKEN="$KNOWN_TOKEN"
+
+UPDATING=false
+if [ -n "$KNOWN_URL" ] && [ -f "$DIR/gustav_satellite.py" ]; then
+  UPDATING=true
+fi
+
+if [ "$UPDATE_ONLY" = true ] && [ "$UPDATING" != true ]; then
+  die "--update is for a satellite that is already here, and there is none in $DIR.
+       Install it first:
+         ... | bash -s -- --url http://your-server:8713 --token <token>"
+fi
+
 if [ -z "$URL" ]; then
   ask URL '  The gustav daemon (e.g. http://box.local:8713): ' \
     || die "say --url http://your-server:8713"
@@ -200,7 +228,10 @@ fi
 [ -n "$URL" ] || die "no server address"
 case "$URL" in http://*|https://*) ;; *) URL="http://$URL" ;; esac
 
-if [ -z "$TOKEN" ]; then
+if [ "$UPDATING" = true ]; then
+  say "  updating the satellite that is already here"
+  say "  server     $URL${KNOWN_TOKEN:+   (keeping the token it already has)}"
+elif [ -z "$TOKEN" ]; then
   warn "  No token. The daemon will refuse unless it has accounts switched off."
   warn "  On the server:  ai user add $NAME && ai user token $NAME"
   ask TOKEN '  Token (blank to carry on without one): ' || true
@@ -304,7 +335,14 @@ fi
 
 # --- 6. always on ------------------------------------------------------------
 if [ -z "$WITH_SERVICE" ]; then
-  if [ -n "$TTY" ]; then
+  if [ "$UPDATING" = true ]; then
+    # It was answered the first time; the answer is whether the unit is there.
+    if [ -f "$HOME/.config/systemd/user/gustav-satellite.service" ]; then
+      WITH_SERVICE=yes
+    else
+      WITH_SERVICE=no
+    fi
+  elif [ -n "$TTY" ]; then
     ask answer '  Start it on boot (systemd user service)? [Y/n]: '
     case "$answer" in [nN]*) WITH_SERVICE=no ;; *) WITH_SERVICE=yes ;; esac
   else
@@ -337,6 +375,9 @@ WantedBy=default.target
 EOF
     systemctl --user daemon-reload
     systemctl --user enable --now gustav-satellite >/dev/null 2>&1 || true
+    # enable --now does nothing to one that is already running, and the whole point
+    # of an update is that the new program is the one in memory.
+    systemctl --user restart gustav-satellite >/dev/null 2>&1 || true
     say "  gustav-satellite.service is running"
     # Without this it stops when you log out, which on a headless Pi is immediately.
     if command -v loginctl >/dev/null 2>&1; then
