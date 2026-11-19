@@ -90,6 +90,7 @@ def test_with_no_wake_word_everything_is_for_us():
 
 def test_the_wake_word_is_taken_off_before_the_model_sees_it():
     assert strip_wake_word("Hey Gustav, what time is it", ["hey gustav"]) == "what time is it"
+    assert strip_wake_word("Gustav?", ["gustav"]) == ""
     assert strip_wake_word("what time is it", ["hey gustav"]) == "what time is it"
 
 
@@ -202,6 +203,18 @@ async def test_something_said_to_somebody_else_is_left_alone(voice_config, tmp_p
     turn = await pipe.turn(Audio.silence(1.0))
     assert turn.ignored == "not addressed to me"
     assert turn.audio == []
+
+
+async def test_a_wake_word_on_its_own_is_not_sent_to_the_model(voice_config, tmp_path):
+    voice_config.wake_words = ["gustav"]
+    pipe = pipeline(voice_config, script=["Gustav?"], room=tmp_path)
+
+    turn = await pipe.turn(Audio.silence(0.5))
+
+    assert turn.ignored == "wake word only"
+    assert turn.reply == ""
+    assert turn.audio == []
+    assert pipe.ask.asked == []
 
 
 async def test_a_spoken_music_mode_request_is_sent_to_the_satellite(voice_config, tmp_path):

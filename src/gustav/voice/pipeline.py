@@ -90,7 +90,7 @@ def strip_wake_word(text: str, wake_words: list[str]) -> str:
         at = lowered.find(word.lower())
         if at != -1 and at < 20:
             rest = text[at + len(word) :]
-            return rest.lstrip(" ,.:;!?-–—").strip() or text.strip()
+            return rest.lstrip(" ,.:;!?-–—").strip()
     return text.strip()
 
 
@@ -159,6 +159,11 @@ class VoicePipeline:
             return
 
         question = strip_wake_word(heard.text, list(self.config.wake_words))
+        if self.config.wake_words and not question:
+            timings.total_ms = int((self.clock() - started) * 1000)
+            yield {"type": "done", "ignored": "wake word only",
+                   "timings": timings.to_dict()}
+            return
         if question.lower().strip(" .,!?") in {
             "music mode", "put yourself in music mode", "put yourself into music mode",
             "switch to music mode", "switch into music mode", "go into music mode",
