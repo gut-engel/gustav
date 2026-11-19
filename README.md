@@ -550,6 +550,14 @@ curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/satel
   | bash -s -- --url http://box.local:8713 --token <token>
 ```
 
+To update an installed satellite, run the same installer with `--update`. It keeps the
+server address, token, microphone and service choice from that satellite's config:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/satellite.sh \
+  | bash -s -- --update
+```
+
 **It has no dependencies.** Not numpy, not sounddevice, not websockets: one Python file,
 `arecord` and `aplay` for sound, and two hundred lines of RFC 6455 at the bottom of it
 for the socket. Every wheel that has to be compiled on an ARM board is a minute of
