@@ -406,3 +406,16 @@ async def test_the_prompt_is_not_rebuilt_for_every_turn_of_a_conversation(harnes
     assert harness.capabilities() is first, "the tool table was read twice in one burst"
     harness.forget_capabilities()
     assert harness.capabilities() is not first
+
+
+async def test_a_small_model_gets_a_short_answer_prompt_with_a_4096_token_window(harness):
+    """The 0.6B checkpoint needs direct instructions even when context space is ample."""
+    from gustav.inference.conversation import ContextBudget
+
+    harness._spec = load_ladder().model("qwen3-0.6b")
+    harness._budget = lambda: ContextBudget(max_seq_len=4096)
+
+    prompt = harness.system_prompt()
+
+    assert "Answer the latest message directly in the same language" in prompt
+    assert "Never introduce yourself as an AI or model" in prompt

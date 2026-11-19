@@ -486,7 +486,10 @@ class Harness:
         from gustav.wake import capabilities as caps
 
         found = self.capabilities()
-        if self._budget().max_seq_len < 4096:
+        # The 0.6B checkpoint cannot reliably follow a long policy paragraph. The
+        # compact form puts the answer rule first and keeps live capability facts.
+        small_model = self._spec is not None and self._spec.params_b <= 1.0
+        if self._budget().max_seq_len < 4096 or small_model:
             return caps.brief_prompt(found)
         return caps.system_prompt(found)
 

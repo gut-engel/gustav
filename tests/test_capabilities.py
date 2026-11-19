@@ -182,7 +182,7 @@ def test_every_paragraph_survives_every_combination(paused):
 
 # --- the short form, for a small window ----------------------------------
 def test_the_brief_prompt_keeps_every_claim_that_changes_what_it_does():
-    """A 2048-token window cannot spend a fifth of itself describing the machine."""
+    """A small model needs short instructions while keeping live tool access clear."""
     full = caps.system_prompt(
         caps.Capabilities(callable_tools=(caps.Tool("bigpow", "exact large powers"),))
     )
@@ -190,15 +190,15 @@ def test_the_brief_prompt_keeps_every_claim_that_changes_what_it_does():
         caps.Capabilities(callable_tools=(caps.Tool("bigpow", "exact large powers"),))
     )
     assert len(brief) < len(full) / 2
-    for claim in ("You are Gustav", "bigpow — exact large powers",
-                  "/tool <what it should do>", "cannot be extended", "no LaTeX"):
+    for claim in ("You are Gustav", "same language", "bigpow — exact large powers",
+                  "/tool <what it should do>", "cannot be extended", "not LaTeX"):
         assert claim in brief, claim
 
 
 def test_the_brief_prompt_switches_off_with_the_same_switches():
     assert "/tool" not in caps.brief_prompt(caps.Capabilities(authoring=False))
     assert "No tools" not in caps.brief_prompt(caps.Capabilities(tools_enabled=False))
-    assert "learning is paused" in caps.brief_prompt(caps.Capabilities(learning_paused=True))
+    assert "Learning is paused" in caps.brief_prompt(caps.Capabilities(learning_paused=True))
 
 
 # --- what it must not do with any of this --------------------------------
@@ -211,5 +211,5 @@ def test_it_is_not_handed_a_sentence_about_itself_to_recite():
 
 def test_it_is_told_not_to_open_with_what_it_is():
     for text in (prompt(), caps.brief_prompt(caps.Capabilities())):
-        assert "As a model" in text and "Never open with what you are" in text
-        assert "Start with the answer" in text or "start with the answer" in text
+        assert "As a model" in text or "AI or model" in text
+        assert "start with the answer" in text.lower()

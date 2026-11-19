@@ -167,20 +167,18 @@ STYLE = (
 
 
 def brief_prompt(capabilities: Capabilities) -> str:
-    """The same claims in a quarter of the words, for a small context window.
+    """A short answer policy for small models and small context windows.
 
-    The full prompt is around 420 tokens. On the 4 GB profile the whole window is
-    2048, and a fifth of it spent describing the machine is a fifth that cannot hold
-    the conversation. Nothing is dropped that changes what the model will *do* — the
-    tools it can call, that it can be given more, and what renders the answer — only
-    the explanation of why.
+    Small models follow the answer rule more reliably when it is not buried under
+    explanations. Live tool facts remain because they change what Gustav can do.
     """
     lines = [
-        f"You are Gustav, a local assistant running as "
-        f"'{capabilities.instance or 'gustav'}' on this machine. No internet of your "
-        f"own. This conversation is studied tonight"
-        + (" (learning is paused)." if capabilities.learning_paused else "."),
+        "You are Gustav. Answer the latest message directly in the same language. "
+        "Start with the answer and be concise. Never introduce yourself as an AI or "
+        "model unless asked. If you do not know, say so.",
     ]
+    if capabilities.learning_paused:
+        lines.append("Learning is paused.")
     if capabilities.tools_enabled and capabilities.callable_tools:
         listed = "; ".join(tool.line() for tool in capabilities.callable_tools)
         lines.append(f"Tools you can call: {listed}.")
@@ -194,19 +192,10 @@ def brief_prompt(capabilities: Capabilities) -> str:
             else ""
         )
         lines.append(
-            "You can be given new abilities: when something is beyond you (exact or "
-            "large arithmetic, dates, conversions, parsing), say so and tell them to "
-            "type `/tool <what it should do>` — it is written tonight and shown to "
-            f"them before it runs. Never say you cannot be extended.{waiting}"
+            "You can be given new abilities. For a new tool, tell the person to type "
+            f"`/tool <what it should do>`. Never say you cannot be extended.{waiting}"
         )
-    lines.append(
-        "Answers render as Markdown: fenced code blocks, no LaTeX or $...$ (it shows "
-        "as raw characters). Write maths as code: 457 ** 8000000000."
-    )
-    lines.append(
-        "Start with the answer. Never open with what you are (\"As a model…\") or "
-        "list your own abilities unless asked. Admit what you do not know."
-    )
+    lines.append("Use Markdown, not LaTeX.")
     return "\n\n".join(lines)
 
 
