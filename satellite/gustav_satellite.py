@@ -19,9 +19,9 @@ What makes it feel fast, in the order it matters:
 * **Streaming up.** Frames go out while you are still talking, so when you stop, the
   server already has all but the last breath of it.
 * **Streaming down.** The answer is played as each sentence arrives.
-* **Barge-in.** The microphone keeps listening while the speaker is talking. Start
-  speaking and playback stops mid-word, which is the difference between a device you
-  talk to and a device you wait for.
+* **No feedback loop.** The microphone stays open for ALSA, but frames captured while
+  Gustav is speaking are discarded before the next turn, so his answer cannot become
+  the next question.
 
 Run it with `--calibrate` once in the room it will live in; it prints the threshold to
 put in the config.
@@ -276,7 +276,7 @@ class Speaker:
         self._process = None
 
     def stop(self) -> None:
-        """Stop now, mid-word. This is barge-in."""
+        """Stop now, mid-word, when playback has to be interrupted."""
         if self._process is None:
             return
         self._process.kill()
@@ -286,6 +286,81 @@ class Speaker:
             pass
         self._process = None
 
+
+class BluetoothMusic:
+    """Let a phone play through the satellite until it disconnects."""
+
+    @staticmethod
+    def source() -> str:
+        """Return the Bluetooth audio source PulseAudio exposes, if one is connected."""
+        try:
+            result = subprocess.run(
+                ["pactl", "list", "short", "sources"], capture_output=True,
+                text=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) > 1 and fields[1].startswith(("bluez_input", "bluez_source")):
+                return fields[1]
+        return ""
+
+    @classmethod
+    def wait_for_phone(cls) -> None:
+        """Open pairing, route a connected phone to the normal speaker, then return."""
+        if shutil.which("bluetoothctl") is None or shutil.which("pactl") is None:
+            say("music mode needs bluetoothctl and pactl; returning to Gustav", error=True)
+            return
+        try:
+            subprocess.run(["bluetoothctl", "power", "on"], check=True,
+                           capture_output=True, timeout=10)
+            subprocess.run(["bluetoothctl", "agent", "NoInputNoOutput"], check=True,
+                           capture_output=True, timeout=10)
+            subprocess.run(["bluetoothctl", "default-agent"], check=True,
+                           capture_output=True, timeout=10)
+            subprocess.run(["bluetoothctl", "pairable", "on"], check=True,
+                           capture_output=True, timeout=10)
+            subprocess.run(["bluetoothctl", "discoverable", "on"], check=True,
+                           capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            say(f"Bluetooth could not be opened: {exc}; returning to Gustav", error=True)
+            return
+        say("music mode: pair your phone with this satellite")
+        module = ""
+        connected = False
+        try:
+            while True:
+                source = cls.source()
+                if source:
+                    connected = True
+                    if not module:
+                        try:
+                            loaded = subprocess.run(
+                                ["pactl", "load-module", "module-loopback",
+                                 f"source={source}", "latency_msec=80"],
+                                capture_output=True, text=True, timeout=10, check=True,
+                            )
+                            module = loaded.stdout.strip()
+                            say("phone connected; playing through the satellite speaker")
+                        except (OSError, subprocess.SubprocessError) as exc:
+                            say(f"the phone connected but could not be routed: {exc}",
+                                error=True)
+                            break
+                elif connected:
+                    say("phone disconnected; listening to Gustav again")
+                    break
+                time.sleep(1)
+        except KeyboardInterrupt:
+            say("leaving music mode")
+        finally:
+            if module:
+                subprocess.run(["pactl", "unload-module", module],
+                               capture_output=True, check=False)
+            subprocess.run(["bluetoothctl", "discoverable", "off"],
+                           capture_output=True, check=False)
+            subprocess.run(["bluetoothctl", "pairable", "off"],
+                           capture_output=True, check=False)
 
 # ---------------------------------------------------------------------------
 # a WebSocket client, because one file with no dependencies beats one with four
@@ -462,6 +537,7 @@ class Satellite:
         self.server = Server()
         self.mic = Microphone(settings)
         self.speaker = Speaker(settings)
+        self.music_requested = False
 
     # --- talking to the daemon ------------------------------------------
     def _http(self, path: str) -> dict:
@@ -561,7 +637,7 @@ class Satellite:
 
     # --- answering -------------------------------------------------------
     def play_answer(self, connection: WebSocket) -> None:
-        """Play what comes back, and stop the moment the person speaks over it."""
+        """Play what comes back without mistaking the speaker for its listener."""
         settings = self.settings
         started = time.monotonic()
         first_audio_at = None
@@ -582,6 +658,11 @@ class Satellite:
                 say(f'heard: "{event.get("text", "")}"')
             elif kind == "error":
                 say(event.get("error", "something went wrong"), error=True)
+            elif kind == "mode" and event.get("mode") == "music":
+                self.music_requested = True
+                say("switching to music mode")
+                say_something(self.settings,
+                              "Pair your phone with me for music. I will listen again when it disconnects.")
             elif kind == "done":
                 timings = event.get("timings") or {}
                 if event.get("ignored"):
@@ -590,17 +671,11 @@ class Satellite:
                     say("  ".join(f"{name}={value}" for name, value in timings.items()))
                 break
 
-            # Barge-in, checked between events: the microphone has been running the
-            # whole time, so this is a read of something already recorded.
-            if self.server.barge_in and self.speaker.talking:
-                frame = self.mic.read(timeout=0.0001)
-                if frame is not None and rms(frame) >= settings.threshold * 1.5:
-                    say("interrupted")
-                    self.speaker.stop()
-                    connection.send_json({"type": "stop"})
-                    break
-
         self.speaker.finish()
+        # The microphone has to stay open while ALSA is playing, but its queue is
+        # full of Gustav's own voice by then. Keeping those frames would make the next
+        # turn start with an answer the satellite just played back to itself.
+        self.mic.drain()
 
     # --- the loop --------------------------------------------------------
     def run(self) -> int:
@@ -637,6 +712,9 @@ class Satellite:
                         if not self.wait_for_speech(connection):
                             continue
                         self.play_answer(connection)
+                        if self.music_requested:
+                            self.music_requested = False
+                            BluetoothMusic.wait_for_phone()
                 except WebSocketError as exc:
                     say(f"the connection dropped: {exc}", error=True)
                 except OSError as exc:

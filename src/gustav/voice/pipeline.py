@@ -159,6 +159,17 @@ class VoicePipeline:
             return
 
         question = strip_wake_word(heard.text, list(self.config.wake_words))
+        if question.lower().strip(" .,!?") in {
+            "music mode", "put yourself in music mode", "put yourself into music mode",
+            "switch to music mode", "switch into music mode", "go into music mode",
+            "start music mode", "enable music mode",
+        }:
+            timings.total_ms = int((self.clock() - started) * 1000)
+            yield {"type": "mode", "mode": "music"}
+            yield {"type": "done", "transcript": heard.text,
+                   "reply": "Connecting your phone. I will listen again when it disconnects.",
+                   "timings": timings.to_dict()}
+            return
         if self.config.reply_language:
             question = (
                 f"{question}\n\n(Answer in {self.config.reply_language}. "

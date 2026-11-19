@@ -503,8 +503,14 @@ Everything in the design is in service of it:
 * **The satellite sends while you are still talking**, with 240 ms of pre-roll from
   *before* speech was detected — without it every utterance loses its first consonant
   and "play" becomes "lay".
-* **It stops the moment you speak.** Barge-in is the difference between a device you
-  talk to and a device you wait for.
+* **It drops what the speaker just said before listening again.** Otherwise the
+  microphone can mistake Gustav's own answer for the next question and keep a loop
+  going. While an answer is playing, the satellite does not listen for interruptions.
+* **Music mode is a spoken request.** Say “Gustav, put yourself in music mode” and a
+  Bluetooth enabled satellite becomes discoverable. Pair the phone with it; its audio
+  plays through the satellite speaker. Disconnect the phone and Gustav listens again.
+  This uses the host's BlueZ and PulseAudio compatible `pactl` interface; without both,
+  the satellite explains that music mode is unavailable and keeps listening.
 * **Answers meant for a speaker are short.** `max_reply_tokens` is not a quality
   setting; it is an acknowledgement that speech is slow.
 

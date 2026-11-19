@@ -203,6 +203,18 @@ async def test_something_said_to_somebody_else_is_left_alone(voice_config, tmp_p
     assert turn.audio == []
 
 
+async def test_a_spoken_music_mode_request_is_sent_to_the_satellite(voice_config, tmp_path):
+    voice_config.wake_words = ["hey gustav"]
+    pipe = pipeline(voice_config, script=["Hey Gustav, put yourself in music mode"],
+                    room=tmp_path)
+
+    events = [event async for event in pipe.converse(Audio.silence(1.0))]
+
+    assert [event["type"] for event in events] == ["transcript", "mode", "done"]
+    assert events[1] == {"type": "mode", "mode": "music"}
+    assert pipe.ask.asked == [], "a mode change belongs to the satellite, not the model"
+
+
 async def test_the_model_is_asked_in_the_language_that_was_configured(voice_config, tmp_path):
     voice_config.reply_language = "German"
     pipe = pipeline(voice_config, script=["what time is it"], room=tmp_path)
@@ -851,3 +863,64 @@ def test_an_ordinary_failure_is_left_alone():
     import gustav_satellite as satellite
 
     assert satellite.why(OSError("connection refused")) == "connection refused"
+
+
+def test_the_satellite_discards_its_own_playback_before_listening_again():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    class Mic:
+        frames = []
+
+        def drain(self):
+            self.frames.clear()
+
+    class Speaker:
+        def play(self, pcm, rate):
+            pass
+
+        def finish(self):
+            pass
+
+    class Connection:
+        events = iter((
+            {"type": "audio", "pcm": base64.b64encode(b"voice").decode(),
+             "sample_rate": 16000},
+            {"type": "done"},
+        ))
+
+        def settimeout(self, timeout):
+            pass
+
+        def recv_json(self):
+            event = next(self.events)
+            if event["type"] == "done":
+                mic.frames.append(b"Gustav echoed by the speaker")
+            return event
+
+    mic = Mic()
+    client = satellite.Satellite.__new__(satellite.Satellite)
+    client.settings = satellite.Settings()
+    client.server = satellite.Server()
+    client.mic = mic
+    client.speaker = Speaker()
+
+    client.play_answer(Connection())
+
+    assert mic.frames == []
+
+
+def test_music_mode_uses_the_connected_bluetooth_audio_source(monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "satellite"))
+    import gustav_satellite as satellite
+
+    class Result:
+        stdout = "0 alsa_output.platform-sound.analog-stereo.monitor\n"
+        returncode = 0
+
+    monkeypatch.setattr(satellite.subprocess, "run", lambda *args, **kwargs: Result())
+
+    assert satellite.BluetoothMusic.source() == ""
+
+    Result.stdout = "4 bluez_input.00_11_22_33_44_55.1 a2dp_source\n"
+    assert satellite.BluetoothMusic.source() == "bluez_input.00_11_22_33_44_55.1"
