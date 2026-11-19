@@ -110,6 +110,16 @@ running as root has none of those. Run the same command again to update — your
 
 ### Updating
 
+The satellite has its own one-line update; it keeps its saved server, token and audio
+settings:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/satellite.sh \
+  | bash -s -- --update
+```
+
+For the main server or a client, use:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gut-engel/gustav/main/scripts/update.sh | bash
 ```
